@@ -1,0 +1,13 @@
+[package]
+name = "mmap-chunker-core"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency data chunking engine with native mmap and C-ABI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/mmap-chunker-core"
+
+[lib]
+name = "mmap_chunker_core"
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
