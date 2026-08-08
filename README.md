@@ -173,15 +173,16 @@ cargo test --test benchmark -- --ignored --nocapture
 cargo test --release scanner::tests::bench_cursor_vs_eager -- --ignored --nocapture
 ```
 
-Time-to-first-chunk (TFC) advantage with lazy cursor on JSONL/log data (64 KiB chunks, release build):
+Time-to-first-chunk (TFC) advantage with lazy cursor on JSONL/log data (64 KiB chunks, release build, 7-sample p50):
 
-| File Size | Eager TFC  | Lazy TFC | Speedup |
-|-----------|-----------|----------|---------|
-| 100 KB    | 205 ns    | 11 ns    | 18x     |
-| 1 MB      | 564 ns    | 12 ns    | 47x     |
-| 10 MB     | 4,450 ns  | 20 ns    | 222x    |
+| File Size | Eager TFC  | Lazy TFC | Speedup | Chunks |
+|-----------|-----------|----------|---------|--------|
+| 100 KB    | 139 ns    | 8.5 ns   | 16x     | 2      |
+| 1 MB      | 554 ns    | 10 ns    | 55x     | 16     |
+| 10 MB     | 2,780 ns  | 10 ns    | 278x    | 153    |
 
-Full traversal is competitive (no Vec allocation overhead).
+Full traversal converges as file size grows (both do equivalent scan work).
+Lazy is 2.2x faster at 1 MB and 1.3x faster at 10 MB (Vec allocation overhead).
 I/O benchmark runs on 1 MB–64 MB files with 64 KB–1 MB chunk sizes.
 
 ## Build

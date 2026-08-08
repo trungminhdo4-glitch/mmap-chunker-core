@@ -791,6 +791,8 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
+        const SAMPLES: usize = 7;
+
         fn gen_log_data(target_size: usize) -> Vec<u8> {
             let mut data = Vec::with_capacity(target_size);
             let mut n = 0u64;
@@ -807,72 +809,213 @@ mod tests {
             data
         }
 
-        fn bench_one(data: &[u8], chunk_size: usize, delim: u8, label: &str, iters: u32) {
+        fn elapsed_per_iter(iters: u64, f: impl Fn()) -> f64 {
+            let start = Instant::now();
+            for _ in 0..iters {
+                f();
+            }
+            start.elapsed().as_nanos() as f64 / iters as f64
+        }
+
+        fn samples_median(mut ns: Vec<f64>) -> f64 {
+            ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ns[ns.len() / 2]
+        }
+
+        fn samples_p10(mut ns: Vec<f64>) -> f64 {
+            ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let idx = ((ns.len() - 1) as f64 * 0.10) as usize;
+            ns[idx]
+        }
+
+        fn samples_p90(mut ns: Vec<f64>) -> f64 {
+            ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let idx = ((ns.len() - 1) as f64 * 0.90) as usize;
+            ns[idx]
+        }
+
+        fn bench_one(
+            data: &[u8],
+            chunk_size: usize,
+            delim: u8,
+            label: &str,
+            iters: u64,
+            eager_chunks: usize,
+            lazy_chunks: usize,
+        ) {
             let total_bytes = data.len();
 
-            let start = Instant::now();
-            for _ in 0..iters {
-                let chunks = find_chunk_boundaries(data, chunk_size, delim);
-                black_box(chunks.first());
-            }
-            let eager_tfc = start.elapsed().as_nanos() as f64 / iters as f64;
+            let mut tfc_eager_ns: Vec<f64> = Vec::with_capacity(SAMPLES);
+            let mut tfc_lazy_ns: Vec<f64> = Vec::with_capacity(SAMPLES);
+            let mut full_eager_ns: Vec<f64> = Vec::with_capacity(SAMPLES);
+            let mut full_lazy_ns: Vec<f64> = Vec::with_capacity(SAMPLES);
 
-            let start = Instant::now();
-            for _ in 0..iters {
-                let mut cursor = ChunkCursor::new(data, chunk_size, delim);
-                black_box(cursor.next());
-            }
-            let lazy_tfc = start.elapsed().as_nanos() as f64 / iters as f64;
+            for _ in 0..SAMPLES {
+                tfc_eager_ns.push(elapsed_per_iter(iters, || {
+                    let d = black_box(data);
+                    let cs = black_box(chunk_size);
+                    let dl = black_box(delim);
+                    let chunks = find_chunk_boundaries(d, cs, dl);
+                    black_box(chunks.first().copied());
+                }));
 
-            let start = Instant::now();
-            let mut total_e = 0usize;
-            for _ in 0..iters {
-                let chunks = find_chunk_boundaries(data, chunk_size, delim);
-                for &(s, e) in &chunks {
-                    total_e = total_e.wrapping_add(e - s);
-                }
-            }
-            let eager_full = start.elapsed().as_nanos() as f64 / iters as f64;
-            black_box(total_e);
+                tfc_lazy_ns.push(elapsed_per_iter(iters, || {
+                    let d = black_box(data);
+                    let cs = black_box(chunk_size);
+                    let dl = black_box(delim);
+                    let mut cursor = ChunkCursor::new(d, cs, dl);
+                    black_box(cursor.next());
+                }));
 
-            let start = Instant::now();
-            let mut total_l = 0usize;
-            for _ in 0..iters {
-                let cursor = ChunkCursor::new(data, chunk_size, delim);
-                for chunk in cursor {
-                    total_l = total_l.wrapping_add(chunk.len());
-                }
+                full_eager_ns.push(elapsed_per_iter(iters, || {
+                    let d = black_box(data);
+                    let cs = black_box(chunk_size);
+                    let dl = black_box(delim);
+                    let chunks = find_chunk_boundaries(d, cs, dl);
+                    let mut total = 0usize;
+                    for &(s, e) in &chunks {
+                        total = total.wrapping_add(e - s);
+                    }
+                    black_box(total);
+                    black_box(&chunks);
+                }));
+
+                full_lazy_ns.push(elapsed_per_iter(iters, || {
+                    let d = black_box(data);
+                    let cs = black_box(chunk_size);
+                    let dl = black_box(delim);
+                    let mut total = 0usize;
+                    let cursor = ChunkCursor::new(d, cs, dl);
+                    for chunk in cursor {
+                        total = total.wrapping_add(chunk.len());
+                    }
+                    black_box(total);
+                }));
             }
-            let lazy_full = start.elapsed().as_nanos() as f64 / iters as f64;
-            black_box(total_l);
+
+            let tfc_e_p50 = samples_median(tfc_eager_ns.clone());
+            let tfc_l_p50 = samples_median(tfc_lazy_ns.clone());
+            let full_e_p50 = samples_median(full_eager_ns.clone());
+            let full_l_p50 = samples_median(full_lazy_ns.clone());
+
+            let tfc_e_p10 = samples_p10(tfc_eager_ns.clone());
+            let tfc_l_p10 = samples_p10(tfc_lazy_ns.clone());
+            let full_e_p10 = samples_p10(full_eager_ns.clone());
+            let full_l_p10 = samples_p10(full_lazy_ns.clone());
+
+            let tfc_e_p90 = samples_p90(tfc_eager_ns.clone());
+            let tfc_l_p90 = samples_p90(tfc_lazy_ns.clone());
+            let full_e_p90 = samples_p90(full_eager_ns.clone());
+            let full_l_p90 = samples_p90(full_lazy_ns.clone());
 
             println!();
             println!("  === {label} ===");
+            println!("  file={total_bytes}B chunk={chunk_size}B delim=0x{delim:02x}",);
             println!(
-                "  file={total_bytes}B chunk={chunk_size}B delim=0x{delim:02x} iters={iters} build={}",
-                if cfg!(debug_assertions) { "debug" } else { "release" }
+                "  build={} samples={SAMPLES} iters/sample={iters}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+            );
+            println!("  eager_chunks={eager_chunks}  lazy_chunks={lazy_chunks}");
+            println!(
+                "  TFC  eager  p50={:>10.1}ns  p10={:>10.1}  p90={:>10.1}",
+                tfc_e_p50, tfc_e_p10, tfc_e_p90,
             );
             println!(
-                "  TFC   eager={eager_tfc:>10.1}ns  lazy={lazy_tfc:>10.1}ns  ratio={:.2}x",
-                lazy_tfc / eager_tfc
+                "  TFC  lazy   p50={:>10.1}ns  p10={:>10.1}  p90={:>10.1}  ratio={:.2}x",
+                tfc_l_p50,
+                tfc_l_p10,
+                tfc_l_p90,
+                tfc_e_p50 / tfc_l_p50,
             );
             println!(
-                "  Full  eager={eager_full:>10.1}ns  lazy={lazy_full:>10.1}ns  ratio={:.2}x",
-                lazy_full / eager_full
+                "  Full eager  p50={:>10.1}ns  p10={:>10.1}  p90={:>10.1}",
+                full_e_p50, full_e_p10, full_e_p90,
+            );
+            println!(
+                "  Full lazy   p50={:>10.1}ns  p10={:>10.1}  p90={:>10.1}  ratio={:.2}x",
+                full_l_p50,
+                full_l_p10,
+                full_l_p90,
+                full_e_p50 / full_l_p50,
             );
         }
 
         println!("=== Time-to-First-Chunk + Full Traversal ===");
+        println!(
+            "  CPU: {} cores",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        );
+        println!("  OS:  {}", std::env::consts::OS);
 
         let jsonl = gen_log_data(100_000);
         let logs = gen_log_data(1_000_000);
         let sparse = gen_log_data(10_000_000);
 
-        bench_one(&jsonl, 64 * 1024, b'\n', "JSONL-like 100KB 64KiB", 200);
-        bench_one(&logs, 64 * 1024, b'\n', "Log-like 1MB 64KiB", 50);
-        bench_one(&sparse, 64 * 1024, b'\n', "Sparse 10MB 64KiB", 10);
-        bench_one(&jsonl, 1024 * 1024, b'\n', "JSONL-like 100KB 1MiB", 200);
-        bench_one(&logs, 1024 * 1024, b'\n', "Log-like 1MB 1MiB", 50);
+        let jsonl_ec = find_chunk_boundaries(&jsonl, 64 * 1024, b'\n').len();
+        let jsonl_lc = ChunkCursor::new(&jsonl, 64 * 1024, b'\n').count();
+        bench_one(
+            &jsonl,
+            64 * 1024,
+            b'\n',
+            "JSONL-like ~100B rec 100KB 64KiB",
+            200,
+            jsonl_ec,
+            jsonl_lc,
+        );
+
+        let logs_ec = find_chunk_boundaries(&logs, 64 * 1024, b'\n').len();
+        let logs_lc = ChunkCursor::new(&logs, 64 * 1024, b'\n').count();
+        bench_one(
+            &logs,
+            64 * 1024,
+            b'\n',
+            "Log-like ~100B rec 1MB 64KiB",
+            50,
+            logs_ec,
+            logs_lc,
+        );
+
+        let sparse_ec = find_chunk_boundaries(&sparse, 64 * 1024, b'\n').len();
+        let sparse_lc = ChunkCursor::new(&sparse, 64 * 1024, b'\n').count();
+        bench_one(
+            &sparse,
+            64 * 1024,
+            b'\n',
+            "Sparse ~100B rec 10MB 64KiB",
+            10,
+            sparse_ec,
+            sparse_lc,
+        );
+
+        let jsonl_ec_1m = find_chunk_boundaries(&jsonl, 1024 * 1024, b'\n').len();
+        let jsonl_lc_1m = ChunkCursor::new(&jsonl, 1024 * 1024, b'\n').count();
+        bench_one(
+            &jsonl,
+            1024 * 1024,
+            b'\n',
+            "JSONL-like ~100B rec 100KB 1MiB",
+            200,
+            jsonl_ec_1m,
+            jsonl_lc_1m,
+        );
+
+        let logs_ec_1m = find_chunk_boundaries(&logs, 1024 * 1024, b'\n').len();
+        let logs_lc_1m = ChunkCursor::new(&logs, 1024 * 1024, b'\n').count();
+        bench_one(
+            &logs,
+            1024 * 1024,
+            b'\n',
+            "Log-like ~100B rec 1MB 1MiB",
+            50,
+            logs_ec_1m,
+            logs_lc_1m,
+        );
     }
 
     // ── Fixed-size chunking tests ────────────────────────────────────────
