@@ -15,7 +15,8 @@ unnecessarily or pull in heavy dependencies. This library provides:
 
 ## Features
 
-- Platform support: Linux, Windows, macOS
+- Targets Windows and POSIX platforms (Linux, macOS)
+- Windows is locally validated; Linux is validated in CI; macOS is targeted
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
@@ -86,7 +87,7 @@ lib.mmap_engine_abi_version.restype = ctypes.c_uint32
 assert lib.mmap_engine_abi_version() == 0x00010000
 ```
 
-See `native_io/` for a full Python ctypes example with protocol-based provider abstraction.
+See the `mmap_chunker.h` header for the complete C API reference with threading and safety contracts.
 
 ## Safety Contract
 
@@ -113,6 +114,7 @@ cargo test --test benchmark -- --ignored --nocapture
 
 Runs on 1 MB, 16 MB, and 64 MB files with 64 KB, 256 KB, and 1 MB chunk sizes.
 Outputs wall-clock time and throughput for mmap vs `std::fs::read` path.
+Results include page-cache effects; warm runs may be faster than cold.
 
 ## Build
 
@@ -135,7 +137,12 @@ cargo test
 cargo build --release
 ```
 
-46 tests including property tests, ABI layout verification, and C ABI integration.
+47 Rust tests (45 unit + 2 integration) including property tests for concatenation,
+gap-freedom, determinism, monotonic offsets, and delimiter variants.
+
+Companion test suites (not in-tree):
+- 15 external C ABI assertions (via `examples/c_consumer.c`, locally validated)
+- 53 Python ctypes integration tests (via `native_io/`, locally validated)
 
 ## Limitations
 
@@ -149,7 +156,7 @@ cargo build --release
 - Multi-byte delimiter support (`\r\n`, custom record separators)
 - Lazy chunk cursor for streaming consumers
 - Fixed-size chunking mode (delimiter-independent)
-- External C consumer validation test
+- macOS CI validation
 
 ## License
 

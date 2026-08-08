@@ -27,8 +27,8 @@
 - `Cargo.toml`: dual-licensed under MIT OR Apache-2.0
 - C header (`mmap_chunker.h`) with full API documentation, threading contract,
   file mutation contract, and ABI stability notes
-- 33 Rust unit + integration tests (pre-evolution)
-- 46 tests including property tests for concatenation, gap-freedom, determinism,
-  monotonic offsets, and alternative delimiters
+- 47 Rust tests (45 unit + 2 integration) including property tests for
+  concatenation, gap-freedom, determinism, monotonic offsets, and alternative
+  delimiters
 - Benchmarks comparing mmap vs `std::fs::read` path
 - Python ctypes consumer example (`native_io/`)
