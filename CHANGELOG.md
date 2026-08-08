@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-08
+
 ### Added
 
 - Record-aligned partition planning for N-way parallel consumers

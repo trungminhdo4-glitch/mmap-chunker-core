@@ -14,7 +14,7 @@ unnecessarily or pull in heavy dependencies. This library provides:
 - **Zero-copy** chunk views backed by OS-level memory mapping
 - **Zero runtime dependencies** — pure Rust with direct syscall FFI
 - **Language-agnostic C ABI** — usable from C, Python, Go, C#, and any language with FFI
-- **Delimiter-aware** chunking — boundaries placed at record boundaries, not arbitrary offsets
+- **Three planning modes**: delimiter-aware chunking, fixed-size chunking, and record-aligned N-way partitioning
 
 ## Features
 
@@ -58,6 +58,8 @@ if (!h) {
 }
 
 size_t count = mmap_engine_scan_chunks_ex(h, 64 * 1024, '\n');
+// or: mmap_engine_scan_fixed(h, 4096)              — fixed-size mode
+// or: mmap_engine_partition_records(h, 4, '\n')   — N-way partition planning
 for (size_t i = 0; i < count; i++) {
     CChunkView view;
     mmap_engine_get_chunk(h, i, &view);
@@ -73,11 +75,16 @@ mmap_engine_free(h);
 use mmap_chunker_core::scanner;
 
 let data = std::fs::read("records.csv")?;
+
+// 1. Delimiter-aware chunking — boundaries aligned after delimiter
 let chunks = scanner::find_chunk_boundaries(&data, 65536, b',');
-for (start, end) in &chunks {
-    let chunk = &data[*start..*end];
-    // process chunk
-}
+
+// 2. Fixed-size chunking — O(1) arithmetic layout, zero scan cost
+let count = scanner::fixed_chunk_count(data.len(), 4096);
+let bounds = scanner::fixed_chunk_bounds(data.len(), 4096, 0);
+
+// 3. Record-aligned N-way partitioning — for parallel consumers
+let partitions = scanner::find_partition_boundaries(&data, 4, b'\n');
 ```
 
 ## Dynamic Library (cdylib)
@@ -87,7 +94,7 @@ for (start, end) in &chunks {
 import ctypes
 lib = ctypes.CDLL("./mmap_chunker_core.dll")
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
-assert lib.mmap_engine_abi_version() == 0x00010000
+assert lib.mmap_engine_abi_version() == 0x00010002
 ```
 
 See the `mmap_chunker.h` header for the complete C API reference with threading and safety contracts.
@@ -140,11 +147,12 @@ cargo test
 cargo build --release
 ```
 
-47 Rust tests (45 unit + 2 integration) including property tests for concatenation,
-gap-freedom, determinism, monotonic offsets, and delimiter variants.
+110 tests (108 unit + 2 integration) including property tests for concatenation,
+gap-freedom, determinism, monotonic offsets, delimiter variants, fixed-size chunking,
+and record-aligned partition planning.
 
 Companion test suites:
-- 15 external C ABI assertions via `examples/c_consumer.c` (CI-validated on Linux and macOS)
+- 30 external C ABI assertions via `examples/c_consumer.c` (CI-validated on Linux and macOS)
 - 53 Python ctypes integration tests (local, companion module)
 
 ## Limitations
@@ -158,7 +166,7 @@ Companion test suites:
 
 - Multi-byte delimiter support (`\r\n`, custom record separators)
 - Lazy chunk cursor for streaming consumers
-- Fixed-size chunking mode (delimiter-independent)
+- SIMD-accelerated byte search (runtime dispatch)
 
 ## License
 
