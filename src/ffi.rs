@@ -27,6 +27,7 @@ pub const CAP_ERROR_STRINGS: u32 = 1 << 2;
 const MAX_ERROR_LEN: usize = 256;
 
 thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
     static LAST_ERROR: RefCell<[u8; MAX_ERROR_LEN]> = RefCell::new([0u8; MAX_ERROR_LEN]);
 }
 
