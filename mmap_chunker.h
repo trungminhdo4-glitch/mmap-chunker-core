@@ -21,7 +21,7 @@ typedef struct {
 
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010001U
+#define MMAP_ENGINE_ABI_VERSION 0x00010002U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
@@ -29,13 +29,14 @@ typedef struct {
 #define MMAP_ENGINE_CAP_CONFIGURABLE_DELIMITER (1U << 1)
 #define MMAP_ENGINE_CAP_ERROR_STRINGS          (1U << 2)
 #define MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING    (1U << 3)
+#define MMAP_ENGINE_CAP_RECORD_PARTITIONING    (1U << 4)
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010001 (v1.1). Always succeeds, never panics.
+ * Current: 0x00010002 (v1.2). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -47,6 +48,7 @@ uint32_t mmap_engine_abi_version(void);
  * Bit 1: CONFIGURABLE_DELIMITER — mmap_engine_scan_chunks_ex() available
  * Bit 2: ERROR_STRINGS          — mmap_engine_last_error() returns diagnostic text
  * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
+ * Bit 4: RECORD_PARTITIONING    — mmap_engine_partition_records() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -170,6 +172,58 @@ size_t mmap_engine_scan_chunks_ex(CEngineHandle *handle,
 size_t mmap_engine_scan_fixed(CEngineHandle *handle, size_t chunk_size_bytes);
 
 /**
+ * Plan record-aligned partition byte ranges for N-way parallel consumers.
+ *
+ * Computes approximately balanced, record-aligned byte ranges that partition
+ * the mapped file into `requested_partitions` contiguous, non-overlapping
+ * segments. Each segment boundary falls immediately after a `delimiter` byte,
+ * ensuring no record is ever split across partition boundaries.
+ *
+ * How it works:
+ *   For each boundary i = 1..N-1, the ideal absolute target position
+ *   `floor(file_len * i / N)` is computed independently, then a forward
+ *   search from that position locates the next delimiter. Each boundary
+ *   is placed immediately after that delimiter byte.
+ *
+ *   This "absolute target" strategy prevents cumulative drift that
+ *   iterative (previous-boundary + chunk_size) approaches suffer from.
+ *
+ * Key properties:
+ *   - Complete coverage: first.start == 0, last.end == file_len
+ *   - No gaps, no overlaps — contiguous byte ranges
+ *   - Record integrity: non-final partitions always end after delimiter
+ *   - Deterministic: same file + parameters always produce same result
+ *   - O(partitions) metadata, bounded scanning
+ *   - No full-file sequential scan required
+ *
+ * Edge cases:
+ *   - Zero partitions requested: returns 0, error set
+ *   - One partition: returns 1 (entire file)
+ *   - No delimiter anywhere in file: returns 1 (entire file)
+ *   - Giant record spanning multiple ideal targets: boundaries collapse,
+ *     effective partition count < requested count
+ *   - Empty file: returns 0 (no partitions)
+ *
+ * Calling this function replaces any previously computed chunk boundaries
+ * (delimited, fixed, or prior partition plan). The most recent plan call
+ * determines the layout returned by mmap_engine_get_chunk().
+ *
+ * @param handle                Valid handle from mmap_engine_open().
+ * @param requested_partitions  Desired number of partitions (must be > 0).
+ * @param delimiter             Byte value used to detect record boundaries.
+ * @return                      Actual partition count (may be < requested),
+ *                              or 0 on error / empty file.
+ *                              On error, call mmap_engine_last_error().
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.2 (detect with MMAP_ENGINE_CAP_RECORD_PARTITIONING).
+ */
+size_t mmap_engine_partition_records(CEngineHandle *handle,
+                                     size_t requested_partitions,
+                                     uint8_t delimiter);
+
+/**
  * Retrieve a chunk view by index (zero-copy).
  *
  * The `data` pointer references the memory-mapped file directly and
@@ -235,6 +289,7 @@ void mmap_engine_free(CEngineHandle *handle);
  * History:
  *   v1.0 (0x00010000): Initial release — 8 core functions.
  *   v1.1 (0x00010001): Added mmap_engine_scan_fixed() + CAP_FIXED_SIZE_CHUNKING.
+ *   v1.2 (0x00010002): Added mmap_engine_partition_records() + CAP_RECORD_PARTITIONING.
  *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *

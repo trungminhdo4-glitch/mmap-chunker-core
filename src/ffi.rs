@@ -18,12 +18,13 @@ use crate::scanner;
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0001;
+pub const ABI_VERSION: u32 = 0x0001_0002;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
 pub const CAP_ERROR_STRINGS: u32 = 1 << 2;
 pub const CAP_FIXED_SIZE_CHUNKING: u32 = 1 << 3;
+pub const CAP_RECORD_PARTITIONING: u32 = 1 << 4;
 
 const MAX_ERROR_LEN: usize = 256;
 
@@ -78,6 +79,7 @@ enum ChunkLayout {
         chunk_size: usize,
         chunk_count: usize,
     },
+    Partitioned(Vec<(usize, usize)>),
 }
 
 struct Engine {
@@ -89,7 +91,7 @@ struct Engine {
 
 /// Return the ABI version as `(major << 16) | minor`.
 ///
-/// Current: `0x0001_0000` (v1.0). Always succeeds, never panics.
+/// Current: `0x0001_0002` (v1.2). Always succeeds, never panics.
 #[no_mangle]
 pub extern "C" fn mmap_engine_abi_version() -> u32 {
     ABI_VERSION
@@ -100,14 +102,19 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.1):
+/// Current bits (v1.2):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
 ///   - Bit 3: `FIXED_SIZE_CHUNKING` — `mmap_engine_scan_fixed` available
+///   - Bit 4: `RECORD_PARTITIONING` — `mmap_engine_partition_records` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
-    CAP_ZERO_COPY | CAP_CONFIGURABLE_DELIMITER | CAP_ERROR_STRINGS | CAP_FIXED_SIZE_CHUNKING
+    CAP_ZERO_COPY
+        | CAP_CONFIGURABLE_DELIMITER
+        | CAP_ERROR_STRINGS
+        | CAP_FIXED_SIZE_CHUNKING
+        | CAP_RECORD_PARTITIONING
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -317,6 +324,106 @@ pub unsafe extern "C" fn mmap_engine_scan_fixed(
     }
 }
 
+/// Plan record-aligned partition byte ranges for N-way parallel consumers.
+///
+/// Computes approximately balanced, record-aligned byte ranges partitioning
+/// the memory-mapped file into `requested_partitions` contiguous segments.
+/// Each segment boundary falls on a record boundary (immediately after the
+/// `delimiter` byte), ensuring no record is split.
+///
+/// Uses absolute ideal cut points: for each boundary `i = 1..N-1`, the
+/// target position `floor(file_len * i / N)` is computed independently,
+/// then forward-searched to the next delimiter. This prevents cumulative
+/// drift that iterative approaches suffer from.
+///
+/// # Properties
+///
+/// - Complete coverage: `first.start == 0`, `last.end == file_len`
+/// - No gaps, no overlaps — contiguous byte ranges
+/// - Record integrity: non-final partitions end immediately after `delimiter`
+/// - Deterministic: same input always produces the same result
+/// - Partition sizes approximate `file_len / actual_count`
+/// - `O(N)` metadata, bounded byte scanning (≤ file_len total)
+/// - No full-file sequential scan required
+///
+/// # Edge cases
+///
+/// | Case | Result |
+/// |------|--------|
+/// | `handle` is NULL | Returns 0 + error |
+/// | `requested_partitions == 0` | Returns 0 + error |
+/// | Empty file | Returns 0 (no partitions) |
+/// | `requested_partitions == 1` | Returns 1 (whole file) |
+/// | No delimiter in file | Returns 1 (whole file) |
+/// | Giant record spans multiple targets | Boundaries collapse, actual < requested |
+/// | Fewer records than requested | Produces ≤ record count partitions |
+///
+/// # Return value
+///
+/// The actual number of partitions, which may be less than `requested_partitions`
+/// if records are sparse. Returns 0 on error; call `mmap_engine_last_error()` for
+/// diagnostics.
+///
+/// # Mode switching
+///
+/// Replaces any previous layout (delimited, fixed, or partitioned). Call
+/// `mmap_engine_get_chunk()` afterwards to retrieve partitions zero-copy.
+///
+/// # Threading
+///
+/// Single-thread open/scan, multi-thread get_chunk after scan completes.
+/// Same contract as `mmap_engine_scan_chunks()`.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by `mmap_engine_open`
+/// and must not have been freed.
+///
+/// Added in ABI v1.2 (detect with `MMAP_ENGINE_CAP_RECORD_PARTITIONING`).
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_partition_records(
+    handle: *mut CEngineHandle,
+    requested_partitions: usize,
+    delimiter: u8,
+) -> usize {
+    let inner = move || {
+        clear_error();
+
+        if handle.is_null() {
+            set_error("handle is null");
+            return 0;
+        }
+
+        let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        let file_len = engine.mmap.len();
+        if file_len == 0 {
+            engine.layout = ChunkLayout::Empty;
+            return 0;
+        }
+
+        if requested_partitions == 0 {
+            set_error("requested_partitions must be > 0");
+            return 0;
+        }
+
+        let data = unsafe { engine.mmap.as_slice() };
+        let partitions = scanner::find_partition_boundaries(data, requested_partitions, delimiter);
+
+        let count = partitions.len();
+        engine.layout = ChunkLayout::Partitioned(partitions);
+        count
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(count) => count,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_partition_records");
+            0
+        }
+    }
+}
+
 /// Retrieve a chunk view by index.
 ///
 /// Writes the chunk's data pointer and length into `out_chunk`. The
@@ -358,7 +465,7 @@ pub unsafe extern "C" fn mmap_engine_get_chunk(
                 set_error("chunk index out of bounds");
                 return -1;
             }
-            ChunkLayout::Delimited(chunks) => {
+            ChunkLayout::Delimited(chunks) | ChunkLayout::Partitioned(chunks) => {
                 if index >= chunks.len() {
                     set_error("chunk index out of bounds");
                     return -1;
@@ -1094,6 +1201,238 @@ mod tests {
             mmap_engine_free(h);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Record partition C ABI tests ──────────────────────────────────
+
+    #[test]
+    fn test_partition_records_null_handle() {
+        unsafe {
+            assert_eq!(
+                mmap_engine_partition_records(std::ptr::null_mut(), 4, b'\n'),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn test_partition_records_zero_partitions() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_zero");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"a\nb\nc\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+            assert_eq!(mmap_engine_partition_records(h, 0, b'\n'), 0);
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_basic() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_basic");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        let content = b"record1\nrecord2\nrecord3\nrecord4\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+
+            // 2 partitions of 4 records
+            let count = mmap_engine_partition_records(h, 2, b'\n');
+            assert!(count == 2);
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert!(view.len > 0);
+            assert_eq!(mmap_engine_get_chunk(h, 1, &mut view), 0);
+            assert!(view.len > 0);
+            // OOB
+            assert_eq!(mmap_engine_get_chunk(h, 2, &mut view), -1);
+
+            // Verify complete coverage
+            let mut total = 0usize;
+            for i in 0..count {
+                assert_eq!(mmap_engine_get_chunk(h, i, &mut view), 0);
+                total += view.len;
+            }
+            assert_eq!(total, content.len());
+
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_no_delimiter() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_nodelim");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        let content = b"no_newlines_at_all";
+        std::fs::write(&file_path, content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+
+            // No delimiter -> entire file is one partition
+            let count = mmap_engine_partition_records(h, 8, b'\n');
+            assert_eq!(count, 1);
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, content.len());
+            assert_eq!(mmap_engine_get_chunk(h, 1, &mut view), -1);
+
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_empty_file() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+            assert_eq!(mmap_engine_partition_records(h, 4, b'\n'), 0);
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_mode_switching_delimited_fixed_partitioned() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_mode_switch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        // 10 records: "line0\n" through "line9\n" = 60 bytes
+        let mut content = Vec::new();
+        for i in 0..10 {
+            content.extend_from_slice(format!("line{i}\n").as_bytes());
+        }
+        std::fs::write(&file_path, &content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+
+            // 1. Delimited scan
+            let dc = mmap_engine_scan_chunks_ex(h, 12, b'\n');
+            assert!(dc > 0);
+
+            // 2. Switch to fixed
+            let fc = mmap_engine_scan_fixed(h, 10);
+            assert!(fc > 0);
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, 10);
+
+            // 3. Switch to partitioned
+            let pc = mmap_engine_partition_records(h, 3, b'\n');
+            assert_eq!(pc, 3);
+            // Verify total coverage
+            let mut total = 0usize;
+            for i in 0..pc {
+                assert_eq!(mmap_engine_get_chunk(h, i, &mut view), 0);
+                total += view.len;
+            }
+            assert_eq!(total, content.len());
+
+            // 4. Switch back to fixed
+            mmap_engine_scan_fixed(h, 20);
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, 20);
+
+            // 5. Switch back to delimited
+            mmap_engine_scan_chunks_ex(h, 12, b'\n');
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert!(view.len > 0);
+
+            // 6. Switch back to partitioned with different N
+            let pc2 = mmap_engine_partition_records(h, 5, b'\n');
+            assert_eq!(pc2, 5);
+
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_giant_record() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_giant");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        let mut content = b"small1\n".to_vec();
+        content.extend(vec![b'x'; 5000]); // giant, no delimiter
+        content.extend_from_slice(b"small2\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+
+            // Request many partitions; should collapse due to giant record
+            let count = mmap_engine_partition_records(h, 32, b'\n');
+            assert!(count < 32, "giant record should collapse boundaries");
+            assert!(count > 0, "should have at least one partition");
+
+            // Verify complete coverage
+            let mut total = 0usize;
+            for i in 0..count {
+                assert_eq!(mmap_engine_get_chunk(h, i, &mut view), 0);
+                total += view.len;
+            }
+            assert_eq!(total, content.len());
+
+            // Verify giant record is not split
+            for i in 0..count.saturating_sub(1) {
+                assert_eq!(mmap_engine_get_chunk(h, i, &mut view), 0);
+                if view.len > 0 {
+                    let last_byte = *view.data.add(view.len - 1);
+                    assert_eq!(last_byte, b'\n', "non-final partition must end after \\n");
+                }
+            }
+
+            mmap_engine_free(h);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

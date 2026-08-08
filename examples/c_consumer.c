@@ -25,7 +25,7 @@ static void write_test_file(const char *path, const uint8_t *data, size_t len) {
 int main(void) {
     /* ── 1. ABI version ──────────────────────────────────────────── */
     TEST("abi_version");
-    CHECK(mmap_engine_abi_version() == 0x00010001U, "ABI version must be 0x00010001");
+    CHECK(mmap_engine_abi_version() == 0x00010002U, "ABI version must be 0x00010002");
 
     /* ── 2. Capabilities ─────────────────────────────────────────── */
     TEST("capabilities");
@@ -259,6 +259,126 @@ int main(void) {
     CHECK(ms_dc2 == ms_dc, "back to delimited must match");
     mmap_engine_free(hms);
     remove("c_consumer_mode_switch.dat");
+
+    /* ── 23. Partition: basic N=2 ──────────────────────────────────── */
+    TEST("partition_n2");
+    write_test_file("c_consumer_partition_n2.dat",
+                    (const uint8_t *)"rec1\nrec2\nrec3\nrec4\n", 20);
+    CEngineHandle *hp2 = mmap_engine_open("c_consumer_partition_n2.dat");
+    CHECK(hp2 != NULL, "must open");
+    size_t pc2 = mmap_engine_partition_records(hp2, 2, '\n');
+    CHECK(pc2 == 2, "4 records, N=2 → 2 partitions");
+    CChunkView pv2;
+    size_t ptotal2 = 0;
+    for (size_t i = 0; i < pc2; i++) {
+        CHECK(mmap_engine_get_chunk(hp2, i, &pv2) == 0, "get partition");
+        CHECK(pv2.len > 0, "partition must be non-empty");
+        ptotal2 += pv2.len;
+    }
+    CHECK(ptotal2 == 20, "total must equal file size");
+    CHECK(mmap_engine_get_chunk(hp2, pc2, &pv2) == -1, "OOB");
+    mmap_engine_free(hp2);
+    remove("c_consumer_partition_n2.dat");
+
+    /* ── 24. Partition: N=1 ────────────────────────────────────────── */
+    TEST("partition_n1");
+    write_test_file("c_consumer_partition_n1.dat",
+                    (const uint8_t *)"a\nb\n", 4);
+    CEngineHandle *hp1 = mmap_engine_open("c_consumer_partition_n1.dat");
+    CHECK(hp1 != NULL, "must open");
+    size_t pc1 = mmap_engine_partition_records(hp1, 1, '\n');
+    CHECK(pc1 == 1, "N=1 → 1 partition");
+    CChunkView pv1;
+    CHECK(mmap_engine_get_chunk(hp1, 0, &pv1) == 0, "");
+    CHECK(pv1.len == 4, "single partition = whole file");
+    mmap_engine_free(hp1);
+    remove("c_consumer_partition_n1.dat");
+
+    /* ── 25. Partition: N=0 → error ────────────────────────────────── */
+    TEST("partition_n0");
+    write_test_file("c_consumer_partition_n0.dat",
+                    (const uint8_t *)"data\n", 5);
+    CEngineHandle *hp0 = mmap_engine_open("c_consumer_partition_n0.dat");
+    CHECK(hp0 != NULL, "must open");
+    CHECK(mmap_engine_partition_records(hp0, 0, '\n') == 0, "N=0 → error");
+    CHECK(mmap_engine_last_error() != NULL, "error must be set");
+    mmap_engine_free(hp0);
+    remove("c_consumer_partition_n0.dat");
+
+    /* ── 26. Partition: no delimiter → 1 partition ─────────────────── */
+    TEST("partition_nodelim");
+    write_test_file("c_consumer_partition_nodelim.dat",
+                    (const uint8_t *)"no_newlines", 11);
+    CEngineHandle *hpnd = mmap_engine_open("c_consumer_partition_nodelim.dat");
+    CHECK(hpnd != NULL, "must open");
+    size_t pcnd = mmap_engine_partition_records(hpnd, 8, '\n');
+    CHECK(pcnd == 1, "no delim → 1 partition");
+    CChunkView pvnd;
+    CHECK(mmap_engine_get_chunk(hpnd, 0, &pvnd) == 0, "");
+    CHECK(pvnd.len == 11, "partition = whole file");
+    mmap_engine_free(hpnd);
+    remove("c_consumer_partition_nodelim.dat");
+
+    /* ── 27. Partition: empty file → 0 ─────────────────────────────── */
+    TEST("partition_empty");
+    write_test_file("c_consumer_partition_empty.dat",
+                    (const uint8_t *)"", 0);
+    CEngineHandle *hpe = mmap_engine_open("c_consumer_partition_empty.dat");
+    CHECK(hpe != NULL, "empty file handle");
+    CHECK(mmap_engine_partition_records(hpe, 4, '\n') == 0, "empty → 0");
+    mmap_engine_free(hpe);
+    remove("c_consumer_partition_empty.dat");
+
+    /* ── 28. Partition: null handle → 0 ────────────────────────────── */
+    TEST("partition_null");
+    CHECK(mmap_engine_partition_records(NULL, 4, '\n') == 0, "null handle → 0");
+
+    /* ── 29. Partition: N > records ────────────────────────────────── */
+    TEST("partition_n_gt_records");
+    write_test_file("c_consumer_partition_ngt.dat",
+                    (const uint8_t *)"a\nb\n", 4);
+    CEngineHandle *hpng = mmap_engine_open("c_consumer_partition_ngt.dat");
+    CHECK(hpng != NULL, "must open");
+    size_t pcng = mmap_engine_partition_records(hpng, 100, '\n');
+    CHECK(pcng > 0, "should produce some partitions");
+    CHECK(pcng < 100, "should not produce 100 partitions for 2 recs");
+    CChunkView pvng;
+    for (size_t i = 0; i < pcng; i++) {
+        CHECK(mmap_engine_get_chunk(hpng, i, &pvng) == 0, "");
+        CHECK(pvng.len > 0, "no empty partitions");
+    }
+    mmap_engine_free(hpng);
+    remove("c_consumer_partition_ngt.dat");
+
+    /* ── 30. Partition mode switch: delimited ↔ partitioned ────────── */
+    TEST("partition_mode_switch");
+    write_test_file("c_consumer_partition_ms.dat",
+                    (const uint8_t *)"line0\nline1\nline2\nline3\nline4\nline5\n", 36);
+    CEngineHandle *hpms = mmap_engine_open("c_consumer_partition_ms.dat");
+    CHECK(hpms != NULL, "must open");
+    CChunkView pmsv;
+
+    /* Delimited first */
+    size_t d = mmap_engine_scan_chunks_ex(hpms, 12, '\n');
+    CHECK(d > 0, "delimited scan");
+    CHECK(mmap_engine_get_chunk(hpms, 0, &pmsv) == 0, "");
+
+    /* Switch to partition */
+    size_t p = mmap_engine_partition_records(hpms, 3, '\n');
+    CHECK(p == 3, "partition scan");
+    size_t ptotalms = 0;
+    for (size_t i = 0; i < p; i++) {
+        CHECK(mmap_engine_get_chunk(hpms, i, &pmsv) == 0, "");
+        ptotalms += pmsv.len;
+    }
+    CHECK(ptotalms == 36, "coverage");
+
+    /* Switch back to delimited */
+    size_t d2 = mmap_engine_scan_chunks_ex(hpms, 12, '\n');
+    CHECK(d2 == d, "back to delimited matches");
+
+    mmap_engine_free(hpms);
+    remove("c_consumer_partition_ms.dat");
 
     /* ── Cleanup ──────────────────────────────────────────────────── */
     remove(test_path);

@@ -11,7 +11,7 @@ Language-agnostic, harness-independent, standalone open-source product.
 cargo fmt --check        # Format check
 cargo check              # Fast compile check
 cargo clippy --all-targets -- -D warnings   # Lint
-cargo test               # 72 unit + 2 integration tests
+cargo test               # 108 unit + 2 integration tests (110 total)
 cargo build --release    # Produces staticlib + cdylib
 ```
 
@@ -31,8 +31,9 @@ python -m pytest tests/test_native_io.py -v
 src/
   lib.rs      — module declarations + public re-exports
   mmap.rs     — MmapFile: platform-specific mmap (Unix/Win), Send+Sync
-  scanner.rs  — find_chunk_boundaries (delimiter), find_byte_swar (SWAR),
-  ffi.rs      — C ABI: 9 public functions, ChunkLayout enum, panic containment
+  scanner.rs  — find_chunk_boundaries (delimiter), find_partition_boundaries (N-way),
+                 find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds
+  ffi.rs      — C ABI: 10 public functions, ChunkLayout enum, panic containment
 
 tests/
   c_abi_test.rs   — Integration test: C ABI via extern "C" (Rust calling Rust)
@@ -52,7 +53,7 @@ mmap_chunker.h    — Public C header with full API docs
 - **Threading**: open/scan/free = single-thread, get_chunk = multi-thread after scan
 - **No harness imports** — this library has no dependency on any agent harness
 
-## Public C ABI (9 functions)
+## Public C ABI (10 functions)
 
 | Function                          | Purpose                              |
 |-----------------------------------|--------------------------------------|
@@ -63,6 +64,7 @@ mmap_chunker.h    — Public C header with full API docs
 | `mmap_engine_scan_chunks(h, sz)`  | Scan with newline delimiter (v1.0)   |
 | `mmap_engine_scan_chunks_ex(h,sz,delim)` | Scan with configurable delimiter |
 | `mmap_engine_scan_fixed(h, sz)`   | Fixed-size arithmetic chunking (v1.1)|
+| `mmap_engine_partition_records(h, n, d)` | Record-aligned N-way partition (v1.2)|
 | `mmap_engine_get_chunk(h, i, out)`| Zero-copy chunk by index (returns 0/-1) |
 | `mmap_engine_free(h)`             | Release all resources (abort on panic)|
 

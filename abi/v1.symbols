@@ -13,5 +13,6 @@ mmap_engine_open
 mmap_engine_scan_chunks
 mmap_engine_scan_chunks_ex
 mmap_engine_scan_fixed
+mmap_engine_partition_records
 mmap_engine_get_chunk
 mmap_engine_free
