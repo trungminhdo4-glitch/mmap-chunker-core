@@ -8,6 +8,7 @@ pub use ffi::{
 };
 pub use mmap::MmapFile;
 pub use scanner::ChunkCursor;
+pub use scanner::PatternChunkCursor;
 
 #[derive(Debug)]
 pub(crate) enum ChunkLayout {
@@ -195,6 +196,60 @@ impl MmapChunker {
     #[inline]
     pub fn delimited_cursor(&self, chunk_size: usize, delimiter: u8) -> ChunkCursor<'_> {
         ChunkCursor::new(self.as_bytes(), chunk_size, delimiter)
+    }
+
+    /// Scan with a multi-byte delimiter (e.g., `b"\r\n"` for CRLF).
+    ///
+    /// Same semantics as [`scan_delimited`](Self::scan_delimited) but
+    /// the delimiter can be multiple bytes. Chunk boundaries are placed
+    /// immediately after the complete delimiter.
+    ///
+    /// When `delimiter.len() == 1`, this produces identical results to
+    /// the single-byte path. Delegates to the SWAR fast path internally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
+    pub fn scan_delimited_pattern(&mut self, chunk_size: usize, delimiter: &[u8]) -> usize {
+        let data = self.mmap.as_bytes();
+        if data.is_empty() {
+            self.layout = ChunkLayout::Empty;
+            return 0;
+        }
+        let chunks = scanner::find_chunk_boundaries_pattern(data, chunk_size, delimiter);
+        let count = chunks.len();
+        self.layout = ChunkLayout::Delimited(chunks);
+        count
+    }
+
+    /// Create a lazy streaming cursor with a multi-byte delimiter.
+    ///
+    /// Returns a [`PatternChunkCursor`] — same O(1) memory semantics
+    /// as [`delimited_cursor`](Self::delimited_cursor), but for
+    /// multi-byte delimiters like `b"\r\n"`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmap_chunker_core::MmapChunker;
+    ///
+    /// let file = unsafe { MmapChunker::open("records.jsonl")? };
+    /// for chunk in file.delimited_cursor_pattern(64 * 1024, b"\r\n") {
+    ///     let _data: &[u8] = chunk;
+    /// }
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[inline]
+    pub fn delimited_cursor_pattern<'a>(
+        &'a self,
+        chunk_size: usize,
+        delimiter: &'a [u8],
+    ) -> PatternChunkCursor<'a, 'a> {
+        PatternChunkCursor::new(self.as_bytes(), chunk_size, delimiter)
     }
 
     /// Retrieve a zero-copy chunk by index.

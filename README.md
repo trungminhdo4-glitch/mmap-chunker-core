@@ -111,6 +111,17 @@ let parts = file.partition_records(4, b'\n');
 for i in 0..parts {
     let partition = file.get_chunk(i).unwrap();
 }
+
+// Multi-byte delimiters (CRLF, HTTP-style, custom separators)
+let mut file = unsafe { MmapChunker::open("data.txt")? };
+let n = file.scan_delimited_pattern(65536, b"\r\n");
+let chunk = file.get_chunk(0);
+
+// Lazy cursor with multi-byte delimiter
+let file = unsafe { MmapChunker::open("data.txt")? };
+for chunk in file.delimited_cursor_pattern(65536, b"\r\n\r\n") {
+    let _data: &[u8] = chunk;
+}
 ```
 
 ## Scanner primitives (standalone, no mmap)
@@ -126,11 +137,17 @@ let chunks = scanner::find_chunk_boundaries(data, 4, b'\n');
 // 2. Lazy delimiter cursor — yields &[u8] slices on demand
 let slices: Vec<&[u8]> = scanner::ChunkCursor::new(data, 4, b'\n').collect();
 
-// 3. Fixed-size chunking — O(1) arithmetic layout, zero scan cost
+// 3. Multi-byte delimiter scanner — e.g., CRLF, HTTP-style separators
+let chunks = scanner::find_chunk_boundaries_pattern(data, 4, b"\r\n");
+
+// 4. Lazy multi-byte cursor
+let slices: Vec<&[u8]> = scanner::PatternChunkCursor::new(data, 4, b"\r\n\r\n").collect();
+
+// 5. Fixed-size chunking — O(1) arithmetic layout, zero scan cost
 let count = scanner::fixed_chunk_count(data.len(), 4096);
 let bounds = scanner::fixed_chunk_bounds(data.len(), 4096, 0);
 
-// 4. Record-aligned N-way partitioning — for parallel consumers
+// 6. Record-aligned N-way partitioning — for parallel consumers
 let partitions = scanner::find_partition_boundaries(data, 4, b'\n');
 ```
 
@@ -206,7 +223,7 @@ cargo test
 cargo build --release
 ```
 
-152 tests (150 unit + 2 integration) including property tests for concatenation,
+181 tests (179 unit + 2 integration) including property tests for concatenation,
 gap-freedom, determinism, monotonic offsets, delimiter variants, fixed-size chunking,
 and record-aligned partition planning.
 
@@ -217,12 +234,11 @@ Companion test suites:
 ## Limitations
 
 - Full-file mapping only (no windowed mmap). Very large files may exhaust address space.
-- Single-byte delimiter only. Multi-byte or regex delimiters not supported.
 - No copy-on-write or mutable access. Read-only mapping.
+- No regex delimiters. Multi-byte delimiters supported (e.g., `b"\r\n"`, `b"\r\n\r\n"`).
 
 ## Roadmap
 
-- Multi-byte delimiter support (`\r\n`, custom record separators)
 - SIMD-accelerated byte search (runtime dispatch)
 
 ## License

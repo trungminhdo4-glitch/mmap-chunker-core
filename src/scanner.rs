@@ -154,6 +154,206 @@ impl<'a> Iterator for ChunkCursor<'a> {
     }
 }
 
+/// Search `haystack` for the first occurrence of the multi-byte `pattern`.
+///
+/// Uses first-byte SWAR to find candidates, then verifies with
+/// [`starts_with`]. For single-byte patterns, this is equivalent to
+/// [`find_byte_swar`]. For longer patterns, each candidate position
+/// resynchronizes the search after a false-positive first-byte match.
+///
+/// Time complexity: O(n + m) typical, O(n*m) pathological (repeated
+/// prefix). No unsafe. No dependencies. MSRV 1.77.
+fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
+    let plen = pattern.len();
+    if plen == 0 || haystack.len() < plen {
+        return None;
+    }
+    if plen == 1 {
+        return find_byte_swar(haystack, pattern[0]);
+    }
+
+    let first_byte = pattern[0];
+    let hlen = haystack.len();
+    let max_search = hlen - plen;
+    let mut search_start = 0;
+
+    while search_start <= max_search {
+        let remainder = &haystack[search_start..];
+        match find_byte_swar(remainder, first_byte) {
+            Some(rel_pos) => {
+                let pos = search_start + rel_pos;
+                if pos > max_search {
+                    return None;
+                }
+                if haystack[pos..].starts_with(pattern) {
+                    return Some(pos);
+                }
+                search_start = pos + 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Find chunk boundaries in `data` using a multi-byte `delimiter`.
+///
+/// Same semantics as [`find_chunk_boundaries`] but the delimiter can be
+/// multiple bytes (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP
+/// headers). Chunks are placed immediately after the complete delimiter.
+///
+/// When `delimiter.len() == 1`, this delegates to the single-byte SWAR
+/// fast path and produces identical output.
+///
+/// # Panics
+///
+/// Panics if `delimiter` is empty.
+pub fn find_chunk_boundaries_pattern(
+    data: &[u8],
+    chunk_size: usize,
+    delimiter: &[u8],
+) -> Vec<(usize, usize)> {
+    assert!(!delimiter.is_empty(), "delimiter must not be empty");
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let dlen = delimiter.len();
+    let len = data.len();
+    let step = chunk_size.max(1);
+    let estimate = (len / step) + 2;
+    let mut chunks = Vec::with_capacity(estimate);
+
+    let mut start = 0usize;
+
+    while start < len {
+        let mut end = start + step;
+
+        if end >= len {
+            end = len;
+        } else {
+            let remainder = &data[end..];
+            if let Some(rel_pos) = find_pattern_in_slice(remainder, delimiter) {
+                end = end + rel_pos + dlen;
+                if end > len {
+                    end = len;
+                }
+            } else {
+                end = len;
+            }
+        }
+
+        chunks.push((start, end));
+        start = end;
+    }
+
+    chunks
+}
+
+/// A lazy, streaming cursor for multi-byte delimiter chunking.
+///
+/// Like [`ChunkCursor`] but accepts a slice pattern as the delimiter.
+/// Each call to [`next`](PatternChunkCursor::next) yields a chunk aligned
+/// after the complete multi-byte delimiter.
+///
+/// Single-byte patterns are handled via the same SWAR fast path as
+/// [`ChunkCursor`]. Multi-byte patterns use first-byte SWAR candidate
+/// search with [`starts_with`] verification.
+///
+/// # Panics
+///
+/// Panics if `delimiter` is empty.
+///
+/// # Example
+///
+/// ```
+/// use mmap_chunker_core::PatternChunkCursor;
+///
+/// let data = b"a\r\nb\r\nc\r\n";
+/// let chunks: Vec<&[u8]> = PatternChunkCursor::new(data, 4, b"\r\n").collect();
+/// assert_eq!(chunks, vec![b"a\r\nb\r\n" as &[u8], b"c\r\n" as &[u8]]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct PatternChunkCursor<'a, 'p> {
+    data: &'a [u8],
+    chunk_size: usize,
+    delimiter: &'p [u8],
+    position: usize,
+}
+
+impl<'a, 'p> PatternChunkCursor<'a, 'p> {
+    /// Create a new pattern cursor with the given multi-byte `delimiter`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
+    #[inline]
+    pub fn new(data: &'a [u8], chunk_size: usize, delimiter: &'p [u8]) -> Self {
+        assert!(!delimiter.is_empty(), "delimiter must not be empty");
+        Self {
+            data,
+            chunk_size,
+            delimiter,
+            position: 0,
+        }
+    }
+
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl<'a, 'p> Iterator for PatternChunkCursor<'a, 'p> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let len = self.data.len();
+        if self.position >= len {
+            return None;
+        }
+
+        let dlen = self.delimiter.len();
+        let step = self.chunk_size.max(1);
+        let target = self.position + step;
+        let end = if target >= len {
+            len
+        } else {
+            let remainder = &self.data[target..];
+            match find_pattern_in_slice(remainder, self.delimiter) {
+                Some(rel_pos) => (target + rel_pos + dlen).min(len),
+                None => len,
+            }
+        };
+
+        let chunk = &self.data[self.position..end];
+        self.position = end;
+        Some(chunk)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.data.len();
+        if self.position >= len {
+            return (0, Some(0));
+        }
+        let remaining = len - self.position;
+        let step = self.chunk_size.max(1);
+        let estimate = (remaining / step) + 1;
+        let max = remaining;
+        (estimate, Some(max))
+    }
+}
+
 /// Safe SWAR (SIMD Within A Register) byte search.
 ///
 /// Scans `haystack` for the first occurrence of `delimiter`. Processes
@@ -1918,5 +2118,313 @@ mod tests {
             let total: usize = partitions.iter().map(|(s, e)| e - s).sum();
             assert_eq!(total, data.len());
         }
+    }
+
+    // ── Multi-byte delimiter tests ──────────────────────────────────────
+
+    /// Verify pattern scanner == single-byte scanner for 1-byte delimiters.
+    fn pattern_equals_single_byte(data: &[u8], chunk_size: usize, delimiter: u8) {
+        let single = find_chunk_boundaries(data, chunk_size, delimiter);
+        let pattern = find_chunk_boundaries_pattern(data, chunk_size, &[delimiter]);
+        assert_eq!(
+            single, pattern,
+            "pattern != single: chunk_size={chunk_size} delim={delimiter:#04x}"
+        );
+    }
+
+    /// Verify PatternChunkCursor == ChunkCursor for 1-byte delimiters.
+    fn cursor_pattern_equals_single_byte(data: &[u8], chunk_size: usize, delimiter: u8) {
+        let single: Vec<&[u8]> = ChunkCursor::new(data, chunk_size, delimiter).collect();
+        let pattern: Vec<&[u8]> = PatternChunkCursor::new(data, chunk_size, &[delimiter]).collect();
+        assert_eq!(
+            single, pattern,
+            "pattern cursor != single cursor: chunk_size={chunk_size} delim={delimiter:#04x}",
+        );
+    }
+
+    #[test]
+    fn pattern_single_byte_equivalence_all_delimiters() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"hello\nworld\n", 4, b'\n'),
+            (b"a,b,c,d", 2, b','),
+            (b"one\ttwo\tthree", 4, b'\t'),
+            (b"a|b|c|d|e|f", 3, b'|'),
+            (b"x\x00y\x00z", 2, b'\x00'),
+            (b"single", 1024, b'\n'),
+            (b"\n\n\n\n\n", 1, b'\n'),
+            (b"", 1024, b'\n'),
+            (b"\n", 1, b'\n'),
+            (b"a", 1024, b'\n'),
+            (b"line1\nline2\nline3\nline4\nline5\n", 10, b'\n'),
+            (b"no_newlines_here", 5, b'\n'),
+            (b"xxxx\n", 5, b'\n'),
+            (b"a\nb\nc\n", 1, b'\n'),
+            (b"tiny\nverylongrecordwithnobreaksanywhere\nend\n", 6, b'\n'),
+        ];
+        for &(data, chunk_size, delim) in cases {
+            pattern_equals_single_byte(data, chunk_size, delim);
+            cursor_pattern_equals_single_byte(data, chunk_size, delim);
+        }
+    }
+
+    #[test]
+    fn pattern_empty_delimiter_panics() {
+        let result = std::panic::catch_unwind(|| {
+            find_chunk_boundaries_pattern(b"hello", 10, b"");
+        });
+        assert!(result.is_err(), "empty delimiter must panic");
+    }
+
+    #[test]
+    fn pattern_empty_data() {
+        assert_eq!(find_chunk_boundaries_pattern(b"", 1024, b"\r\n"), vec![]);
+        assert_eq!(
+            PatternChunkCursor::new(b"", 1024, b"\r\n").collect::<Vec<_>>(),
+            Vec::<&[u8]>::new()
+        );
+    }
+
+    #[test]
+    fn pattern_crlf_basic() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 4, b"\r\n");
+        assert_eq!(chunks, vec![(0, 6), (6, 9)]);
+
+        let cursor: Vec<&[u8]> = PatternChunkCursor::new(data, 4, b"\r\n").collect();
+        assert_eq!(cursor, vec![b"a\r\nb\r\n" as &[u8], b"c\r\n" as &[u8]]);
+    }
+
+    #[test]
+    fn pattern_crlf_no_trailing_delimiter() {
+        let data = b"a\r\nb\r\nc";
+        let chunks = find_chunk_boundaries_pattern(data, 1024, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_consecutive_crlf() {
+        let data = b"\r\n\r\n\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 1, b"\r\n");
+        assert_eq!(chunks, vec![(0, 4), (4, 6)]);
+    }
+
+    #[test]
+    fn pattern_double_crlf_http_style() {
+        let data = b"Header: val\r\n\r\nbody";
+        let chunks = find_chunk_boundaries_pattern(data, 1024, b"\r\n\r\n");
+        assert_eq!(chunks, vec![(0, 19)]);
+    }
+
+    #[test]
+    fn pattern_double_crlf_split_at_delimiter() {
+        let data = b"Header: val\r\n\r\nbody line 2\r\n\r\nmore";
+        let chunks = find_chunk_boundaries_pattern(data, 1, b"\r\n\r\n");
+        assert_eq!(chunks.len(), 3);
+        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, data.len());
+        assert_eq!(&data[chunks[0].0..chunks[0].1], b"Header: val\r\n\r\n");
+    }
+
+    #[test]
+    fn pattern_custom_double_separator() {
+        let data = b"a||b||c||d";
+        let chunks = find_chunk_boundaries_pattern(data, 4, b"||");
+        assert_eq!(chunks, vec![(0, 6), (6, 10)]);
+
+        let cursor: Vec<&[u8]> = PatternChunkCursor::new(data, 4, b"||").collect();
+        assert_eq!(cursor, vec![b"a||b||" as &[u8], b"c||d" as &[u8]]);
+    }
+
+    #[test]
+    fn pattern_binary_delimiter() {
+        let data = b"AB\x00\xFF\x00CD\x00\xFF\x00EF";
+        let chunks = find_chunk_boundaries_pattern(data, 10, b"\x00\xff\x00");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_binary_delimiter_small_chunk() {
+        let data = b"AB\x00\xFF\x00CD\x00\xFF\x00EF";
+        let chunks = find_chunk_boundaries_pattern(data, 4, b"\x00\xff\x00");
+        assert_eq!(chunks, vec![(0, 10), (10, 12)]);
+    }
+
+    #[test]
+    fn pattern_at_eof() {
+        let data = b"hello\r\nworld\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 50, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_partial_at_eof() {
+        let data = b"hello\r\nworld\r";
+        let chunks = find_chunk_boundaries_pattern(data, 50, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_exactly_at_target() {
+        let data = b"xxxx\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 6, b"\r\n");
+        assert_eq!(chunks, vec![(0, 6)]);
+    }
+
+    #[test]
+    fn pattern_starts_one_byte_before_target() {
+        let data = b"xxxy\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 6, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+        assert_eq!(&data[..chunks[0].1], b"xxxy\r\n");
+    }
+
+    #[test]
+    fn pattern_no_delimiter() {
+        let data = b"no_delimiter_here";
+        let chunks = find_chunk_boundaries_pattern(data, 5, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_delimiter_longer_than_data() {
+        let data = b"hi";
+        let chunks = find_chunk_boundaries_pattern(data, 1024, b"\r\n\r\n\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_chunk_size_zero() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 0, b"\r\n");
+        assert!(!chunks.is_empty());
+        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn pattern_chunk_size_one() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 1, b"\r\n");
+        let mut pos = 0;
+        for (start, end) in &chunks {
+            assert_eq!(*start, pos);
+            pos = *end;
+        }
+        assert_eq!(pos, data.len());
+    }
+
+    #[test]
+    fn pattern_huge_chunk_size() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 1_000_000, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn pattern_overlapping_pattern() {
+        // Delimiter "aa" should not match at position 0 in "aaa"
+        let data = b"xaaaay";
+        let chunks = find_chunk_boundaries_pattern(data, 1, b"aa");
+        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn pattern_cursor_equivalence_crlf() {
+        let data = b"line1\r\nline2\r\nline3\r\n";
+        let eager = find_chunk_boundaries_pattern(data, 6, b"\r\n");
+        let cursor: Vec<&[u8]> = PatternChunkCursor::new(data, 6, b"\r\n").collect();
+        let lazy_ranges: Vec<(usize, usize)> = cursor
+            .iter()
+            .scan(0usize, |pos, &chunk| {
+                let start = *pos;
+                *pos += chunk.len();
+                Some((start, *pos))
+            })
+            .collect();
+        assert_eq!(lazy_ranges, eager);
+    }
+
+    #[test]
+    fn pattern_deterministic_corpus() {
+        let mut data = Vec::new();
+        for i in 0..1000u32 {
+            data.extend_from_slice(format!("line_{i:04}\r\n").as_bytes());
+        }
+        let eager = find_chunk_boundaries_pattern(&data, 64, b"\r\n");
+        let cursor: Vec<&[u8]> = PatternChunkCursor::new(&data, 64, b"\r\n").collect();
+        let cursor_ranges: Vec<(usize, usize)> = cursor
+            .iter()
+            .scan(0usize, |pos, &chunk| {
+                let start = *pos;
+                *pos += chunk.len();
+                Some((start, *pos))
+            })
+            .collect();
+        assert_eq!(cursor_ranges, eager);
+    }
+
+    #[test]
+    fn pattern_property_no_gaps() {
+        let data = b"rec1\r\nrec2\r\nrec3\r\nrec4\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, 6, b"\r\n");
+        if chunks.is_empty() {
+            return;
+        }
+        assert_eq!(chunks[0].0, 0);
+        for i in 1..chunks.len() {
+            assert_eq!(chunks[i].0, chunks[i - 1].1);
+        }
+        assert_eq!(chunks.last().unwrap().1, data.len());
+    }
+
+    #[test]
+    fn pattern_property_concatenation() {
+        let cases: &[(&[u8], usize, &[u8])] = &[
+            (b"a\r\nb\r\nc\r\n", 4, b"\r\n"),
+            (b"ab||cd||ef", 4, b"||"),
+            (b"single", 1024, b"\r\n"),
+            (b"AB\xff\x00CD\xff\x00EF", 4, b"\xff\x00"),
+        ];
+        for &(data, cs, delim) in cases {
+            let chunks = find_chunk_boundaries_pattern(data, cs, delim);
+            let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+            assert_eq!(total, data.len());
+        }
+    }
+
+    #[test]
+    fn pattern_property_determinism() {
+        let data = b"x||y||z||w||";
+        let c1 = find_chunk_boundaries_pattern(data, 2, b"||");
+        let c2 = find_chunk_boundaries_pattern(data, 2, b"||");
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    #[should_panic(expected = "delimiter must not be empty")]
+    fn pattern_empty_delimiter_cursor_panics() {
+        let _ = PatternChunkCursor::new(b"hello", 10, b"");
+    }
+
+    #[test]
+    fn pattern_empty_delimiter_cursor_panics_catch() {
+        let result = std::panic::catch_unwind(|| {
+            PatternChunkCursor::new(b"hello", 10, b"");
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pattern_repeated_prefix_adversarial() {
+        // Searching for "aaaaab" in "aaaaaaaaaa..." — worst-case for
+        // first-byte SWAR + verify (hits many false positives).
+        let delimiter = b"aaaaab";
+        let hay = vec![b'a'; 10_000];
+        let data: Vec<u8> = hay.iter().chain(delimiter.iter()).copied().collect();
+        let chunks = find_chunk_boundaries_pattern(&data, 5000, delimiter);
+        assert!(!chunks.is_empty());
+        let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, data.len());
     }
 }
