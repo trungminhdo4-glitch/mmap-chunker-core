@@ -1,2 +1,13 @@
 /target/
 Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Local tooling
+.ruff_cache/

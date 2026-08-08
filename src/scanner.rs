@@ -218,4 +218,97 @@ mod tests {
         let chunks = find_chunk_boundaries(data, 1024, b'\n');
         assert_eq!(chunks, vec![(0, 1)]);
     }
+
+    #[test]
+    fn property_concatenation_equals_input() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"hello\nworld\n", 4, b'\n'),
+            (b"a,b,c,d", 2, b','),
+            (b"one\ttwo\tthree", 4, b'\t'),
+            (b"a|b|c|d|e|f", 3, b'|'),
+            (b"x\x00y\x00z", 2, b'\x00'),
+            (b"single", 1024, b'\n'),
+            (b"\n\n\n\n\n", 1, b'\n'),
+            (b"", 1024, b'\n'),
+            (b"\n", 1, b'\n'),
+            (b"a", 1024, b'\n'),
+        ];
+        for &(data, chunk_size, delim) in cases {
+            let chunks = find_chunk_boundaries(data, chunk_size, delim);
+            let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
+            assert_eq!(total, data.len(), "concatenation property failed");
+        }
+    }
+
+    #[test]
+    fn property_no_gaps() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"a\nb\nc\n", 2, b'\n'),
+            (b"a,b,c,d,e", 1, b','),
+            (b"a\tb\tc\t", 2, b'\t'),
+        ];
+        for &(data, chunk_size, delim) in cases {
+            let chunks = find_chunk_boundaries(data, chunk_size, delim);
+            if chunks.is_empty() {
+                continue;
+            }
+            assert_eq!(chunks[0].0, 0, "first chunk must start at 0");
+            for i in 1..chunks.len() {
+                assert_eq!(
+                    chunks[i].0,
+                    chunks[i - 1].1,
+                    "gap at chunk {}->{}",
+                    i - 1,
+                    i
+                );
+            }
+            assert_eq!(
+                chunks.last().unwrap().1,
+                data.len(),
+                "last chunk must end at EOF"
+            );
+        }
+    }
+
+    #[test]
+    fn property_determinism() {
+        let data = b"line1\nline2\nline3\nline4\nline5\n";
+        let chunks1 = find_chunk_boundaries(data, 10, b'\n');
+        let chunks2 = find_chunk_boundaries(data, 10, b'\n');
+        assert_eq!(chunks1, chunks2);
+        let chunks3 = find_chunk_boundaries(data, 10, b'\n');
+        assert_eq!(chunks1, chunks3);
+    }
+
+    #[test]
+    fn property_monotonic_offsets() {
+        let data = b"x\nxx\nxxx\nxxxx\nxxxxx\n";
+        let chunks = find_chunk_boundaries(data, 1, b'\n');
+        let mut last_end = 0usize;
+        for (start, end) in &chunks {
+            assert!(*start >= last_end, "offsets must be monotonic");
+            assert!(*end > *start, "chunk must be non-empty");
+            last_end = *end;
+        }
+    }
+
+    #[test]
+    fn test_alternative_delimiters() {
+        assert_eq!(
+            find_chunk_boundaries(b"a,b,c,d,e", 2, b','),
+            vec![(0, 4), (4, 8), (8, 9)]
+        );
+        assert_eq!(
+            find_chunk_boundaries(b"one\ttwo\tthree", 4, b'\t'),
+            vec![(0, 8), (8, 13)]
+        );
+        assert_eq!(
+            find_chunk_boundaries(b"a|b|c|d|e|f", 3, b'|'),
+            vec![(0, 4), (4, 8), (8, 11)]
+        );
+        assert_eq!(
+            find_chunk_boundaries(b"x\x00y\x00z", 2, b'\x00'),
+            vec![(0, 4), (4, 5)]
+        );
+    }
 }

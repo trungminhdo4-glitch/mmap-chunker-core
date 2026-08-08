@@ -2,12 +2,17 @@
 name = "mmap-chunker-core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.77"
 description = "Zero-dependency data chunking engine with native mmap and C-ABI"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/example/mmap-chunker-core"
+readme = "README.md"
+keywords = ["mmap", "chunking", "ffi", "zero-copy", "c-abi"]
+categories = ["filesystem", "memory-management", "development-tools::ffi"]
+exclude = ["/native_io/", "/tests/test_native_io.py", "/AGENTS.md", "/Cargo.lock"]
 
 [lib]
 name = "mmap_chunker_core"
-crate-type = ["lib", "staticlib"]
+crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]

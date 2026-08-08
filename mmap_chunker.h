@@ -19,6 +19,51 @@ typedef struct {
     size_t len;
 } CChunkView;
 
+/* ── ABI version ──────────────────────────────────────────────────────────── */
+
+#define MMAP_ENGINE_ABI_VERSION 0x00010000U
+
+/* ── Capability bits ──────────────────────────────────────────────────────── */
+
+#define MMAP_ENGINE_CAP_ZERO_COPY              (1U << 0)
+#define MMAP_ENGINE_CAP_CONFIGURABLE_DELIMITER (1U << 1)
+#define MMAP_ENGINE_CAP_ERROR_STRINGS          (1U << 2)
+
+/* ── ABI discovery ────────────────────────────────────────────────────────── */
+
+/**
+ * Return the ABI version as (major << 16) | minor.
+ *
+ * Current: 0x00010000 (v1.0). Always succeeds, never panics.
+ * Call once at library load time to verify compatibility.
+ */
+uint32_t mmap_engine_abi_version(void);
+
+/**
+ * Return a bitmask of supported capabilities.
+ *
+ * Bit 0: ZERO_COPY             — chunk views reference mapped memory directly
+ * Bit 1: CONFIGURABLE_DELIMITER — mmap_engine_scan_chunks_ex() available
+ * Bit 2: ERROR_STRINGS         — mmap_engine_last_error() returns diagnostic text
+ *
+ * Call once at library load time to discover which optional features
+ * the loaded library provides.
+ */
+uint32_t mmap_engine_capabilities(void);
+
+/**
+ * Return a pointer to the last error message for the calling thread,
+ * or NULL if no error occurred.
+ *
+ * The returned pointer references an internal thread-local buffer
+ * (max 255 chars + NUL). It remains valid until the next call to any
+ * API function on the same thread. The caller must copy the string
+ * if it needs to persist beyond the next API call.
+ *
+ * Threading: Thread-safe — each thread has its own error buffer.
+ */
+const char *mmap_engine_last_error(void);
+
 /* ── API functions ────────────────────────────────────────────────────────── */
 
 /**
@@ -27,9 +72,9 @@ typedef struct {
  * @param path  Null-terminated UTF-8 file path.
  * @return      Opaque engine handle on success, or NULL on failure.
  *              Must be freed with mmap_engine_free().
+ *              On failure, call mmap_engine_last_error() for diagnostics.
  *
- * Threading: Must be called from a single thread. The returned handle is not
- * safe to use from multiple threads concurrently.
+ * Threading: Must be called from a single thread.
  *
  * Platform notes:
  * - On Windows, `path` must be valid UTF-8. Non-ASCII characters are
@@ -39,11 +84,12 @@ typedef struct {
 CEngineHandle *mmap_engine_open(const char *path);
 
 /**
- * Scan the mapped file for chunk boundaries.
+ * Scan the mapped file for chunk boundaries using newline ('\\n', 0x0A)
+ * as the delimiter.
  *
- * Chunks are created at approximately `chunk_size_bytes` intervals.
- * Each chunk boundary is placed immediately after a newline (`\n`, 0x0A)
- * found at or after the target offset.
+ * This is the original v1.0 API preserved for backward compatibility.
+ * New consumers should prefer mmap_engine_scan_chunks_ex() which
+ * supports configurable delimiters.
  *
  * Calling this function replaces any previously computed chunk boundaries.
  *
@@ -51,11 +97,44 @@ CEngineHandle *mmap_engine_open(const char *path);
  * @param chunk_size_bytes  Approximate chunk size in bytes (minimum 1;
  *                          values of 0 are silently clamped to 1).
  * @return                  Number of chunks found, or 0 on error / empty file.
+ *                          On error, call mmap_engine_last_error() for diagnostics.
  *
  * Threading: Must be called from a single thread. Concurrent calls to
  * mmap_engine_get_chunk() are permitted ONLY after this function returns.
  */
 size_t mmap_engine_scan_chunks(CEngineHandle *handle, size_t chunk_size_bytes);
+
+/**
+ * Scan the mapped file for chunk boundaries with a configurable delimiter.
+ *
+ * Chunks are created at approximately `chunk_size_bytes` intervals.
+ * Each chunk boundary is placed immediately after a `delimiter` byte
+ * found at or after the target offset. The last chunk extends to the
+ * end of the file.
+ *
+ * Common delimiter values:
+ *   '\\n' (0x0A) — newline (JSONL, NDJSON, logs)
+ *   ','  (0x2C) — comma (CSV)
+ *   '\\t' (0x09) — tab (TSV)
+ *   '|'  (0x7C) — pipe
+ *   '\\0' (0x00) — NUL byte (binary framing)
+ *
+ * Calling this function replaces any previously computed chunk boundaries.
+ *
+ * @param handle            Valid handle from mmap_engine_open().
+ * @param chunk_size_bytes  Approximate chunk size in bytes (minimum 1;
+ *                          values of 0 are silently clamped to 1).
+ * @param delimiter         Byte value used to detect record boundaries.
+ * @return                  Number of chunks found, or 0 on error / empty file.
+ *                          On error, call mmap_engine_last_error() for diagnostics.
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.0 (detect with MMAP_ENGINE_CAP_CONFIGURABLE_DELIMITER).
+ */
+size_t mmap_engine_scan_chunks_ex(CEngineHandle *handle,
+                                  size_t chunk_size_bytes,
+                                  uint8_t delimiter);
 
 /**
  * Retrieve a chunk view by index (zero-copy).
@@ -68,6 +147,7 @@ size_t mmap_engine_scan_chunks(CEngineHandle *handle, size_t chunk_size_bytes);
  * @param index      Zero-based chunk index (< chunk_count).
  * @param out_chunk  Output parameter filled with chunk data and length.
  * @return           0 on success, -1 on error (null pointer or out of bounds).
+ *                   On error, call mmap_engine_last_error() for diagnostics.
  *
  * Threading: Safe to call from multiple threads concurrently after
  * mmap_engine_scan_chunks() has returned, provided the handle is not
@@ -113,6 +193,12 @@ void mmap_engine_free(CEngineHandle *handle);
 
 /* ── ABI stability ────────────────────────────────────────────────────────── */
 /*
+ * Versioning:
+ *   - mmap_engine_abi_version() returns (major << 16) | minor.
+ *   - PATCH releases (bug fixes) do not change the ABI version.
+ *   - MINOR releases add new functions without changing existing signatures.
+ *   - MAJOR releases may break ABI compatibility.
+ *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *
  *   offset  field   type            size (64-bit)
