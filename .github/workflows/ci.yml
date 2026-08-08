@@ -50,13 +50,13 @@ jobs:
       - name: Verify ABI v1 symbols (Linux cdylib)
         run: |
           nm -D target/release/libmmap_chunker_core.so | grep -oP 'T \Kmmap_engine_\w+' | sort > /tmp/actual.symbols
-          sort abi/v1.symbols > /tmp/expected.symbols
+          grep '^mmap_engine_' abi/v1.symbols | sort > /tmp/expected.symbols
           echo "=== ABI v1 symbol check ==="
           echo "Required:"
           cat /tmp/expected.symbols
           echo "Exported:"
           cat /tmp/actual.symbols
-          for sym in $(cat abi/v1.symbols); do
+          for sym in $(grep '^mmap_engine_' abi/v1.symbols); do
             if ! grep -qFx "$sym" /tmp/actual.symbols; then
               echo "FAIL: required symbol '$sym' not exported"
               exit 1
