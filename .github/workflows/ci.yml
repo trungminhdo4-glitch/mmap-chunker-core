@@ -122,6 +122,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Check semver compatibility (v0.2.0 baseline)
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
