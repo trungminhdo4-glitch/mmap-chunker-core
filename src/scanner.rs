@@ -30,7 +30,7 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
             end = len;
         } else {
             let remainder = &data[end..];
-            if let Some(rel_pos) = remainder.iter().position(|&b| b == delimiter) {
+            if let Some(rel_pos) = find_byte_swar(remainder, delimiter) {
                 end = end + rel_pos + 1;
                 if end > len {
                     end = len;
@@ -45,6 +45,62 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
     }
 
     chunks
+}
+
+/// Safe SWAR (SIMD Within A Register) byte search.
+///
+/// Scans `haystack` for the first occurrence of `delimiter`. Processes
+/// 8 bytes per iteration using word-at-a-time bit manipulation, with a
+/// scalar prefix for alignment and a scalar tail for the final <8 bytes.
+///
+/// No unsafe. No dependencies. MSRV 1.77.
+fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
+    let len = haystack.len();
+    if len == 0 {
+        return None;
+    }
+
+    let pattern = (delimiter as u64).wrapping_mul(0x0101010101010101u64);
+    let lo = 0x0101010101010101u64;
+    let hi = 0x8080808080808080u64;
+
+    let mut i = 0usize;
+
+    // Phase 1: scalar prefix to reach 8-byte alignment
+    let ptr = haystack.as_ptr() as usize;
+    let align = ptr % 8;
+    if align != 0 {
+        let prefix_end = (8 - align).min(len);
+        while i < prefix_end {
+            if haystack[i] == delimiter {
+                return Some(i);
+            }
+            i += 1;
+        }
+    }
+
+    // Phase 2: SWAR main loop (8-byte reads)
+    while i + 8 <= len {
+        let chunk: [u8; 8] = haystack[i..i + 8].try_into().unwrap();
+        let word = u64::from_ne_bytes(chunk);
+        let xored = word ^ pattern;
+
+        let has_zero = xored.wrapping_sub(lo) & !xored & hi;
+        if has_zero != 0 {
+            return Some(i + (has_zero.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+
+    // Phase 3: scalar tail (< 8 bytes)
+    while i < len {
+        if haystack[i] == delimiter {
+            return Some(i);
+        }
+        i += 1;
+    }
+
+    None
 }
 
 #[cfg(test)]
