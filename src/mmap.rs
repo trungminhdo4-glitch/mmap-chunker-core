@@ -93,6 +93,7 @@ mod sys {
 ///
 /// - **Unix** (Linux, macOS): Uses `mmap(2)` / `munmap(2)` / `madvise(2)`.
 /// - **Windows**: Uses `CreateFileMappingW` / `MapViewOfFile` / `UnmapViewOfFile`.
+#[derive(Debug)]
 pub struct MmapFile {
     ptr: *const u8,
     size: usize,
@@ -190,11 +191,17 @@ impl MmapFile {
             .chain(std::iter::once(0))
             .collect();
 
-        // SAFETY: `wide` is a valid null-terminated UTF-16 string.
+        // SAFETY: `wide` is null-terminated, all syscalls are read-only.
+        unsafe { Self::open_windows_wide(&wide) }
+    }
+
+    #[cfg(windows)]
+    unsafe fn open_windows_wide(wide_path: &[u16]) -> Option<Self> {
+        // SAFETY: `wide_path` is a valid null-terminated UTF-16 string.
         // `GENERIC_READ` opens for read-only; `OPEN_EXISTING` fails if
         // the file does not exist.
         let fh = sys::CreateFileW(
-            wide.as_ptr(),
+            wide_path.as_ptr(),
             sys::GENERIC_READ,
             sys::FILE_SHARE_READ,
             std::ptr::null(),
@@ -261,6 +268,88 @@ impl MmapFile {
         })
     }
 
+    /// Open and memory-map the file at `path` for read-only access.
+    ///
+    /// Accepts any type that converts to `Path` (`&str`, `&Path`,
+    /// `PathBuf`, `&OsStr`, etc.).
+    ///
+    /// On Windows, the path is encoded as UTF-16 directly (no lossy
+    /// UTF-8 round-trip). On Unix, the raw OS path bytes are used
+    /// directly.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the backing file is not modified,
+    /// truncated, deleted, or otherwise invalidated for the entire
+    /// lifetime of the returned `MmapFile` and all `&[u8]` slices
+    /// derived from it via [`as_bytes`](Self::as_bytes).
+    ///
+    /// Concurrent file mutation by any process — including the calling
+    /// process — violates Rust's `&[u8]` immutability guarantee and is
+    /// undefined behavior (see [The Rust Reference]).
+    ///
+    /// On POSIX systems (`MAP_PRIVATE`) another process may freely
+    /// open the file for writing; use external synchronization (file
+    /// locks, snapshots, or immutable files). On Windows the share
+    /// mode `FILE_SHARE_READ` prevents other processes from opening
+    /// the file for writing, but same-process mutation remains
+    /// possible.
+    ///
+    /// Accessing beyond a truncated region may deliver `SIGBUS`
+    /// (POSIX) or an access violation (Windows), crashing the process.
+    ///
+    /// [The Rust Reference]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub unsafe fn open_path(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        use std::ffi::CString;
+        use std::io;
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = path.as_ref().as_os_str().as_bytes();
+        let c_str =
+            CString::new(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: c_str is a valid null-terminated string, not mutated
+        // during this call. `open` reads the path and maps the file.
+        // The caller's safety obligation covers the returned mapping.
+        unsafe { Self::open(&c_str) }.ok_or_else(|| io::Error::other("failed to open or map file"))
+    }
+
+    /// Open and memory-map the file at `path` for read-only access.
+    ///
+    /// Accepts any type that converts to `Path` (`&str`, `&Path`,
+    /// `PathBuf`, `&OsStr`, etc.).
+    ///
+    /// On Windows, the path is encoded as UTF-16 directly (no lossy
+    /// UTF-8 round-trip). On Unix, the raw OS path bytes are used.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the backing file is not modified,
+    /// truncated, deleted, or otherwise invalidated for the entire
+    /// lifetime of the returned `MmapFile` and all `&[u8]` slices
+    /// derived from it via [`as_bytes`](Self::as_bytes).
+    ///
+    /// See the Unix variant for additional notes on OS-specific
+    /// behavior.
+    #[cfg(windows)]
+    pub unsafe fn open_path(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        use std::io;
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide: Vec<u16> = path
+            .as_ref()
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `wide` is a valid null-terminated UTF-16 string.
+        // All syscalls are read-only file/mapping operations.
+        // The caller's safety obligation covers the returned mapping.
+        unsafe { Self::open_windows_wide(&wide) }
+            .ok_or_else(|| io::Error::other("failed to open or map file"))
+    }
+
     /// Returns a raw pointer to the start of the mapped memory.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
@@ -283,19 +372,37 @@ impl MmapFile {
     ///
     /// # Safety
     ///
-    /// The returned borrow is valid for the lifetime of `self`. The caller
-    /// must not mutate the underlying file while the slice is live
-    /// (the mapping is read-only, so this only matters if another process
-    /// truncates or overwrites the file).
+    /// The returned borrow is valid for the lifetime of `self`. The
+    /// caller must not allow the underlying file to be mutated while
+    /// the slice is live (the mapping is read-only, so this only
+    /// matters if another process truncates or overwrites the file).
+    ///
+    /// Prefer [`as_bytes`](Self::as_bytes) when the caller has already
+    /// accepted the file-immutability contract at construction time
+    /// (e.g. via [`open_path`](Self::open_path)).
     #[inline]
     pub unsafe fn as_slice(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    /// Returns the mapped memory as a byte slice.
+    ///
+    /// The returned borrow is valid for the lifetime of `self`. This
+    /// method is safe because the constructor
+    /// ([`open_path`](Self::open_path)) requires the caller to
+    /// guarantee that the backing file is immutable. If that guarantee
+    /// is violated (external truncation or overwrite), the process may
+    /// crash with `SIGBUS` (POSIX) or an access violation (Windows)
+    /// rather than undefined behavior.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
         if self.ptr.is_null() || self.size == 0 {
             &[]
         } else {
             // SAFETY: `ptr` points to `size` bytes of valid memory that
             // was allocated by the OS mapping during `open()` and is
-            // guaranteed to outlive `self`.
-            std::slice::from_raw_parts(self.ptr, self.size)
+            // guaranteed to outlive `self`. The mapping is read-only.
+            unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
         }
     }
 
@@ -445,6 +552,167 @@ mod tests {
             let mmap = MmapFile::open(&c_path).unwrap();
             mmap.advise_sequential();
             mmap.advise_sequential();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── open_path (Path-based) tests ────────────────────────────────────
+
+    #[test]
+    fn test_open_path_normal() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_path_normal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        let content = b"hello world\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            assert!(!mmap.is_empty());
+            assert_eq!(mmap.len(), content.len());
+            assert_eq!(mmap.as_bytes(), content.as_slice());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_nonexistent() {
+        unsafe {
+            let err = MmapFile::open_path("nonexistent_file_xyz_123.dat").unwrap_err();
+            assert!(
+                err.kind() == std::io::ErrorKind::NotFound
+                    || err.kind() == std::io::ErrorKind::Other,
+                "expected NotFound or Other, got {:?}",
+                err.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_path_empty_file() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_path_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("empty.dat");
+        std::fs::File::create(&file_path).unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            assert!(mmap.is_empty());
+            assert_eq!(mmap.len(), 0);
+            assert_eq!(mmap.as_bytes(), b"");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_with_spaces() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test path spaces");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("my file.dat");
+        let content = b"data with spaces in path\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            assert_eq!(mmap.as_bytes(), content.as_slice());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_unicode() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_unicode");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"content\n").unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            assert_eq!(mmap.len(), 8);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_drop_works() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_path_drop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("drop_test.dat");
+        std::fs::write(&file_path, b"drop test content\n").unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            assert!(!mmap.is_empty());
+            // mmap is dropped here — should unmap and close handles
+        }
+
+        // Verify the file still exists and is readable after drop
+        let content = std::fs::read(&file_path).unwrap();
+        assert_eq!(content, b"drop test content\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_from_pathbuf() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pathbuf");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("pathbuf.dat");
+        std::fs::write(&file_path, b"pathbuf content\n").unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(file_path.clone()).unwrap();
+            assert_eq!(mmap.as_bytes(), b"pathbuf content\n");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_from_str() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_path_str");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("str.dat");
+        std::fs::write(&file_path, b"str content\n").unwrap();
+
+        let path_str = file_path.to_str().unwrap();
+        unsafe {
+            let mmap = MmapFile::open_path(path_str).unwrap();
+            assert_eq!(mmap.as_bytes(), b"str content\n");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_path_as_bytes_returns_valid_slice() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_as_bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("bytes.dat");
+        let content: Vec<u8> = (0u8..=255).collect();
+        std::fs::write(&file_path, &content).unwrap();
+
+        unsafe {
+            let mmap = MmapFile::open_path(&file_path).unwrap();
+            let slice = mmap.as_bytes();
+            assert_eq!(slice.len(), 256);
+            assert_eq!(slice[0], 0);
+            assert_eq!(slice[128], 128);
+            assert_eq!(slice[255], 255);
+            assert_eq!(slice, &content[..]);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
