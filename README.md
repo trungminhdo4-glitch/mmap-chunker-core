@@ -22,6 +22,7 @@ unnecessarily or pull in heavy dependencies. This library provides:
 - Windows and Linux are validated in CI; macOS validation now included
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
+- Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust API
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
 - Panic containment at all FFI boundaries
@@ -223,9 +224,8 @@ cargo test
 cargo build --release
 ```
 
-181 tests (179 unit + 2 integration) including property tests for concatenation,
-gap-freedom, determinism, monotonic offsets, delimiter variants, fixed-size chunking,
-and record-aligned partition planning.
+The suite covers delimiter semantics, cursor equivalence, fixed-size chunking,
+partitioning, C ABI behavior, and edge cases.
 
 Companion test suites:
 - 30 external C ABI assertions via `examples/c_consumer.c` (CI-validated on Linux and macOS)

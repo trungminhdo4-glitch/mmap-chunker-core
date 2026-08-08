@@ -11,7 +11,7 @@ Language-agnostic, harness-independent, standalone open-source product.
 cargo fmt --check        # Format check
 cargo check              # Fast compile check
 cargo clippy --all-targets -- -D warnings   # Lint
-cargo test               # 179 unit + 2 integration tests (181 total)
+cargo test               # run the full Rust test suite
 cargo build --release    # Produces staticlib + cdylib
 ```
 

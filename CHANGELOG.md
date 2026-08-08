@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- Safe Rust API (`MmapChunker`) with `Path`/`OsStr` support wrapping `MmapFile`
+  with a chunk-layout state machine (`Empty`, `Delimited`, `Fixed`, `Partitioned`)
+- Lazy streaming `ChunkCursor` — O(1) memory (~40 bytes on 64-bit) delimiter-aware
+  chunk traversal without pre-computing all boundaries
+- `PatternChunkCursor` — lazy multi-byte delimiter cursor (e.g., `b"\r\n"`, `b"\r\n\r\n"`)
+- Multi-byte delimiter support via `find_chunk_boundaries_pattern` and `find_pattern_in_slice`
+  (Rust-only, first-byte SWAR + `starts_with` verification)
+
+### Fixed
+
+- `ChunkCursor::size_hint()` and `PatternChunkCursor::size_hint()`: lower bound corrected
+  from bogus `(remaining / step) + 1` to `1` (there is always at least one more chunk
+  when the cursor is not exhausted). The old lower bound could exceed the true remaining
+  count, violating the `Iterator` contract.
+- `ChunkCursor::is_empty()` and `PatternChunkCursor::is_empty()`: implementation changed
+  from `self.data.is_empty()` (which reports whether *underlying* data is empty) to
+  `self.position >= self.data.len()` (which reports whether the cursor is exhausted),
+  matching the documented contract.
+
+### Changed
+
+- Cursor benchmark methodology hardened with `black_box`, 7-sample p50/p10/p90
+
 ## [0.2.0] — 2026-08-08
 
 ### Added

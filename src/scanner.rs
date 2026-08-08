@@ -111,7 +111,7 @@ impl<'a> ChunkCursor<'a> {
     /// Returns `true` if all chunks have been consumed.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.position >= self.data.len()
     }
 }
 
@@ -147,10 +147,7 @@ impl<'a> Iterator for ChunkCursor<'a> {
             return (0, Some(0));
         }
         let remaining = len - self.position;
-        let step = self.chunk_size.max(1);
-        let estimate = (remaining / step) + 1;
-        let max = remaining; // at minimum 1 byte per chunk
-        (estimate, Some(max))
+        (1, Some(remaining))
     }
 }
 
@@ -308,9 +305,10 @@ impl<'a, 'p> PatternChunkCursor<'a, 'p> {
         self.data.len()
     }
 
+    /// Returns `true` if all chunks have been consumed.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.position >= self.data.len()
     }
 }
 
@@ -347,10 +345,7 @@ impl<'a, 'p> Iterator for PatternChunkCursor<'a, 'p> {
             return (0, Some(0));
         }
         let remaining = len - self.position;
-        let step = self.chunk_size.max(1);
-        let estimate = (remaining / step) + 1;
-        let max = remaining;
-        (estimate, Some(max))
+        (1, Some(remaining))
     }
 }
 
@@ -984,6 +979,269 @@ mod tests {
         }
         cursor_equals_eager(&data, 64, b'\n');
     }
+
+    // ── Cursor contract tests — size_hint + is_empty ────────────────
+
+    #[test]
+    fn cursor_size_hint_before_iteration() {
+        let data = b"aaa\nbbb\nccc\nddd\neee\n";
+        let cur = ChunkCursor::new(data, 6, b'\n');
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1);
+        assert_eq!(hi, Some(data.len()));
+    }
+
+    #[test]
+    fn cursor_size_hint_after_one_next() {
+        let data = b"aaa\nbbb\nccc\nddd\neee\n";
+        let mut cur = ChunkCursor::new(data, 6, b'\n');
+        let _ = cur.next();
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1);
+        assert!(hi.unwrap() < data.len());
+    }
+
+    #[test]
+    fn cursor_size_hint_after_exhaustion() {
+        let data = b"hello\n";
+        let mut cur = ChunkCursor::new(data, 1024, b'\n');
+        let _ = cur.next();
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 0);
+        assert_eq!(hi, Some(0));
+    }
+
+    #[test]
+    fn cursor_size_hint_empty_input() {
+        let cur = ChunkCursor::new(b"", 1024, b'\n');
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 0);
+        assert_eq!(hi, Some(0));
+    }
+
+    #[test]
+    fn cursor_is_empty_before_iteration() {
+        let data = b"hello\nworld";
+        let cur = ChunkCursor::new(data, 100, b'\n');
+        assert!(!cur.is_empty());
+    }
+
+    #[test]
+    fn cursor_is_empty_after_exhaustion() {
+        let data = b"hello\n";
+        let mut cur = ChunkCursor::new(data, 1024, b'\n');
+        let _ = cur.next(); // yields the only chunk
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn cursor_is_empty_empty_input() {
+        let cur = ChunkCursor::new(b"", 1024, b'\n');
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn cursor_size_hint_no_delimiter() {
+        let data = b"no_newlines_at_all";
+        let cur = ChunkCursor::new(data, 5, b'\n');
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1, "at least one chunk even with no delimiter");
+        assert_eq!(hi, Some(data.len()));
+    }
+
+    #[test]
+    fn cursor_size_hint_chunk_size_zero() {
+        let data = b"abcd\n";
+        let cur = ChunkCursor::new(data, 0, b'\n');
+        let (lo, _) = cur.size_hint();
+        assert_eq!(lo, 1);
+    }
+
+    #[test]
+    fn cursor_size_hint_chunk_size_one() {
+        let data = b"a\nb\nc\n";
+        let cur = ChunkCursor::new(data, 1, b'\n');
+        let (lo, _) = cur.size_hint();
+        assert_eq!(lo, 1);
+    }
+
+    #[test]
+    fn cursor_size_hint_chunk_size_larger_than_data() {
+        let data = b"tiny\n";
+        let cur = ChunkCursor::new(data, 1_000_000, b'\n');
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1);
+        assert_eq!(hi, Some(data.len()));
+    }
+
+    #[test]
+    fn property_size_hint_lower_bound_accurate() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"hello\nworld\n", 4, b'\n'),
+            (b"a,b,c,d", 2, b','),
+            (b"one\ttwo\tthree", 4, b'\t'),
+            (b"a|b|c|d|e|f", 3, b'|'),
+            (b"x\x00y\x00z", 2, b'\x00'),
+            (b"single", 1024, b'\n'),
+            (b"\n\n\n\n\n", 1, b'\n'),
+            (b"", 1024, b'\n'),
+            (b"\n", 1, b'\n'),
+            (b"a", 1024, b'\n'),
+            (b"a\nb\nc\n", 1, b'\n'),
+            (b"aaaa\n", 5, b'\n'),
+        ];
+        for &(data, cs, delim) in cases {
+            let mut cur = ChunkCursor::new(data, cs, delim);
+            let mut total_yielded = 0usize;
+            loop {
+                let (lo, hi) = cur.size_hint();
+                let remaining = cur.len() - cur.position();
+                if remaining == 0 {
+                    assert_eq!(lo, 0);
+                    assert_eq!(hi, Some(0));
+                    break;
+                }
+                assert!(
+                    lo <= remaining,
+                    "lower bound {lo} exceeds remaining {remaining}: data={data:?} cs={cs}"
+                );
+                if let Some(next) = cur.next() {
+                    total_yielded += next.len();
+                }
+            }
+            assert_eq!(total_yielded, data.len());
+        }
+    }
+
+    #[test]
+    fn property_size_hint_upper_bound_accurate() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"hello\nworld\n", 4, b'\n'),
+            (b"a,b,c,d", 2, b','),
+            (b"a|b|c|d|e|f", 3, b'|'),
+            (b"\n\n\n", 1, b'\n'),
+        ];
+        for &(data, cs, delim) in cases {
+            let mut cur = ChunkCursor::new(data, cs, delim);
+            loop {
+                let (_, hi) = cur.size_hint();
+                let remaining = cur.len() - cur.position();
+                if remaining == 0 {
+                    assert_eq!(hi, Some(0));
+                    break;
+                }
+                assert!(
+                    hi.unwrap() >= remaining,
+                    "upper bound {} < remaining {}: data={data:?} cs={cs}",
+                    hi.unwrap(),
+                    remaining
+                );
+                let _ = cur.next();
+            }
+        }
+    }
+
+    // ── PatternChunkCursor contract tests ────────────────────────────
+
+    #[test]
+    fn pattern_cursor_size_hint_before_iteration() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let cur = PatternChunkCursor::new(data, 4, b"\r\n");
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1);
+        assert_eq!(hi, Some(data.len()));
+    }
+
+    #[test]
+    fn pattern_cursor_size_hint_after_one_next() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let mut cur = PatternChunkCursor::new(data, 4, b"\r\n");
+        let _ = cur.next();
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 1);
+        assert!(hi.unwrap() < data.len());
+    }
+
+    #[test]
+    fn pattern_cursor_size_hint_after_exhaustion() {
+        let data = b"a\r\n";
+        let mut cur = PatternChunkCursor::new(data, 1024, b"\r\n");
+        let _ = cur.next();
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 0);
+        assert_eq!(hi, Some(0));
+    }
+
+    #[test]
+    fn pattern_cursor_size_hint_empty_input() {
+        let cur = PatternChunkCursor::new(b"", 1024, b"\r\n");
+        let (lo, hi) = cur.size_hint();
+        assert_eq!(lo, 0);
+        assert_eq!(hi, Some(0));
+    }
+
+    #[test]
+    fn pattern_cursor_is_empty_before_iteration() {
+        let data = b"hello\r\nworld";
+        let cur = PatternChunkCursor::new(data, 100, b"\r\n");
+        assert!(!cur.is_empty());
+    }
+
+    #[test]
+    fn pattern_cursor_is_empty_after_exhaustion() {
+        let data = b"hello\r\n";
+        let mut cur = PatternChunkCursor::new(data, 1024, b"\r\n");
+        let _ = cur.next();
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn pattern_cursor_is_empty_empty_input() {
+        let cur = PatternChunkCursor::new(b"", 1024, b"\r\n");
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn pattern_cursor_size_hint_no_delimiter() {
+        let data = b"no_crlf_here";
+        let cur = PatternChunkCursor::new(data, 5, b"\r\n");
+        let (lo, _) = cur.size_hint();
+        assert_eq!(lo, 1);
+    }
+
+    #[test]
+    fn pattern_property_size_hint_lower_bound_accurate() {
+        let cases: &[(&[u8], usize, &[u8])] = &[
+            (b"a\r\nb\r\nc\r\n", 4, b"\r\n"),
+            (b"ab||cd||ef", 4, b"||"),
+            (b"single", 1024, b"\r\n"),
+            (b"AB\xff\x00CD\xff\x00EF", 4, b"\xff\x00"),
+            (b"\r\n\r\n\r\n", 1, b"\r\n"),
+        ];
+        for &(data, cs, delim) in cases {
+            let mut cur = PatternChunkCursor::new(data, cs, delim);
+            let mut total_yielded = 0usize;
+            loop {
+                let (lo, hi) = cur.size_hint();
+                let remaining = cur.len() - cur.position();
+                if remaining == 0 {
+                    assert_eq!(lo, 0);
+                    assert_eq!(hi, Some(0));
+                    break;
+                }
+                assert!(
+                    lo <= remaining,
+                    "lower bound {lo} exceeds remaining {remaining}"
+                );
+                if let Some(next) = cur.next() {
+                    total_yielded += next.len();
+                }
+            }
+            assert_eq!(total_yielded, data.len());
+        }
+    }
+
+    // ── Fixed-size chunking tests ────────────────────────────────────────
 
     #[test]
     #[ignore = "performance experiment — run with --ignored --nocapture"]
