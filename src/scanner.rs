@@ -176,19 +176,15 @@ fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
 
     while search_start <= max_search {
         let remainder = &haystack[search_start..];
-        match find_byte_swar(remainder, first_byte) {
-            Some(rel_pos) => {
-                let pos = search_start + rel_pos;
-                if pos > max_search {
-                    return None;
-                }
-                if haystack[pos..].starts_with(pattern) {
-                    return Some(pos);
-                }
-                search_start = pos + 1;
-            }
-            None => return None,
+        let rel_pos = find_byte_swar(remainder, first_byte)?;
+        let pos = search_start + rel_pos;
+        if pos > max_search {
+            return None;
         }
+        if haystack[pos..].starts_with(pattern) {
+            return Some(pos);
+        }
+        search_start = pos + 1;
     }
     None
 }
