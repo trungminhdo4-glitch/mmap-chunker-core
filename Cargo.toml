@@ -9,7 +9,7 @@ repository = "https://github.com/trungminhdo4-glitch/mmap-chunker-core"
 readme = "README.md"
 keywords = ["mmap", "chunking", "ffi", "zero-copy", "c-abi"]
 categories = ["filesystem", "memory-management", "development-tools::ffi"]
-exclude = ["/native_io/", "/tests/test_native_io.py", "/AGENTS.md", "/Cargo.lock"]
+exclude = ["/native_io/", "/tests/test_native_io.py", "/AGENTS.md", "/AGENT_LOG.md", "/Cargo.lock"]
 
 [lib]
 name = "mmap_chunker_core"

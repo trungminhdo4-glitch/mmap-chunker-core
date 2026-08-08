@@ -1,5 +1,8 @@
 # mmap-chunker-core
 
+[![CI](https://github.com/trungminhdo4-glitch/mmap-chunker-core/actions/workflows/ci.yml/badge.svg)](https://github.com/trungminhdo4-glitch/mmap-chunker-core/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
+
 Zero-dependency data chunking engine with native memory-mapped I/O and a stable C ABI.
 
 ## Why
@@ -16,7 +19,7 @@ unnecessarily or pull in heavy dependencies. This library provides:
 ## Features
 
 - Targets Windows and POSIX platforms (Linux, macOS)
-- Windows is locally validated; Linux is validated in CI; macOS is targeted
+- Windows and Linux are validated in CI; macOS validation now included
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
@@ -140,9 +143,9 @@ cargo build --release
 47 Rust tests (45 unit + 2 integration) including property tests for concatenation,
 gap-freedom, determinism, monotonic offsets, and delimiter variants.
 
-Companion test suites (not in-tree):
-- 15 external C ABI assertions (via `examples/c_consumer.c`, locally validated)
-- 53 Python ctypes integration tests (via `native_io/`, locally validated)
+Companion test suites:
+- 15 external C ABI assertions via `examples/c_consumer.c` (CI-validated on Linux and macOS)
+- 53 Python ctypes integration tests (local, companion module)
 
 ## Limitations
 
@@ -156,7 +159,6 @@ Companion test suites (not in-tree):
 - Multi-byte delimiter support (`\r\n`, custom record separators)
 - Lazy chunk cursor for streaming consumers
 - Fixed-size chunking mode (delimiter-independent)
-- macOS CI validation
 
 ## License
 

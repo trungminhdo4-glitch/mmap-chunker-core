@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -13,6 +20,7 @@ env:
 jobs:
   ubuntu:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -39,8 +47,26 @@ jobs:
           cc -o c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread -ldl
           ./c_consumer
 
+      - name: Verify ABI v1 symbols (Linux cdylib)
+        run: |
+          nm -D target/release/libmmap_chunker_core.so | grep -oP 'T \Kmmap_engine_\w+' | sort > /tmp/actual.symbols
+          sort abi/v1.symbols > /tmp/expected.symbols
+          echo "=== ABI v1 symbol check ==="
+          echo "Required:"
+          cat /tmp/expected.symbols
+          echo "Exported:"
+          cat /tmp/actual.symbols
+          for sym in $(cat abi/v1.symbols); do
+            if ! grep -qFx "$sym" /tmp/actual.symbols; then
+              echo "FAIL: required symbol '$sym' not exported"
+              exit 1
+            fi
+          done
+          echo "PASS: all required v1 symbols present"
+
   windows:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -61,3 +87,49 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Build and run C consumer
+        run: |
+          cc -o c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread
+          ./c_consumer
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.77
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.77"
+
+      - name: cargo check (MSRV 1.77)
+        run: cargo check
+
+      - name: cargo test (MSRV 1.77)
+        run: cargo test

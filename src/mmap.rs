@@ -3,7 +3,10 @@ use std::ffi::CStr;
 
 // ─── Platform-specific FFI declarations ───────────────────────────────────────
 
-#[cfg(unix)]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+compile_error!("mmap-chunker-core only supports Windows, Linux, and macOS");
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
     use std::ffi::{c_char, c_int, c_void};
 
@@ -93,7 +96,7 @@ mod sys {
 pub struct MmapFile {
     ptr: *const u8,
     size: usize,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fd: std::ffi::c_int,
     #[cfg(windows)]
     file_handle: isize,
@@ -115,7 +118,7 @@ impl MmapFile {
     /// `path` must point to a valid null-terminated C string and must not
     /// be mutated during this call.
     pub unsafe fn open(path: &CStr) -> Option<Self> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             Self::open_unix(path)
         }
@@ -125,7 +128,7 @@ impl MmapFile {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe fn open_unix(path: &CStr) -> Option<Self> {
         // SAFETY: `path.as_ptr()` is a valid null-terminated string;
         // `open()` is a POSIX syscall that only reads from the path.
@@ -303,7 +306,7 @@ impl MmapFile {
             return;
         }
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // SAFETY: `ptr` and `size` are valid from the mapping.
             // `madvise()` with `MADV_SEQUENTIAL` is purely advisory
@@ -322,7 +325,7 @@ impl MmapFile {
 
 impl Drop for MmapFile {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             if !self.ptr.is_null() && self.size > 0 {
                 // SAFETY: `ptr` and `size` match the original `mmap()`
