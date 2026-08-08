@@ -117,6 +117,17 @@ jobs:
           cc -o c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread
           ./c_consumer
 
+  semver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check semver compatibility (v0.2.0 baseline)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: v0.2.0
+          release-type: minor
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15
