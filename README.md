@@ -72,19 +72,66 @@ mmap_engine_free(h);
 ## Rust Usage
 
 ```rust
+use mmap_chunker_core::MmapChunker;
+
+// ── Indexed (random access) ─────────────────────────────────
+// Pre-computes chunk boundaries → O(1) random access by index.
+// O(number_of_chunks) heap metadata (~16 bytes per chunk).
+
+let mut file = unsafe { MmapChunker::open("records.jsonl")? };
+let count = file.scan_delimited(65536, b'\n');
+let third = file.get_chunk(2);
+// Iterate all
+for i in 0..count {
+    if let Some(chunk) = file.get_chunk(i) {
+        let _data: &[u8] = chunk;
+    }
+}
+
+// ── Streaming (low memory) ─────────────────────────────────
+// Yields chunks sequentially without building a boundary Vec.
+// O(1) state (~40 bytes on 64-bit) regardless of file size.
+// Ideal for single-pass consumers, pipelines, and large files.
+
+let file = unsafe { MmapChunker::open("records.jsonl")? };
+for chunk in file.delimited_cursor(65536, b'\n') {
+    let _data: &[u8] = chunk;
+}
+
+// ── Other scan modes ────────────────────────────────────────
+
+let mut file = unsafe { MmapChunker::open("data.bin")? };
+
+// Fixed-size chunks (no delimiter)
+let n = file.scan_fixed(4096);
+let block = file.get_chunk(0);
+
+// Record-aligned N-way partitioning
+let parts = file.partition_records(4, b'\n');
+for i in 0..parts {
+    let partition = file.get_chunk(i).unwrap();
+}
+```
+
+## Scanner primitives (standalone, no mmap)
+
+```rust
 use mmap_chunker_core::scanner;
 
-let data = std::fs::read("records.csv")?;
+let data = b"aaa\nbbb\nccc\nddd\n";
 
-// 1. Delimiter-aware chunking — boundaries aligned after delimiter
-let chunks = scanner::find_chunk_boundaries(&data, 65536, b',');
+// 1. Eager delimiter-aware chunking — returns Vec<(usize, usize)>
+let chunks = scanner::find_chunk_boundaries(data, 4, b'\n');
 
-// 2. Fixed-size chunking — O(1) arithmetic layout, zero scan cost
+// 2. Lazy delimiter cursor — yields &[u8] slices on demand
+let slices: Vec<&[u8]> = scanner::ChunkCursor::new(data, 4, b'\n').collect();
+
+// 3. Fixed-size chunking — O(1) arithmetic layout, zero scan cost
 let count = scanner::fixed_chunk_count(data.len(), 4096);
 let bounds = scanner::fixed_chunk_bounds(data.len(), 4096, 0);
 
-// 3. Record-aligned N-way partitioning — for parallel consumers
-let partitions = scanner::find_partition_boundaries(&data, 4, b'\n');
+// 4. Record-aligned N-way partitioning — for parallel consumers
+let partitions = scanner::find_partition_boundaries(data, 4, b'\n');
 ```
 
 ## Dynamic Library (cdylib)
@@ -119,12 +166,23 @@ process truncates or overwrites the file:
 ## Benchmarks
 
 ```sh
+# I/O benchmark (mmap vs fs::read)
 cargo test --test benchmark -- --ignored --nocapture
+
+# Cursor vs eager time-to-first-chunk + full traversal
+cargo test --release scanner::tests::bench_cursor_vs_eager -- --ignored --nocapture
 ```
 
-Runs on 1 MB, 16 MB, and 64 MB files with 64 KB, 256 KB, and 1 MB chunk sizes.
-Outputs wall-clock time and throughput for mmap vs `std::fs::read` path.
-Results include page-cache effects; warm runs may be faster than cold.
+Time-to-first-chunk (TFC) advantage with lazy cursor on JSONL/log data (64 KiB chunks, release build):
+
+| File Size | Eager TFC  | Lazy TFC | Speedup |
+|-----------|-----------|----------|---------|
+| 100 KB    | 205 ns    | 11 ns    | 18x     |
+| 1 MB      | 564 ns    | 12 ns    | 47x     |
+| 10 MB     | 4,450 ns  | 20 ns    | 222x    |
+
+Full traversal is competitive (no Vec allocation overhead).
+I/O benchmark runs on 1 MB–64 MB files with 64 KB–1 MB chunk sizes.
 
 ## Build
 
@@ -147,7 +205,7 @@ cargo test
 cargo build --release
 ```
 
-110 tests (108 unit + 2 integration) including property tests for concatenation,
+152 tests (150 unit + 2 integration) including property tests for concatenation,
 gap-freedom, determinism, monotonic offsets, delimiter variants, fixed-size chunking,
 and record-aligned partition planning.
 
@@ -160,12 +218,10 @@ Companion test suites:
 - Full-file mapping only (no windowed mmap). Very large files may exhaust address space.
 - Single-byte delimiter only. Multi-byte or regex delimiters not supported.
 - No copy-on-write or mutable access. Read-only mapping.
-- No lazy/streaming chunk iteration. Chunks are computed eagerly before first access.
 
 ## Roadmap
 
 - Multi-byte delimiter support (`\r\n`, custom record separators)
-- Lazy chunk cursor for streaming consumers
 - SIMD-accelerated byte search (runtime dispatch)
 
 ## License

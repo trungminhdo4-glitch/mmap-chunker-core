@@ -11,13 +11,14 @@ Language-agnostic, harness-independent, standalone open-source product.
 cargo fmt --check        # Format check
 cargo check              # Fast compile check
 cargo clippy --all-targets -- -D warnings   # Lint
-cargo test               # 108 unit + 2 integration tests (110 total)
+cargo test               # 150 unit + 2 integration tests (152 total)
 cargo build --release    # Produces staticlib + cdylib
 ```
 
 Benchmarks:
 ```sh
-cargo test --test benchmark -- --ignored --nocapture
+cargo test --test benchmark -- --ignored --nocapture           # I/O mmap vs fs::read
+cargo test --release scanner::tests::bench_cursor_vs_eager -- --ignored --nocapture  # Cursor TFC
 ```
 
 Python tests (requires release build first):
@@ -31,8 +32,9 @@ python -m pytest tests/test_native_io.py -v
 src/
   lib.rs      — module declarations + public re-exports
   mmap.rs     — MmapFile: platform-specific mmap (Unix/Win), Send+Sync
-  scanner.rs  — find_chunk_boundaries (delimiter), find_partition_boundaries (N-way),
-                 find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds
+  scanner.rs  — find_chunk_boundaries (delimiter), ChunkCursor (lazy iterator),
+                 find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds,
+                 find_partition_boundaries (N-way)
   ffi.rs      — C ABI: 10 public functions, ChunkLayout enum, panic containment
 
 tests/

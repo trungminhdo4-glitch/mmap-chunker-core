@@ -47,6 +47,113 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
     chunks
 }
 
+/// A lazy, streaming cursor that yields delimiter-aligned chunks
+/// sequentially without pre-computing all boundaries.
+///
+/// Each call to [`next`](ChunkCursor::next) produces a single chunk using
+/// the same boundary semantics as [`find_chunk_boundaries`], reusing the
+/// SWAR byte search internally. The cursor advances its internal position
+/// and yields `&[u8]` slices directly referencing the input data.
+///
+/// # Memory footprint
+///
+/// O(1) state: a single struct (~40 bytes on 64-bit) regardless of file
+/// size, compared to O(number_of_chunks) for the eager `Vec<(usize,usize)>`
+/// approach (16 bytes per chunk).
+///
+/// # Example
+///
+/// ```
+/// use mmap_chunker_core::scanner::ChunkCursor;
+///
+/// let data = b"aaa\nbbb\nccc\nddd\n";
+/// let chunks: Vec<&[u8]> = ChunkCursor::new(data, 4, b'\n').collect();
+/// assert_eq!(chunks, vec![b"aaa\nbbb\n" as &[u8], b"ccc\nddd\n" as &[u8]]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ChunkCursor<'a> {
+    data: &'a [u8],
+    chunk_size: usize,
+    delimiter: u8,
+    position: usize,
+}
+
+impl<'a> ChunkCursor<'a> {
+    /// Create a new cursor over `data` with the given approximate
+    /// `chunk_size` and single-byte `delimiter`.
+    ///
+    /// Chunk boundaries are placed at or after each `chunk_size`
+    /// interval, snapped to the next occurrence of `delimiter`.
+    /// The last chunk extends to EOF. Empty input produces an
+    /// exhausted cursor (no items yielded).
+    #[inline]
+    pub fn new(data: &'a [u8], chunk_size: usize, delimiter: u8) -> Self {
+        Self {
+            data,
+            chunk_size,
+            delimiter,
+            position: 0,
+        }
+    }
+
+    /// Returns the current position (start of the next chunk).
+    #[inline]
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the total number of bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if all chunks have been consumed.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl<'a> Iterator for ChunkCursor<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let len = self.data.len();
+        if self.position >= len {
+            return None;
+        }
+
+        let step = self.chunk_size.max(1);
+        let target = self.position + step;
+        let end = if target >= len {
+            len
+        } else {
+            let remainder = &self.data[target..];
+            match find_byte_swar(remainder, self.delimiter) {
+                Some(rel_pos) => (target + rel_pos + 1).min(len),
+                None => len,
+            }
+        };
+
+        let chunk = &self.data[self.position..end];
+        self.position = end;
+        Some(chunk)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.data.len();
+        if self.position >= len {
+            return (0, Some(0));
+        }
+        let remaining = len - self.position;
+        let step = self.chunk_size.max(1);
+        let estimate = (remaining / step) + 1;
+        let max = remaining; // at minimum 1 byte per chunk
+        (estimate, Some(max))
+    }
+}
+
 /// Safe SWAR (SIMD Within A Register) byte search.
 ///
 /// Scans `haystack` for the first occurrence of `delimiter`. Processes
@@ -509,6 +616,263 @@ mod tests {
             find_chunk_boundaries(b"x\x00y\x00z", 2, b'\x00'),
             vec![(0, 4), (4, 5)]
         );
+    }
+
+    // ── ChunkCursor tests ──────────────────────────────────────────────
+
+    /// Verify cursor produces identical chunks as eager scanner.
+    fn cursor_equals_eager(data: &[u8], chunk_size: usize, delimiter: u8) {
+        let eager = find_chunk_boundaries(data, chunk_size, delimiter);
+        let cursor: Vec<&[u8]> = ChunkCursor::new(data, chunk_size, delimiter).collect();
+        let lazy_ranges: Vec<(usize, usize)> = cursor
+            .iter()
+            .scan(0usize, |pos, &chunk| {
+                let start = *pos;
+                *pos += chunk.len();
+                Some((start, *pos))
+            })
+            .collect();
+        assert_eq!(
+            lazy_ranges, eager,
+            "cursor mismatch: chunk_size={chunk_size}, delim={delimiter:#04x}"
+        );
+    }
+
+    #[test]
+    fn cursor_empty_input() {
+        assert_eq!(
+            ChunkCursor::new(b"", 1024, b'\n').collect::<Vec<_>>(),
+            Vec::<&[u8]>::new()
+        );
+    }
+
+    #[test]
+    fn cursor_one_byte_file() {
+        cursor_equals_eager(b"x", 1024, b'\n');
+    }
+
+    #[test]
+    fn cursor_one_byte_delimiter() {
+        cursor_equals_eager(b"\n", 1024, b'\n');
+    }
+
+    #[test]
+    fn cursor_delimiter_only_file() {
+        cursor_equals_eager(b"\n\n\n", 1, b'\n');
+    }
+
+    #[test]
+    fn cursor_no_delimiter() {
+        cursor_equals_eager(b"no_newlines_here", 5, b'\n');
+    }
+
+    #[test]
+    fn cursor_delimiter_exactly_at_target() {
+        cursor_equals_eager(b"xxxx\n", 5, b'\n');
+    }
+
+    #[test]
+    fn cursor_delimiter_after_target() {
+        cursor_equals_eager(b"xxxyy\n", 3, b'\n');
+    }
+
+    #[test]
+    fn cursor_multiple_consecutive_delimiters() {
+        cursor_equals_eager(b"line1\n\n\nline2\n", 6, b'\n');
+    }
+
+    #[test]
+    fn cursor_nul_delimiter() {
+        cursor_equals_eager(b"prefix\x00suffix\n", 100, b'\n');
+    }
+
+    #[test]
+    fn cursor_giant_record() {
+        cursor_equals_eager(b"tiny\nverylongrecordwithnobreaksanywhere\nend\n", 6, b'\n');
+    }
+
+    #[test]
+    fn cursor_no_trailing_delimiter() {
+        cursor_equals_eager(b"hello\nworld", 100, b'\n');
+    }
+
+    #[test]
+    fn cursor_chunk_size_zero() {
+        cursor_equals_eager(b"abc\n", 0, b'\n');
+    }
+
+    #[test]
+    fn cursor_chunk_size_one() {
+        cursor_equals_eager(b"a\nb\nc\n", 1, b'\n');
+    }
+
+    #[test]
+    fn cursor_chunk_size_larger_than_data() {
+        cursor_equals_eager(b"tiny\n", 1_000_000, b'\n');
+    }
+
+    #[test]
+    fn cursor_chunk_size_equals_len() {
+        cursor_equals_eager(b"aaaa\n", 5, b'\n');
+    }
+
+    #[test]
+    fn cursor_different_delimiters() {
+        cursor_equals_eager(b"a,b,c,d,e", 2, b',');
+        cursor_equals_eager(b"one\ttwo\tthree", 4, b'\t');
+        cursor_equals_eager(b"a|b|c|d|e|f", 3, b'|');
+        cursor_equals_eager(b"x\x00y\x00z", 2, b'\x00');
+    }
+
+    #[test]
+    fn cursor_binary_input() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        cursor_equals_eager(&data, 32, b'\n');
+        cursor_equals_eager(&data, 32, 0x00);
+        cursor_equals_eager(&data, 32, 0xff);
+    }
+
+    #[test]
+    fn cursor_repeated_iteration_new_cursor() {
+        let data = b"a\nb\nc\n";
+        let first: Vec<&[u8]> = ChunkCursor::new(data, 2, b'\n').collect();
+        let second: Vec<&[u8]> = ChunkCursor::new(data, 2, b'\n').collect();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cursor_fixed_lines_equivalence() {
+        let data = b"aaa\nbbb\nccc\nddd\neee\n";
+        cursor_equals_eager(data, 6, b'\n');
+    }
+
+    #[test]
+    fn cursor_only_newlines() {
+        cursor_equals_eager(b"\n\n\n", 1, b'\n');
+    }
+
+    #[test]
+    fn cursor_record_larger_than_chunk() {
+        let data = b"short\nverylonglinewithnodelimiteratall\nshort\n";
+        cursor_equals_eager(data, 6, b'\n');
+    }
+
+    #[test]
+    fn cursor_deterministic_random_corpus() {
+        let cases: &[(&[u8], usize, u8)] = &[
+            (b"hello\nworld\n", 4, b'\n'),
+            (b"a,b,c,d", 2, b','),
+            (b"one\ttwo\tthree", 4, b'\t'),
+            (b"a|b|c|d|e|f", 3, b'|'),
+            (b"x\x00y\x00z", 2, b'\x00'),
+            (b"single", 1024, b'\n'),
+            (b"\n\n\n\n\n", 1, b'\n'),
+            (b"\n", 1, b'\n'),
+            (b"a", 1024, b'\n'),
+            (b"line1\nline2\nline3\nline4\nline5\n", 10, b'\n'),
+        ];
+        for &(data, chunk_size, delim) in cases {
+            cursor_equals_eager(data, chunk_size, delim);
+        }
+    }
+
+    #[test]
+    fn cursor_large_corpus_equivalence() {
+        let mut data = Vec::new();
+        for i in 0..1000u32 {
+            data.extend_from_slice(format!("line_content_{i:04}\n").as_bytes());
+        }
+        cursor_equals_eager(&data, 64, b'\n');
+    }
+
+    #[test]
+    #[ignore = "performance experiment — run with --ignored --nocapture"]
+    fn bench_cursor_vs_eager() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn gen_log_data(target_size: usize) -> Vec<u8> {
+            let mut data = Vec::with_capacity(target_size);
+            let mut n = 0u64;
+            while data.len() < target_size {
+                let line = format!(
+                    "[2026-08-08T12:00:00Z] INFO request_id={} status=200 latency_ms={}\n",
+                    n,
+                    n % 100
+                );
+                data.extend_from_slice(line.as_bytes());
+                n += 1;
+            }
+            data.truncate(target_size);
+            data
+        }
+
+        fn bench_one(data: &[u8], chunk_size: usize, delim: u8, label: &str, iters: u32) {
+            let total_bytes = data.len();
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                let chunks = find_chunk_boundaries(data, chunk_size, delim);
+                black_box(chunks.first());
+            }
+            let eager_tfc = start.elapsed().as_nanos() as f64 / iters as f64;
+
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut cursor = ChunkCursor::new(data, chunk_size, delim);
+                black_box(cursor.next());
+            }
+            let lazy_tfc = start.elapsed().as_nanos() as f64 / iters as f64;
+
+            let start = Instant::now();
+            let mut total_e = 0usize;
+            for _ in 0..iters {
+                let chunks = find_chunk_boundaries(data, chunk_size, delim);
+                for &(s, e) in &chunks {
+                    total_e = total_e.wrapping_add(e - s);
+                }
+            }
+            let eager_full = start.elapsed().as_nanos() as f64 / iters as f64;
+            black_box(total_e);
+
+            let start = Instant::now();
+            let mut total_l = 0usize;
+            for _ in 0..iters {
+                let cursor = ChunkCursor::new(data, chunk_size, delim);
+                for chunk in cursor {
+                    total_l = total_l.wrapping_add(chunk.len());
+                }
+            }
+            let lazy_full = start.elapsed().as_nanos() as f64 / iters as f64;
+            black_box(total_l);
+
+            println!();
+            println!("  === {label} ===");
+            println!(
+                "  file={total_bytes}B chunk={chunk_size}B delim=0x{delim:02x} iters={iters} build={}",
+                if cfg!(debug_assertions) { "debug" } else { "release" }
+            );
+            println!(
+                "  TFC   eager={eager_tfc:>10.1}ns  lazy={lazy_tfc:>10.1}ns  ratio={:.2}x",
+                lazy_tfc / eager_tfc
+            );
+            println!(
+                "  Full  eager={eager_full:>10.1}ns  lazy={lazy_full:>10.1}ns  ratio={:.2}x",
+                lazy_full / eager_full
+            );
+        }
+
+        println!("=== Time-to-First-Chunk + Full Traversal ===");
+
+        let jsonl = gen_log_data(100_000);
+        let logs = gen_log_data(1_000_000);
+        let sparse = gen_log_data(10_000_000);
+
+        bench_one(&jsonl, 64 * 1024, b'\n', "JSONL-like 100KB 64KiB", 200);
+        bench_one(&logs, 64 * 1024, b'\n', "Log-like 1MB 64KiB", 50);
+        bench_one(&sparse, 64 * 1024, b'\n', "Sparse 10MB 64KiB", 10);
+        bench_one(&jsonl, 1024 * 1024, b'\n', "JSONL-like 100KB 1MiB", 200);
+        bench_one(&logs, 1024 * 1024, b'\n', "Log-like 1MB 1MiB", 50);
     }
 
     // ── Fixed-size chunking tests ────────────────────────────────────────

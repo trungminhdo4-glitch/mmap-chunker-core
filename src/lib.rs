@@ -7,6 +7,7 @@ pub use ffi::{
     CAP_FIXED_SIZE_CHUNKING, CAP_RECORD_PARTITIONING, CAP_ZERO_COPY,
 };
 pub use mmap::MmapFile;
+pub use scanner::ChunkCursor;
 
 #[derive(Debug)]
 pub(crate) enum ChunkLayout {
@@ -167,6 +168,33 @@ impl MmapChunker {
         let count = partitions.len();
         self.layout = ChunkLayout::Partitioned(partitions);
         count
+    }
+
+    /// Create a lazy streaming cursor for sequential chunk consumption.
+    ///
+    /// Returns a [`ChunkCursor`] that yields chunks one at a time using
+    /// the same delimiter-aware boundary semantics as
+    /// [`scan_delimited`](Self::scan_delimited), but without
+    /// pre-computing a `Vec` of all boundaries.
+    ///
+    /// O(1) state (~40 bytes on 64-bit) regardless of file size.
+    /// Ideal for low-memory streaming consumers where random access
+    /// via [`get_chunk`](Self::get_chunk) is not needed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use mmap_chunker_core::MmapChunker;
+    ///
+    /// let file = unsafe { MmapChunker::open("records.jsonl")? };
+    /// for chunk in file.delimited_cursor(64 * 1024, b'\n') {
+    ///     let _data: &[u8] = chunk;
+    /// }
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    #[inline]
+    pub fn delimited_cursor(&self, chunk_size: usize, delimiter: u8) -> ChunkCursor<'_> {
+        ChunkCursor::new(self.as_bytes(), chunk_size, delimiter)
     }
 
     /// Retrieve a zero-copy chunk by index.
