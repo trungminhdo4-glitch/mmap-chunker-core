@@ -54,7 +54,7 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
 /// scalar prefix for alignment and a scalar tail for the final <8 bytes.
 ///
 /// No unsafe. No dependencies. MSRV 1.77.
-fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
+pub fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
     let len = haystack.len();
     if len == 0 {
         return None;
@@ -101,6 +101,50 @@ fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
     }
 
     None
+}
+
+/// Number of fixed-size chunks a file of `file_len` bytes would produce
+/// with the given `chunk_size`.
+///
+/// `chunk_size` of 0 is clamped to 1, consistent with the delimiter scanner.
+#[inline]
+pub fn fixed_chunk_count(file_len: usize, chunk_size: usize) -> usize {
+    if file_len == 0 {
+        return 0;
+    }
+    file_len.div_ceil(chunk_size.max(1))
+}
+
+/// Compute the (start, end) boundaries for the `index`-th fixed-size chunk.
+///
+/// Returns `None` if `index >= fixed_chunk_count(file_len, chunk_size)`.
+///
+/// Overflow-safe: uses saturating arithmetic with a `min(file_len)` clamp.
+/// `chunk_size` of 0 is clamped to 1.
+#[inline]
+pub fn fixed_chunk_bounds(
+    file_len: usize,
+    chunk_size: usize,
+    index: usize,
+) -> Option<(usize, usize)> {
+    let effective_size = chunk_size.max(1);
+    if file_len == 0 {
+        return None;
+    }
+    let count = file_len.div_ceil(effective_size);
+    if index >= count {
+        return None;
+    }
+    let start = index.saturating_mul(effective_size);
+
+    let raw_end = start.saturating_add(effective_size);
+    let end = if raw_end > file_len {
+        file_len
+    } else {
+        raw_end
+    };
+
+    Some((start, end))
 }
 
 #[cfg(test)]
@@ -366,5 +410,164 @@ mod tests {
             find_chunk_boundaries(b"x\x00y\x00z", 2, b'\x00'),
             vec![(0, 4), (4, 5)]
         );
+    }
+
+    // ── Fixed-size chunking tests ────────────────────────────────────────
+
+    #[test]
+    fn test_fixed_chunk_count_empty() {
+        assert_eq!(fixed_chunk_count(0, 1024), 0);
+    }
+
+    #[test]
+    fn test_fixed_chunk_count_exact_multiple() {
+        assert_eq!(fixed_chunk_count(1024, 256), 4);
+    }
+
+    #[test]
+    fn test_fixed_chunk_count_with_remainder() {
+        assert_eq!(fixed_chunk_count(1000, 256), 4);
+    }
+
+    #[test]
+    fn test_fixed_chunk_count_single() {
+        assert_eq!(fixed_chunk_count(10, 1024), 1);
+    }
+
+    #[test]
+    fn test_fixed_chunk_count_zero_clamps() {
+        assert_eq!(fixed_chunk_count(5, 0), 5);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_empty() {
+        assert_eq!(fixed_chunk_bounds(0, 256, 0), None);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_exact() {
+        assert_eq!(fixed_chunk_bounds(1024, 256, 0), Some((0, 256)));
+        assert_eq!(fixed_chunk_bounds(1024, 256, 1), Some((256, 512)));
+        assert_eq!(fixed_chunk_bounds(1024, 256, 2), Some((512, 768)));
+        assert_eq!(fixed_chunk_bounds(1024, 256, 3), Some((768, 1024)));
+        assert_eq!(fixed_chunk_bounds(1024, 256, 4), None);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_remainder() {
+        assert_eq!(fixed_chunk_bounds(1000, 256, 3), Some((768, 1000)));
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_size_larger_than_file() {
+        assert_eq!(fixed_chunk_bounds(10, 1024, 0), Some((0, 10)));
+        assert_eq!(fixed_chunk_bounds(10, 1024, 1), None);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_oob() {
+        assert_eq!(fixed_chunk_bounds(1024, 256, 4), None);
+        assert_eq!(fixed_chunk_bounds(1024, 256, 100), None);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_zero_clamps() {
+        assert_eq!(fixed_chunk_bounds(5, 0, 0), Some((0, 1)));
+        assert_eq!(fixed_chunk_bounds(5, 0, 1), Some((1, 2)));
+        assert_eq!(fixed_chunk_bounds(5, 0, 4), Some((4, 5)));
+        assert_eq!(fixed_chunk_bounds(5, 0, 5), None);
+    }
+
+    #[test]
+    fn test_fixed_chunk_bounds_single() {
+        assert_eq!(fixed_chunk_bounds(1, 1024, 0), Some((0, 1)));
+    }
+
+    #[test]
+    fn test_fixed_property_concat_equals_len() {
+        let cases: &[(usize, usize)] = &[
+            (1024, 256),
+            (1000, 256),
+            (1, 1024),
+            (0, 1024),
+            (5, 1),
+            (1024, 1024),
+            (1025, 1024),
+        ];
+        for &(len, cs) in cases {
+            let count = fixed_chunk_count(len, cs);
+            let mut total = 0usize;
+            for i in 0..count {
+                let (s, e) = fixed_chunk_bounds(len, cs, i).unwrap();
+                total += e - s;
+                assert!(s <= e);
+            }
+            assert_eq!(total, len, "len={len} cs={cs}");
+        }
+    }
+
+    #[test]
+    fn test_fixed_property_no_gaps() {
+        let cases: &[(usize, usize)] = &[(1024, 256), (1000, 256), (5, 1)];
+        for &(len, cs) in cases {
+            let count = fixed_chunk_count(len, cs);
+            let mut prev_end = 0usize;
+            for i in 0..count {
+                let (s, e) = fixed_chunk_bounds(len, cs, i).unwrap();
+                assert_eq!(s, prev_end, "gap at i={i}");
+                prev_end = e;
+            }
+            assert_eq!(prev_end, len);
+        }
+    }
+
+    #[test]
+    fn test_fixed_property_non_final_full() {
+        let cases: &[(usize, usize)] = &[(1024, 256), (1000, 256), (5, 1)];
+        for &(len, cs) in cases {
+            let count = fixed_chunk_count(len, cs);
+            let eff = cs.max(1);
+            for i in 0..count.saturating_sub(1) {
+                let (s, e) = fixed_chunk_bounds(len, cs, i).unwrap();
+                assert_eq!(e - s, eff, "non-final chunk {i} not full");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixed_property_final_not_larger_than_chunk_size() {
+        let cases: &[(usize, usize)] = &[(1024, 256), (1000, 256), (5, 1)];
+        for &(len, cs) in cases {
+            let count = fixed_chunk_count(len, cs);
+            if count > 0 {
+                let (s, e) = fixed_chunk_bounds(len, cs, count - 1).unwrap();
+                assert!(e - s <= cs.max(1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixed_property_deterministic() {
+        for _ in 0..10 {
+            assert_eq!(fixed_chunk_count(1000, 256), 4);
+            assert_eq!(fixed_chunk_bounds(1000, 256, 1), Some((256, 512)));
+        }
+    }
+
+    #[test]
+    fn test_fixed_overflow_safety() {
+        // chunk_size near usize::MAX — should produce 1 chunk covering the file
+        let len: usize = 1024;
+        let huge: usize = usize::MAX;
+        assert_eq!(fixed_chunk_count(len, huge), 1);
+        assert_eq!(fixed_chunk_bounds(len, huge, 0), Some((0, len)));
+
+        // chunk_size = 1 on reasonable file
+        assert_eq!(fixed_chunk_count(len, 1), len);
+        assert_eq!(fixed_chunk_bounds(len, 1, 0), Some((0, 1)));
+        assert_eq!(fixed_chunk_bounds(len, 1, len - 1), Some((len - 1, len)));
+
+        // zero file, huge chunk
+        assert_eq!(fixed_chunk_count(0, usize::MAX), 0);
     }
 }

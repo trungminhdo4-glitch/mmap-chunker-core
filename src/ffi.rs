@@ -18,11 +18,12 @@ use crate::scanner;
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0000;
+pub const ABI_VERSION: u32 = 0x0001_0001;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
 pub const CAP_ERROR_STRINGS: u32 = 1 << 2;
+pub const CAP_FIXED_SIZE_CHUNKING: u32 = 1 << 3;
 
 const MAX_ERROR_LEN: usize = 256;
 
@@ -70,9 +71,18 @@ pub struct CEngineHandle {
 
 // ─── Internal engine state ────────────────────────────────────────────────────
 
+enum ChunkLayout {
+    Empty,
+    Delimited(Vec<(usize, usize)>),
+    Fixed {
+        chunk_size: usize,
+        chunk_count: usize,
+    },
+}
+
 struct Engine {
     mmap: MmapFile,
-    chunks: Vec<(usize, usize)>,
+    layout: ChunkLayout,
 }
 
 // ─── ABI discovery ────────────────────────────────────────────────────────────
@@ -90,13 +100,14 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.0):
+/// Current bits (v1.1):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
+///   - Bit 3: `FIXED_SIZE_CHUNKING` — `mmap_engine_scan_fixed` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
-    CAP_ZERO_COPY | CAP_CONFIGURABLE_DELIMITER | CAP_ERROR_STRINGS
+    CAP_ZERO_COPY | CAP_CONFIGURABLE_DELIMITER | CAP_ERROR_STRINGS | CAP_FIXED_SIZE_CHUNKING
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -151,7 +162,7 @@ pub unsafe extern "C" fn mmap_engine_open(path: *const c_char) -> *mut CEngineHa
                 mmap.advise_sequential();
                 let engine = Box::new(Engine {
                     mmap,
-                    chunks: Vec::new(),
+                    layout: ChunkLayout::Empty,
                 });
                 Box::into_raw(engine) as *mut CEngineHandle
             }
@@ -227,18 +238,80 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_ex(
 
         let data = unsafe { engine.mmap.as_slice() };
         if data.is_empty() {
-            engine.chunks.clear();
+            engine.layout = ChunkLayout::Empty;
             return 0;
         }
 
-        engine.chunks = scanner::find_chunk_boundaries(data, chunk_size_bytes, delimiter);
-        engine.chunks.len()
+        let chunks = scanner::find_chunk_boundaries(data, chunk_size_bytes, delimiter);
+        let count = chunks.len();
+        engine.layout = ChunkLayout::Delimited(chunks);
+        count
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
         Ok(count) => count,
         Err(_) => {
             set_error("internal error: panic in mmap_engine_scan_chunks");
+            0
+        }
+    }
+}
+
+/// Scan the mapped file into sequential fixed-size chunks.
+///
+/// Chunks are created at exact `chunk_size_bytes` intervals, with the last
+/// chunk potentially shorter at EOF. No delimiter semantics — this mode is
+/// suitable for binary/non-record workloads.
+///
+/// `chunk_size_bytes` of 0 is silently clamped to 1, consistent with all
+/// other scan functions.
+///
+/// Calling this function replaces any previously computed chunk boundaries.
+///
+/// Returns the number of chunks found, or 0 on error (null handle, empty file).
+/// On error, call `mmap_engine_last_error()` for diagnostics.
+///
+/// Threading: Same contract as `mmap_engine_scan_chunks()`.
+/// Added in ABI v1.1 (detect with `MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING`).
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by `mmap_engine_open`
+/// and must not have been freed.
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_scan_fixed(
+    handle: *mut CEngineHandle,
+    chunk_size_bytes: usize,
+) -> usize {
+    let inner = move || {
+        clear_error();
+
+        if handle.is_null() {
+            set_error("handle is null");
+            return 0;
+        }
+
+        let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        let file_len = engine.mmap.len();
+        if file_len == 0 {
+            engine.layout = ChunkLayout::Empty;
+            return 0;
+        }
+
+        let effective_size = chunk_size_bytes.max(1);
+        let count = file_len.div_ceil(effective_size);
+        engine.layout = ChunkLayout::Fixed {
+            chunk_size: effective_size,
+            chunk_count: count,
+        };
+        count
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(count) => count,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_scan_fixed");
             0
         }
     }
@@ -280,12 +353,35 @@ pub unsafe extern "C" fn mmap_engine_get_chunk(
 
         let engine = unsafe { &*(handle as *mut Engine) };
 
-        if index >= engine.chunks.len() {
-            set_error("chunk index out of bounds");
-            return -1;
-        }
-
-        let (start, end) = engine.chunks[index];
+        let (start, end) = match &engine.layout {
+            ChunkLayout::Empty => {
+                set_error("chunk index out of bounds");
+                return -1;
+            }
+            ChunkLayout::Delimited(chunks) => {
+                if index >= chunks.len() {
+                    set_error("chunk index out of bounds");
+                    return -1;
+                }
+                chunks[index]
+            }
+            ChunkLayout::Fixed {
+                chunk_size,
+                chunk_count,
+            } => {
+                if index >= *chunk_count {
+                    set_error("chunk index out of bounds");
+                    return -1;
+                }
+                match scanner::fixed_chunk_bounds(engine.mmap.len(), *chunk_size, index) {
+                    Some(bounds) => bounds,
+                    None => {
+                        set_error("internal error: fixed chunk bounds overflow");
+                        return -1;
+                    }
+                }
+            }
+        };
 
         unsafe {
             (*out_chunk).data = engine.mmap.as_ptr().add(start);
@@ -509,6 +605,10 @@ mod tests {
             "must have CONFIGURABLE_DELIMITER"
         );
         assert!(caps & CAP_ERROR_STRINGS != 0, "must have ERROR_STRINGS");
+        assert!(
+            caps & CAP_FIXED_SIZE_CHUNKING != 0,
+            "must have FIXED_SIZE_CHUNKING"
+        );
     }
 
     #[test]
@@ -707,6 +807,289 @@ mod tests {
             assert!(!err2.is_null());
             let msg2 = std::ffi::CStr::from_ptr(err2).to_string_lossy();
             assert!(msg2.contains("out_chunk is null"), "got: {msg2}");
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Fixed-size chunking tests ──────────────────────────────────────
+
+    #[test]
+    fn test_scan_fixed_exact_split() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_exact");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"AAAABBBBCCCCDDDDEEEEFFFF").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 4);
+            assert_eq!(count, 6);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            for i in 0..count {
+                let ret = mmap_engine_get_chunk(h, i, &mut view);
+                assert_eq!(ret, 0, "get_chunk failed at {i}");
+                assert_eq!(view.len, 4, "chunk {i} must be exactly 4 bytes");
+            }
+
+            let mut total = 0usize;
+            for i in 0..count {
+                mmap_engine_get_chunk(h, i, &mut view);
+                total += view.len;
+            }
+            assert_eq!(total, 24);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_short_last_chunk() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_short");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"XXXXXXXXX").unwrap(); // 9 bytes
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 4);
+            assert_eq!(count, 3);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 4);
+            mmap_engine_get_chunk(h, 1, &mut view);
+            assert_eq!(view.len, 4);
+            mmap_engine_get_chunk(h, 2, &mut view);
+            assert_eq!(view.len, 1);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_size_larger_than_file() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_large");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"tiny").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 1024);
+            assert_eq!(count, 1);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 4);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_chunk_size_zero() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_zero_cs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"abcdef").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 0);
+            assert_eq!(count, 6, "chunk_size=0 clamps to 1 → 6 chunks");
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            for i in 0..count {
+                let ret = mmap_engine_get_chunk(h, i, &mut view);
+                assert_eq!(ret, 0);
+                assert_eq!(view.len, 1);
+            }
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_empty_file() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("empty.dat");
+        std::fs::File::create(&file_path).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 256);
+            assert_eq!(count, 0);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_null_handle() {
+        unsafe {
+            assert_eq!(mmap_engine_scan_fixed(std::ptr::null_mut(), 1024), 0);
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+        }
+    }
+
+    #[test]
+    fn test_mode_switching_fixed_and_delimited() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_mode_switch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"aaa\nbbb\nccc\nddd\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+
+            // Delimited scan: chunk_size=4, delimiter=\n
+            // File: "aaa\nbbb\nccc\nddd\n" = 16 bytes
+            // Scanner steps to 4, finds \n at relative +3 → chunk (0, 8) = "aaa\nbbb\n"
+            let dc = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+            assert!(dc > 0);
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 8);
+
+            // Switch to fixed: 4-byte chunks
+            let fc = mmap_engine_scan_fixed(h, 4);
+            assert!(fc > 0);
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 4);
+
+            // Switch back to delimited
+            let dc2 = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+            assert_eq!(dc2, dc);
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 8);
+
+            // Fixed with different size
+            let fc2 = mmap_engine_scan_fixed(h, 8);
+            assert!(fc2 > 0);
+            assert_ne!(fc2, fc);
+            mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(view.len, 8);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_coverage_equals_file_len() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_coverage");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        let content = b"0123456789ABCDEF";
+        std::fs::write(&file_path, content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 3);
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let mut total = 0usize;
+            let mut pos = 0usize;
+            for i in 0..count {
+                let ret = mmap_engine_get_chunk(h, i, &mut view);
+                assert_eq!(ret, 0);
+                let slice = std::slice::from_raw_parts(view.data, view.len);
+                assert_eq!(slice, &content[pos..pos + view.len]);
+                total += view.len;
+                pos += view.len;
+            }
+            assert_eq!(total, content.len());
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_fixed_oob() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_fixed_oob");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_scan_fixed(h, 2);
+            assert_eq!(count, 3);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let ret = mmap_engine_get_chunk(h, 3, &mut view);
+            assert_eq!(ret, -1);
 
             mmap_engine_free(h);
         }

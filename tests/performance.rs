@@ -12,7 +12,7 @@
 //!   - Phase 10+11: end-to-end scanner + mmap benchmark
 //!   - Phase 12: optional memchr calibration (behind feature flag)
 
-use mmap_chunker_core::scanner::find_chunk_boundaries;
+use mmap_chunker_core::scanner::{find_byte_swar, find_chunk_boundaries};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -25,69 +25,6 @@ use std::time::Instant;
 #[inline(always)]
 pub fn find_byte_scalar(haystack: &[u8], delimiter: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == delimiter)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Phase 4: FIND_BYTE_SWAR — safe 64-bit word-at-a-time search
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Safe SWAR (SIMD Within A Register) byte search.
-///
-/// Strategy:
-///   1. Scalar prefix to reach 8-byte alignment
-///   2. SWAR main loop: load 8 bytes as u64, XOR with broadcast delimiter,
-///      detect zero bytes via classic `haszero` bit-hack
-///   3. Scalar tail for remaining <8 bytes
-///
-/// No unsafe. No new dependencies. MSRV 1.77 compatible.
-#[inline(never)]
-pub fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
-    let len = haystack.len();
-    if len == 0 {
-        return None;
-    }
-
-    let pattern = (delimiter as u64).wrapping_mul(0x0101010101010101u64);
-    let lo = 0x0101010101010101u64;
-    let hi = 0x8080808080808080u64;
-
-    let mut i = 0usize;
-
-    // Phase 1: scalar prefix to reach 8-byte alignment
-    let ptr = haystack.as_ptr() as usize;
-    let align = ptr % 8;
-    if align != 0 {
-        let prefix_end = (8 - align).min(len);
-        while i < prefix_end {
-            if haystack[i] == delimiter {
-                return Some(i);
-            }
-            i += 1;
-        }
-    }
-
-    // Phase 2: SWAR main loop (aligned 8-byte reads)
-    while i + 8 <= len {
-        let chunk: [u8; 8] = haystack[i..i + 8].try_into().unwrap();
-        let word = u64::from_ne_bytes(chunk);
-        let xored = word ^ pattern;
-
-        let has_zero = xored.wrapping_sub(lo) & !xored & hi;
-        if has_zero != 0 {
-            return Some(i + (has_zero.trailing_zeros() / 8) as usize);
-        }
-        i += 8;
-    }
-
-    // Phase 3: scalar tail (< 8 bytes)
-    while i < len {
-        if haystack[i] == delimiter {
-            return Some(i);
-        }
-        i += 1;
-    }
-
-    None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -275,7 +212,7 @@ where
 }
 
 /// Auto-calibrated benchmark: keep doubling iterations until RSD < 2% or max reached.
-fn bench_find_byte_auto<F>(haystack: &[u8], delim: u8, f: F, name: &str) -> f64
+fn bench_find_byte_auto<F>(haystack: &[u8], delim: u8, f: F, name: &str) -> (f64, usize)
 where
     F: Fn(&[u8], u8) -> Option<usize>,
 {
@@ -289,45 +226,57 @@ where
     let mut samples = Vec::with_capacity(10);
 
     while iters <= max_iters {
-        let total_ns = bench_find_byte(haystack, delim, &f, iters);
-        if total_ns * iters as f64 > 500_000_000.0 {
-            // ~500ms per sample — good enough precision
-            samples.push(total_ns);
+        let avg_ns = bench_find_byte(haystack, delim, &f, iters);
+        // avg_ns * iters == total elapsed; require ~500ms per sample
+        if avg_ns * iters as f64 > 500_000_000.0 {
+            samples.push(avg_ns);
             if samples.len() >= 5 {
                 break;
             }
         }
         iters = (iters * 2).min(max_iters);
         if iters == max_iters && samples.is_empty() {
-            samples.push(total_ns);
+            samples.push(avg_ns);
             break;
         }
     }
 
     if samples.is_empty() {
-        return 0.0;
+        return (0.0, 0);
     }
 
+    let n = samples.len();
     let mut sorted = samples.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median_ns = sorted[sorted.len() / 2];
+    let median_ns = sorted[n / 2];
 
     let result = black_box(f(black_box(haystack), delim));
     let _ = black_box(result);
 
-    println!("  {name:<20} {median_ns:>10.1} ns/call");
-    median_ns
+    println!(
+        "  {name:<20} {median_ns:>10.1} ns/call  (n={n})",
+        name = name,
+        n = n
+    );
+    (median_ns, n)
 }
 
 #[test]
 #[ignore = "performance experiment — run with --ignored --nocapture"]
 fn bench_byte_search_primitive() {
     println!();
-    println!("=== Microbenchmark: byte search primitive ===");
+    println!("=== Byte-Search Microbenchmark (scalar vs SWAR) ===");
+    println!(
+        "  Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
 
     let delim = b'\n';
 
-    // Use generated data
     fn gen_data(len: usize, pattern: &str) -> Vec<u8> {
         match pattern {
             "no_match" => vec![b'x'; len],
@@ -366,14 +315,16 @@ fn bench_byte_search_primitive() {
         for pattern in ["no_match", "match_mid"] {
             let data = gen_data(size, pattern);
             let case = format!("{label} {size}B {pattern}");
-            let s = bench_find_byte_auto(&data, delim, find_byte_scalar, &format!("scalar {case}"));
-            let w = bench_find_byte_auto(&data, delim, find_byte_swar, &format!("SWAR   {case}"));
+            let (s, _) =
+                bench_find_byte_auto(&data, delim, find_byte_scalar, &format!("scalar {case}"));
+            let (w, _) =
+                bench_find_byte_auto(&data, delim, find_byte_swar, &format!("SWAR   {case}"));
             let ratio = if s > 0.0 { w / s } else { f64::NAN };
             println!(
                 "  {case:<25} {s:>14.1} {w:>14.1} {ratio:>9.2}x",
                 case = case,
-                s = s as f64,
-                w = w as f64,
+                s = s,
+                w = w,
                 ratio = ratio
             );
         }
@@ -421,7 +372,7 @@ impl DataGenerator {
 }
 
 /// Instrumented version of find_chunk_boundaries that counts bytes examined
-/// by the delimiter search.
+/// by the delimiter search (early-exit semantics).
 fn find_chunk_boundaries_instrumented(
     data: &[u8],
     chunk_size: usize,
@@ -444,13 +395,14 @@ fn find_chunk_boundaries_instrumented(
             end = len;
         } else {
             let remainder = &data[end..];
-            search_bytes += remainder.len();
             if let Some(rel_pos) = remainder.iter().position(|&b| b == delimiter) {
+                search_bytes += rel_pos + 1;
                 end = end + rel_pos + 1;
                 if end > len {
                     end = len;
                 }
             } else {
+                search_bytes += remainder.len();
                 end = len;
             }
         }
@@ -467,7 +419,7 @@ fn bench_search_amplification() {
     println!();
     println!("=== Search Amplification Analysis ===");
     println!(
-        "  Dataset                  Input       Chunk KB  Chunks   Search B        Ratio    Avg OS"
+        "  Dataset                  File MB   Chk KB  Chunks  Searches   ExmB   Exm/Inp  MeanExm   p50OS   p95OS  maxOS"
     );
 
     let workloads: &[(&str, usize)] = &[
@@ -486,34 +438,51 @@ fn bench_search_amplification() {
             let data = gen.generate(file_size);
             for &chunk_kb in chunk_sizes_kb {
                 let chunk_size = chunk_kb * 1024;
-                let (chunks, search_bytes) =
+                let (chunks, exm_bytes) =
                     find_chunk_boundaries_instrumented(&data, chunk_size, b'\n');
 
+                let searches = chunks.len().saturating_sub(1);
+
                 let ratio = if file_size > 0 {
-                    search_bytes as f64 / file_size as f64
+                    exm_bytes as f64 / file_size as f64
                 } else {
                     0.0
                 };
 
-                let avg_overshoot = if !chunks.is_empty() {
-                    let total_os: usize = chunks
-                        .iter()
-                        .map(|(s, e)| (e - s).saturating_sub(chunk_size.min(e - s)))
-                        .sum();
-                    total_os as f64 / chunks.len() as f64
+                let mean_exm = if searches > 0 {
+                    exm_bytes as f64 / searches as f64
                 } else {
                     0.0
                 };
+
+                let mut overshoots: Vec<usize> = chunks
+                    .iter()
+                    .map(|(s, e)| (e - s).saturating_sub(chunk_size.min(e - s)))
+                    .collect();
+                overshoots.sort_unstable();
+                let n = overshoots.len();
+                let p50 = if n > 0 { overshoots[n / 2] } else { 0 };
+                let p95_idx = if n > 0 {
+                    ((n - 1) as f64 * 0.95) as usize
+                } else {
+                    0
+                };
+                let p95 = if n > 0 { overshoots[p95_idx] } else { 0 };
+                let max_os = overshoots.last().copied().unwrap_or(0);
 
                 println!(
-                    "  {label:<20} {fsize:>10} MB {ckb:>8} KB {clen:<8} {sb:>10} B {ratio:>9.4} {avg_os:>10.1}",
+                    "  {label:<20} {fsize:>8} {ckb:>7} {clen:>7} {srch:>9} {exmb:>7} {ratio:>9.4} {mexm:>9.1} {p50:>7} {p95:>7} {mos:>7}",
                     label = label,
                     fsize = file_size / 1048576,
                     ckb = chunk_kb,
                     clen = chunks.len(),
-                    sb = search_bytes,
+                    srch = searches,
+                    exmb = exm_bytes,
                     ratio = ratio,
-                    avg_os = avg_overshoot,
+                    mexm = mean_exm,
+                    p50 = p50,
+                    p95 = p95,
+                    mos = max_os,
                 );
             }
         }
@@ -525,36 +494,41 @@ fn bench_search_amplification() {
     {
         // No delimiter at all
         let data = vec![b'x'; 1_048_576];
-        let (chunks, sb) = find_chunk_boundaries_instrumented(&data, 65536, b'\n');
+        let (chunks, exm) = find_chunk_boundaries_instrumented(&data, 65536, b'\n');
+        let searches = chunks.len().saturating_sub(1);
         println!(
-            "  No delim 1MiB          {fsize:>10} MB {ckb:>8} KB {clen:<8} {sb:>10} B {ratio:>9.4}",
+            "  No delim 1MiB          {fsize:>8} {ckb:>7} {clen:>7} {srch:>9} {exmb:>7} {ratio:>9.4}",
             fsize = 1,
             ckb = 64,
             clen = chunks.len(),
-            sb = sb,
-            ratio = sb as f64 / 1048576.0,
+            srch = searches,
+            exmb = exm,
+            ratio = exm as f64 / 1048576.0,
         );
 
         // chunk_size = 1 (worst case)
         let data = DataGenerator::new(100, b'\n').generate(1_048_576);
-        let (chunks, sb) = find_chunk_boundaries_instrumented(&data, 1, b'\n');
+        let (chunks, exm) = find_chunk_boundaries_instrumented(&data, 1, b'\n');
+        let searches = chunks.len().saturating_sub(1);
         println!(
-            "  chunk=1 JSONL 1MiB     {fsize:>10} MB {ckb:>8} KB {clen:<8} {sb:>10} B {ratio:>9.4}",
+            "  chunk=1 JSONL 1MiB     {fsize:>8} {ckb:>7} {clen:>7} {srch:>9} {exmb:>7} {ratio:>9.4}",
             fsize = 1,
             ckb = 1,
             clen = chunks.len(),
-            sb = sb,
-            ratio = sb as f64 / 1048576.0,
+            srch = searches,
+            exmb = exm,
+            ratio = exm as f64 / 1048576.0,
         );
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 10+11: END-TO-END SCANNER BENCHMARK (scalar vs SWAR)
+// Phase 10+11: SCANNER BENCHMARK — production (SWAR) vs scalar baseline
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// find_chunk_boundaries variant using SWAR for delimiter search.
-fn find_chunk_boundaries_swar(
+/// Genuine scalar variant of find_chunk_boundaries for baseline comparison.
+/// Uses `position()` for delimiter search — no SWAR, no unsafe.
+fn find_chunk_boundaries_scalar(
     data: &[u8],
     chunk_size: usize,
     delimiter: u8,
@@ -575,7 +549,7 @@ fn find_chunk_boundaries_swar(
             end = len;
         } else {
             let remainder = &data[end..];
-            if let Some(rel_pos) = find_byte_swar(remainder, delimiter) {
+            if let Some(rel_pos) = remainder.iter().position(|&b| b == delimiter) {
                 end = end + rel_pos + 1;
                 if end > len {
                     end = len;
@@ -610,8 +584,16 @@ where
 #[ignore = "performance experiment — run with --ignored --nocapture"]
 fn bench_scanner_end_to_end() {
     println!();
-    println!("=== End-to-End Scanner Benchmark (scalar vs SWAR) ===");
-    println!("  Dataset                    Size       Chunk KB   Scalar ms     SWAR ms      Ratio   Chunks");
+    println!("=== Scanner Benchmark (production SWAR vs scalar baseline) ===");
+    println!(
+        "  Build: {}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    println!("  Dataset                    Size       Chunk KB   Prod SWAR ms  Scalar ms    Ratio   Chunks");
 
     let delim = b'\n';
     let file_sizes: &[usize] = &[1_048_576, 16_777_216, 67_108_864];
@@ -635,14 +617,14 @@ fn bench_scanner_end_to_end() {
                 // Warmup
                 for _ in 0..3 {
                     let _ = black_box(find_chunk_boundaries(black_box(&data), chunk_size, delim));
-                    let _ = black_box(find_chunk_boundaries_swar(
+                    let _ = black_box(find_chunk_boundaries_scalar(
                         black_box(&data),
                         chunk_size,
                         delim,
                     ));
                 }
 
-                // Calibrate iterations
+                // Calibrate iterations using production path
                 let mut iters: u64 = 1;
                 loop {
                     let start = Instant::now();
@@ -658,10 +640,15 @@ fn bench_scanner_end_to_end() {
 
                 let (s_ms, chunks) =
                     bench_scanner(&data, chunk_size, delim, find_chunk_boundaries, iters);
-                let (w_ms, _) =
-                    bench_scanner(&data, chunk_size, delim, find_chunk_boundaries_swar, iters);
+                let (w_ms, _) = bench_scanner(
+                    &data,
+                    chunk_size,
+                    delim,
+                    find_chunk_boundaries_scalar,
+                    iters,
+                );
 
-                let ratio = if s_ms > 0.0 { w_ms / s_ms } else { f64::NAN };
+                let ratio = if w_ms > 0.0 { s_ms / w_ms } else { f64::NAN };
 
                 println!(
                     "  {wl:<22} {fmb:>8} MB {ckb:>8} KB {sms:>12.3} {wms:>12.3} {ratio:>9.3}x {chunks:>8}",
@@ -744,18 +731,18 @@ mod scanner_properties {
 
         for &(data, chunk_size, delim) in cases {
             let original = find_chunk_boundaries(data, chunk_size, delim);
-            let swar = find_chunk_boundaries_swar(data, chunk_size, delim);
+            let scalar = find_chunk_boundaries_scalar(data, chunk_size, delim);
             assert_eq!(
                 original,
-                swar,
-                "SWAR chunker differs: len={} chunk_size={chunk_size} delim={delim:02x}",
+                scalar,
+                "production != scalar: len={} chunk_size={chunk_size} delim={delim:02x}",
                 data.len()
             );
             // Additional property: total bytes covered must equal input length
             let orig_total: usize = original.iter().map(|(s, e)| e - s).sum();
-            let swar_total: usize = swar.iter().map(|(s, e)| e - s).sum();
+            let scalar_total: usize = scalar.iter().map(|(s, e)| e - s).sum();
             assert_eq!(orig_total, data.len());
-            assert_eq!(swar_total, data.len());
+            assert_eq!(scalar_total, data.len());
         }
     }
 }

@@ -1,10 +1,10 @@
-# ABI v1 — required exported symbols
+# ABI v1.x — required exported symbols
 # ===================================
 # Additive-only policy:
 #   - Required symbols must always be present.
 #   - Missing or renamed symbol → CI FAIL.
 #   - Additional symbols → PASS (additive is allowed).
-# Generated from mmap-chunker-core v0.1.0.
+# Covers v1.0 through v1.x.
 
 mmap_engine_abi_version
 mmap_engine_capabilities
@@ -12,5 +12,6 @@ mmap_engine_last_error
 mmap_engine_open
 mmap_engine_scan_chunks
 mmap_engine_scan_chunks_ex
+mmap_engine_scan_fixed
 mmap_engine_get_chunk
 mmap_engine_free

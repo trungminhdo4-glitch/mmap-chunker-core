@@ -25,7 +25,7 @@ static void write_test_file(const char *path, const uint8_t *data, size_t len) {
 int main(void) {
     /* ── 1. ABI version ──────────────────────────────────────────── */
     TEST("abi_version");
-    CHECK(mmap_engine_abi_version() == 0x00010000U, "ABI version must be 0x00010000");
+    CHECK(mmap_engine_abi_version() == 0x00010001U, "ABI version must be 0x00010001");
 
     /* ── 2. Capabilities ─────────────────────────────────────────── */
     TEST("capabilities");
@@ -33,6 +33,7 @@ int main(void) {
     CHECK(caps & (1U << 0), "must have ZERO_COPY");
     CHECK(caps & (1U << 1), "must have CONFIGURABLE_DELIMITER");
     CHECK(caps & (1U << 2), "must have ERROR_STRINGS");
+    CHECK(caps & (1U << 3), "must have FIXED_SIZE_CHUNKING");
 
     /* ── 3. Error on NULL path ───────────────────────────────────── */
     TEST("open_null");
@@ -146,6 +147,118 @@ int main(void) {
     TEST("struct_layout");
     CHECK(sizeof(CChunkView) >= sizeof(void *) + sizeof(size_t),
           "CChunkView must hold pointer + size");
+
+    /* ── 16. Fixed-size: exact split ──────────────────────────────── */
+    TEST("fixed_exact");
+    const uint8_t fixed_data[] = "AAAABBBBCCCCDDDDEEEEFFFF";
+    size_t fixed_len = sizeof(fixed_data) - 1;
+    write_test_file("c_consumer_fixed_test.dat", fixed_data, fixed_len);
+    CEngineHandle *hf = mmap_engine_open("c_consumer_fixed_test.dat");
+    CHECK(hf != NULL, "must open fixed test file");
+    size_t fc = mmap_engine_scan_fixed(hf, 4);
+    CHECK(fc == 6, "24B/4B = 6 chunks");
+    CChunkView fv;
+    size_t ftotal = 0;
+    for (size_t i = 0; i < fc; i++) {
+        CHECK(mmap_engine_get_chunk(hf, i, &fv) == 0, "get chunk");
+        CHECK(fv.len == 4, "each chunk must be exactly 4 bytes");
+        ftotal += fv.len;
+    }
+    CHECK(ftotal == fixed_len, "total must equal file size");
+    mmap_engine_free(hf);
+    remove("c_consumer_fixed_test.dat");
+
+    /* ── 17. Fixed-size: short last chunk ─────────────────────────── */
+    TEST("fixed_short_last");
+    write_test_file("c_consumer_fixed_short.dat",
+                    (const uint8_t *)"XXXXXXXXX", 9);
+    CEngineHandle *hfs = mmap_engine_open("c_consumer_fixed_short.dat");
+    CHECK(hfs != NULL, "must open");
+    size_t fcs = mmap_engine_scan_fixed(hfs, 4);
+    CHECK(fcs == 3, "9B/4B = 3 chunks");
+    CChunkView fsv;
+    CHECK(mmap_engine_get_chunk(hfs, 0, &fsv) == 0, "");
+    CHECK(fsv.len == 4, "");
+    CHECK(mmap_engine_get_chunk(hfs, 1, &fsv) == 0, "");
+    CHECK(fsv.len == 4, "");
+    CHECK(mmap_engine_get_chunk(hfs, 2, &fsv) == 0, "");
+    CHECK(fsv.len == 1, "last chunk must be 1 byte");
+    mmap_engine_free(hfs);
+    remove("c_consumer_fixed_short.dat");
+
+    /* ── 18. Fixed-size: size larger than file ────────────────────── */
+    TEST("fixed_size_larger");
+    write_test_file("c_consumer_fixed_large.dat",
+                    (const uint8_t *)"tiny", 4);
+    CEngineHandle *hfl = mmap_engine_open("c_consumer_fixed_large.dat");
+    CHECK(hfl != NULL, "must open");
+    CHECK(mmap_engine_scan_fixed(hfl, 1024) == 1, "1 chunk");
+    CChunkView flv;
+    CHECK(mmap_engine_get_chunk(hfl, 0, &flv) == 0, "");
+    CHECK(flv.len == 4, "single chunk covers whole file");
+    mmap_engine_free(hfl);
+    remove("c_consumer_fixed_large.dat");
+
+    /* ── 19. Fixed-size: chunk_size=0 clamped ─────────────────────── */
+    TEST("fixed_size_zero");
+    write_test_file("c_consumer_fixed_zero.dat",
+                    (const uint8_t *)"abc", 3);
+    CEngineHandle *hfz = mmap_engine_open("c_consumer_fixed_zero.dat");
+    CHECK(hfz != NULL, "must open");
+    CHECK(mmap_engine_scan_fixed(hfz, 0) == 3, "0 clamps to 1 → 3 chunks");
+    CChunkView fzv;
+    CHECK(mmap_engine_get_chunk(hfz, 0, &fzv) == 0, "");
+    CHECK(fzv.len == 1, "");
+    CHECK(fzv.data[0] == 'a', "");
+    mmap_engine_free(hfz);
+    remove("c_consumer_fixed_zero.dat");
+
+    /* ── 20. Fixed-size: empty file ───────────────────────────────── */
+    TEST("fixed_empty");
+    write_test_file("c_consumer_fixed_empty.dat", (const uint8_t *)"", 0);
+    CEngineHandle *hfe = mmap_engine_open("c_consumer_fixed_empty.dat");
+    CHECK(hfe != NULL, "empty file must return valid handle");
+    CHECK(mmap_engine_scan_fixed(hfe, 256) == 0, "empty file → 0 chunks");
+    mmap_engine_free(hfe);
+    remove("c_consumer_fixed_empty.dat");
+
+    /* ── 21. Fixed-size: no delimiter alignment ───────────────────── */
+    TEST("fixed_no_delim");
+    write_test_file("c_consumer_fixed_nodelim.dat",
+                    (const uint8_t *)"ab\ncd\nef", 8);
+    CEngineHandle *hfd = mmap_engine_open("c_consumer_fixed_nodelim.dat");
+    CHECK(hfd != NULL, "must open");
+    CHECK(mmap_engine_scan_fixed(hfd, 3) == 3, "8B/3B = 3 chunks");
+    CChunkView fdv;
+    CHECK(mmap_engine_get_chunk(hfd, 0, &fdv) == 0, "");
+    CHECK(fdv.len == 3, "first chunk exactly 3B despite newline");
+    CHECK(mmap_engine_get_chunk(hfd, 1, &fdv) == 0, "");
+    CHECK(fdv.len == 3, "second chunk exactly 3B");
+    CHECK(mmap_engine_get_chunk(hfd, 2, &fdv) == 0, "");
+    CHECK(fdv.len == 2, "last chunk 2B");
+    mmap_engine_free(hfd);
+    remove("c_consumer_fixed_nodelim.dat");
+
+    /* ── 22. Mode switching: delimited → fixed → delimited ────────── */
+    TEST("mode_switch");
+    write_test_file("c_consumer_mode_switch.dat",
+                    (const uint8_t *)"aaa\nbbb\nccc\nddd\n", 16);
+    CEngineHandle *hms = mmap_engine_open("c_consumer_mode_switch.dat");
+    CHECK(hms != NULL, "must open");
+    size_t ms_dc = mmap_engine_scan_chunks_ex(hms, 4, '\n');
+    CHECK(ms_dc > 0, "delimited scan");
+    CChunkView msv;
+    CHECK(mmap_engine_get_chunk(hms, 0, &msv) == 0, "");
+    /* delimited mode: step=4, finds \n at offset7 → chunk(0,8) */
+    CHECK(msv.len == 8, "delimited chunk 0 must be 8B");
+    size_t ms_fc = mmap_engine_scan_fixed(hms, 4);
+    CHECK(ms_fc == 4, "fixed(4) → 4 chunks");
+    CHECK(mmap_engine_get_chunk(hms, 0, &msv) == 0, "");
+    CHECK(msv.len == 4, "fixed chunk 0 must be 4B");
+    size_t ms_dc2 = mmap_engine_scan_chunks_ex(hms, 4, '\n');
+    CHECK(ms_dc2 == ms_dc, "back to delimited must match");
+    mmap_engine_free(hms);
+    remove("c_consumer_mode_switch.dat");
 
     /* ── Cleanup ──────────────────────────────────────────────────── */
     remove(test_path);

@@ -21,20 +21,21 @@ typedef struct {
 
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010000U
+#define MMAP_ENGINE_ABI_VERSION 0x00010001U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
 #define MMAP_ENGINE_CAP_ZERO_COPY              (1U << 0)
 #define MMAP_ENGINE_CAP_CONFIGURABLE_DELIMITER (1U << 1)
 #define MMAP_ENGINE_CAP_ERROR_STRINGS          (1U << 2)
+#define MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING    (1U << 3)
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010000 (v1.0). Always succeeds, never panics.
+ * Current: 0x00010001 (v1.1). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -42,9 +43,10 @@ uint32_t mmap_engine_abi_version(void);
 /**
  * Return a bitmask of supported capabilities.
  *
- * Bit 0: ZERO_COPY             — chunk views reference mapped memory directly
+ * Bit 0: ZERO_COPY              — chunk views reference mapped memory directly
  * Bit 1: CONFIGURABLE_DELIMITER — mmap_engine_scan_chunks_ex() available
- * Bit 2: ERROR_STRINGS         — mmap_engine_last_error() returns diagnostic text
+ * Bit 2: ERROR_STRINGS          — mmap_engine_last_error() returns diagnostic text
+ * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -137,6 +139,37 @@ size_t mmap_engine_scan_chunks_ex(CEngineHandle *handle,
                                   uint8_t delimiter);
 
 /**
+ * Scan the mapped file into sequential fixed-size chunks.
+ *
+ * Chunks are created at exact `chunk_size_bytes` intervals, with the
+ * last chunk potentially shorter at EOF. No delimiter semantics — this
+ * mode is suitable for binary/non-record workloads.
+ *
+ * Chunk i covers [i*size, min((i+1)*size, file_len)).
+ * All non-final chunks have length exactly `chunk_size_bytes`.
+ * The final chunk has length `file_len % chunk_size_bytes`, or a full
+ * chunk when the file size divides evenly.
+ *
+ * `chunk_size_bytes` of 0 is silently clamped to 1 (consistent with
+ * all other scan functions — see mmap_engine_scan_chunks()).
+ *
+ * Calling this function replaces any previously computed chunk boundaries.
+ * The most recent scan determines the layout returned by
+ * mmap_engine_get_chunk().
+ *
+ * @param handle            Valid handle from mmap_engine_open().
+ * @param chunk_size_bytes  Exact chunk size in bytes (minimum 1;
+ *                          values of 0 are silently clamped to 1).
+ * @return                  Number of chunks found, or 0 on error / empty file.
+ *                          On error, call mmap_engine_last_error() for diagnostics.
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.1 (detect with MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING).
+ */
+size_t mmap_engine_scan_fixed(CEngineHandle *handle, size_t chunk_size_bytes);
+
+/**
  * Retrieve a chunk view by index (zero-copy).
  *
  * The `data` pointer references the memory-mapped file directly and
@@ -198,6 +231,10 @@ void mmap_engine_free(CEngineHandle *handle);
  *   - PATCH releases (bug fixes) do not change the ABI version.
  *   - MINOR releases add new functions without changing existing signatures.
  *   - MAJOR releases may break ABI compatibility.
+ *
+ * History:
+ *   v1.0 (0x00010000): Initial release — 8 core functions.
+ *   v1.1 (0x00010001): Added mmap_engine_scan_fixed() + CAP_FIXED_SIZE_CHUNKING.
  *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *
