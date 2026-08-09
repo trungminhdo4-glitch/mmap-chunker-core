@@ -59,6 +59,7 @@ mmap_chunker.h    — Public C header with full API docs
 - **No harness imports** — this library has no dependency on any agent harness
 - **64-bit only**: `compile_error!` at the pointer-width gate; 32-bit glibc `off_t` is 4 bytes — Rust FFI declares `i64` (8 bytes), which is an ABI mismatch (calling-convention corruption, not just truncation). musl 32-bit has 64-bit `off_t` but is untested and unsupported.
 - **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
+- **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. crates.io publish remains separate manual step.
 
 ## Public C ABI (10 functions)
 
@@ -84,3 +85,4 @@ mmap_chunker.h    — Public C header with full API docs
 - Cargo.lock is gitignored (library, not application) but exists in-tree from early commit
 - Python native_io module requires `cargo build --release` before tests
 - **Integer arithmetic**: scanner targets use `saturating_add`, partition uses `u128`, file-size uses `usize::try_from` — do not revert to unchecked `as` casts or `+`
+- **Release workflow**: `release.yml` builds native artifacts per platform on tag push. Uses `cross-rs/cross` for Linux aarch64 cross-compilation. Artifact naming uses Rust target triples. Draft release must be published manually.

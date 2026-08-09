@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml version
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: tag v$TAG_VERSION != Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: "v${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref }}
+          body: |
+            ## mmap-chunker-core v${{ steps.version.outputs.version }}
+
+            Prebuilt native libraries for C, Python, Go, and other FFI consumers.
+
+            ### Quick start
+
+            ```sh
+            # Linux x86_64
+            curl -L -o mmap.tar.gz \
+              https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/mmap-chunker-core-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+            tar xzf mmap.tar.gz
+            cc -I staging/include/ -L staging/lib/ -lmmap_chunker_core your_program.c
+            ```
+
+            Each platform archive contains: C header, dynamic library, static library, and licenses.
+          generate_release_notes: true
+
+  build-release:
+    needs: [create-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            ext: tar.gz
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        if: ${{ !matrix.cross }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross, aarch64-linux)
+        if: ${{ matrix.cross }}
+        uses: cross-rs/cross@v0.2
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          ARCHIVE="mmap-chunker-core-${{ needs.create-release.outputs.version }}-${{ matrix.target }}"
+          STAGING="staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING/include" "$STAGING/lib"
+          cp mmap_chunker.h "$STAGING/include/"
+          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+
+          TARGET_DIR="target/${{ matrix.target }}/release"
+
+          case "${{ runner.os }}" in
+            Windows)
+              cp "$TARGET_DIR/mmap_chunker_core.dll" "$STAGING/lib/"  2>/dev/null || true
+              cp "$TARGET_DIR/mmap_chunker_core.dll.lib" "$STAGING/lib/" 2>/dev/null || true
+              cp "$TARGET_DIR/mmap_chunker_core.lib" "$STAGING/lib/" 2>/dev/null || true
+              zip -r "${ARCHIVE}.zip" "$STAGING"
+              SHA=$(sha256sum "${ARCHIVE}.zip" | awk '{print $1}')
+              echo "$SHA  ${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+              ;;
+            macOS)
+              cp "$TARGET_DIR/libmmap_chunker_core.dylib" "$STAGING/lib/"
+              cp "$TARGET_DIR/libmmap_chunker_core.a" "$STAGING/lib/"
+              tar czf "${ARCHIVE}.tar.gz" "$STAGING"
+              SHA=$(shasum -a 256 "${ARCHIVE}.tar.gz" | awk '{print $1}')
+              echo "$SHA  ${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+              ;;
+            Linux)
+              cp "$TARGET_DIR/libmmap_chunker_core.so" "$STAGING/lib/"
+              cp "$TARGET_DIR/libmmap_chunker_core.a" "$STAGING/lib/"
+              tar czf "${ARCHIVE}.tar.gz" "$STAGING"
+              SHA=$(sha256sum "${ARCHIVE}.tar.gz" | awk '{print $1}')
+              echo "$SHA  ${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+              ;;
+          esac
+
+      - name: Upload artifact to release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref }}
+          files: |
+            mmap-chunker-core-*.${{ matrix.ext }}
+            mmap-chunker-core-*.${{ matrix.ext }}.sha256

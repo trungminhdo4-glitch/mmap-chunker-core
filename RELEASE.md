@@ -24,6 +24,17 @@ Before `cargo publish` for any version:
 5. **Package verification**: `cargo package` succeeds, version is correct, no private files
 6. **CHANGELOG**: Release section exists with correct date
 
+## Automated Release Assets
+
+Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`:
+
+- Validates tag == `Cargo.toml` version
+- Creates a draft GitHub Release
+- Matrix-builds 5 platforms (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64)
+- Uploads per-platform archives (header + dynamic + static library) + sha256 checksums
+
+The draft is published manually after review. crates.io publish remains a separate manual step (see Publish Order below).
+
 ## Publish Order
 
 1. Create annotated tag on the exact commit:

@@ -152,17 +152,34 @@ let bounds = scanner::fixed_chunk_bounds(data.len(), 4096, 0);
 let partitions = scanner::find_partition_boundaries(data, 4, b'\n');
 ```
 
-## Dynamic Library (cdylib)
+## Prebuilt Libraries (C / Python / Go / FFI)
+
+Prebuilt native libraries are published on [GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases) for every tagged version. Each platform archive contains the C header, dynamic library, static library, and licenses.
+
+| Platform | Archive | Contents |
+|----------|---------|----------|
+| Linux x86_64 | `mmap-chunker-core-{ver}-x86_64-unknown-linux-gnu.tar.gz` | `.so`, `.a` |
+| Linux aarch64 | `mmap-chunker-core-{ver}-aarch64-unknown-linux-gnu.tar.gz` | `.so`, `.a` |
+| macOS x86_64 | `mmap-chunker-core-{ver}-x86_64-apple-darwin.tar.gz` | `.dylib`, `.a` |
+| macOS arm64 | `mmap-chunker-core-{ver}-aarch64-apple-darwin.tar.gz` | `.dylib`, `.a` |
+| Windows x86_64 | `mmap-chunker-core-{ver}-x86_64-pc-windows-msvc.zip` | `.dll`, `.dll.lib`, `.lib` |
 
 ```python
-# Python with ctypes
+# Python with ctypes (download archive, extract, load)
 import ctypes
-lib = ctypes.CDLL("./mmap_chunker_core.dll")
+lib = ctypes.CDLL("./libmmap_chunker_core.so")  # or .dll / .dylib
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
 assert lib.mmap_engine_abi_version() == 0x00010002
 ```
 
-See the `mmap_chunker.h` header for the complete C API reference with threading and safety contracts.
+```c
+// C: compile against extracted archive
+// cc -I staging/include/ -L staging/lib/ -lmmap_chunker_core your_program.c
+#include "mmap_chunker.h"
+uint32_t ver = mmap_engine_abi_version();
+```
+
+See `mmap_chunker.h` for the complete C API reference with threading and safety contracts.
 
 ## Safety Contract
 
