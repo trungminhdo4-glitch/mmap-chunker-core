@@ -217,7 +217,13 @@ jobs:
                 | sort > "$VERIFY_ROOT/actual.symbols"
               ;;
             Windows)
-              if command -v dumpbin.exe >/dev/null 2>&1; then
+              if command -v llvm-readobj.exe >/dev/null 2>&1; then
+                llvm-readobj.exe --coff-exports "$DYNAMIC" \
+                  | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
+              elif command -v llvm-readobj >/dev/null 2>&1; then
+                llvm-readobj --coff-exports "$DYNAMIC" \
+                  | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
+              elif command -v dumpbin.exe >/dev/null 2>&1; then
                 dumpbin.exe /exports "$DYNAMIC" \
                   | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
               elif command -v llvm-nm.exe >/dev/null 2>&1; then
@@ -227,7 +233,7 @@ jobs:
                 llvm-nm --defined-only "$DYNAMIC" \
                   | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
               else
-                echo "ERROR: no PE export inspection tool (dumpbin.exe or llvm-nm.exe)"
+                echo "ERROR: no PE export inspection tool (llvm-readobj.exe, dumpbin.exe, or llvm-nm.exe)"
                 exit 1
               fi
               ;;
