@@ -61,7 +61,7 @@ mmap_chunker.h    — Public C header with full API docs
 - **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
 - **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. crates.io publish remains separate manual step.
 
-## Public C ABI (10 functions)
+## Public C ABI (11 functions)
 
 | Function                          | Purpose                              |
 |-----------------------------------|--------------------------------------|
