@@ -129,7 +129,7 @@ jobs:
                   exit 1
                 fi
               done
-              zip -q -r "${ARCHIVE}.zip" "$STAGING"
+              7z a -tzip -mx=9 "${ARCHIVE}.zip" "$STAGING" >/dev/null
               sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
               CHECKSUM_FILE="${ARCHIVE}.zip.sha256"
               PACKAGE="${ARCHIVE}.zip"
@@ -177,7 +177,7 @@ jobs:
           trap 'rm -rf "$VERIFY_ROOT"' EXIT
           mkdir "$VERIFY_ROOT/extracted"
           case "${{ runner.os }}" in
-            Windows) unzip -q "$PACKAGE" -d "$VERIFY_ROOT/extracted" ;;
+            Windows) 7z x -y "$PACKAGE" "-o$VERIFY_ROOT/extracted" >/dev/null ;;
             *) tar xzf "$PACKAGE" -C "$VERIFY_ROOT/extracted" ;;
           esac
 
@@ -234,38 +234,41 @@ jobs:
           esac
           diff -u "$VERIFY_ROOT/expected.symbols" "$VERIFY_ROOT/actual.symbols"
 
-          echo "=== C consumer from extracted archive ==="
-          CONSUMER="$VERIFY_ROOT/c_consumer.c"
-          sed 's|#include "../mmap_chunker.h"|#include "mmap_chunker.h"|' \
-            examples/c_consumer.c > "$CONSUMER"
-          test -s "$CONSUMER"
-          case "${{ runner.os }}" in
-            Windows)
-              cc -I"$ARCHIVE_ROOT/include" -o "$VERIFY_ROOT/c_consumer.exe" \
-                "$CONSUMER" "$ARCHIVE_ROOT/lib/mmap_chunker_core.dll.lib"
-              (cd "$VERIFY_ROOT" && ./c_consumer.exe)
-              ;;
-            macOS)
-              cc -I"$ARCHIVE_ROOT/include" -L"$ARCHIVE_ROOT/lib" \
-                -Wl,-rpath,"$ARCHIVE_ROOT/lib" -o "$VERIFY_ROOT/c_consumer" \
-                "$CONSUMER" -lmmap_chunker_core -lpthread
-              (cd "$VERIFY_ROOT" && ./c_consumer)
-              ;;
-            Linux)
-              cc -I"$ARCHIVE_ROOT/include" -L"$ARCHIVE_ROOT/lib" \
-                -Wl,-rpath,"$ARCHIVE_ROOT/lib" -o "$VERIFY_ROOT/c_consumer" \
-                "$CONSUMER" -lmmap_chunker_core -lpthread -ldl
-              (cd "$VERIFY_ROOT" && ./c_consumer)
-              ;;
-          esac
+          if [ "${{ matrix.cross || false }}" = "true" ]; then
+            echo "SKIP: native C and ctypes runtime checks for cross-compiled aarch64 artifact"
+          else
+            echo "=== C consumer from extracted archive ==="
+            CONSUMER="$VERIFY_ROOT/c_consumer.c"
+            sed 's|#include "../mmap_chunker.h"|#include "mmap_chunker.h"|' \
+              examples/c_consumer.c > "$CONSUMER"
+            test -s "$CONSUMER"
+            case "${{ runner.os }}" in
+              Windows)
+                cc -I"$ARCHIVE_ROOT/include" -o "$VERIFY_ROOT/c_consumer.exe" \
+                  "$CONSUMER" "$ARCHIVE_ROOT/lib/mmap_chunker_core.dll.lib"
+                (cd "$VERIFY_ROOT" && ./c_consumer.exe)
+                ;;
+              macOS)
+                cc -I"$ARCHIVE_ROOT/include" -L"$ARCHIVE_ROOT/lib" \
+                  -Wl,-rpath,"$ARCHIVE_ROOT/lib" -o "$VERIFY_ROOT/c_consumer" \
+                  "$CONSUMER" -lmmap_chunker_core -lpthread
+                (cd "$VERIFY_ROOT" && ./c_consumer)
+                ;;
+              Linux)
+                cc -I"$ARCHIVE_ROOT/include" -L"$ARCHIVE_ROOT/lib" \
+                  -Wl,-rpath,"$ARCHIVE_ROOT/lib" -o "$VERIFY_ROOT/c_consumer" \
+                  "$CONSUMER" -lmmap_chunker_core -lpthread -ldl
+                (cd "$VERIFY_ROOT" && ./c_consumer)
+                ;;
+            esac
 
-          echo "=== Python ctypes from extracted dynamic library ==="
-          if command -v python >/dev/null 2>&1; then
-            PY_DYNAMIC="$DYNAMIC"
-            if [ "${{ runner.os }}" = "Windows" ]; then
-              PY_DYNAMIC="$(cygpath -w "$DYNAMIC")"
-            fi
-            python - "$PY_DYNAMIC" <<'PY'
+            echo "=== Python ctypes from extracted dynamic library ==="
+            if command -v python >/dev/null 2>&1; then
+              PY_DYNAMIC="$DYNAMIC"
+              if [ "${{ runner.os }}" = "Windows" ]; then
+                PY_DYNAMIC="$(cygpath -w "$DYNAMIC")"
+              fi
+              python - "$PY_DYNAMIC" <<'PY'
           import ctypes
           import os
           import sys
@@ -280,16 +283,21 @@ jobs:
           assert lib.mmap_engine_capabilities() & 0x1
           print("PASS: ctypes loaded extracted dynamic library")
           PY
-          else
-            echo "SKIP: python is not installed on this runner"
+            else
+              echo "SKIP: python is not installed on this runner"
+            fi
           fi
 
           echo "=== Archive contents ==="
           case "${{ runner.os }}" in
-            Windows) unzip -l "$PACKAGE" ;;
+            Windows) 7z l "$PACKAGE" ;;
             *) tar tzf "$PACKAGE" ;;
           esac
-          echo "PASS: $PACKAGE has verified checksum, contents, ABI, C, and ctypes coverage"
+          if [ "${{ matrix.cross || false }}" = "true" ]; then
+            echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only cross coverage"
+          else
+            echo "PASS: $PACKAGE has verified checksum, contents, ABI, C, and ctypes coverage"
+          fi
 
       - name: Upload verified artifact for release or dry run
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
