@@ -250,7 +250,7 @@ jobs:
             test -s "$CONSUMER"
             case "${{ runner.os }}" in
               Windows)
-                cc -I"$ARCHIVE_ROOT/include" -o "$VERIFY_ROOT/c_consumer.exe" \
+                gcc -I"$ARCHIVE_ROOT/include" -o "$VERIFY_ROOT/c_consumer.exe" \
                   "$CONSUMER" "$ARCHIVE_ROOT/lib/mmap_chunker_core.dll.lib"
                 (cd "$VERIFY_ROOT" && ./c_consumer.exe)
                 ;;
