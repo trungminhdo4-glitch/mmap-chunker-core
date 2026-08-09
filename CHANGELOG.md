@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-09
+
 ### Added
 
 - C ABI multi-byte delimiter scanning via `mmap_engine_scan_chunks_pattern`.
@@ -16,8 +18,17 @@
 - Multi-byte delimiter support via `find_chunk_boundaries_pattern` and `find_pattern_in_slice`
   (Rust-only, first-byte SWAR + `starts_with` verification)
 
+### Changed
+
+- Native release archives now cover Linux x86_64, Linux aarch64 package-only,
+  Windows x86_64, macOS x86_64, and macOS aarch64, with checksums and
+  extracted-archive ABI/consumer verification for native lanes.
+- The supported target contract is explicitly 64-bit; Rust MSRV remains 1.77.
+
 ### Fixed
 
+- Hardened file-size conversion and scanner/partition arithmetic against
+  overflow and unsupported 32-bit ABI layouts.
 - `ChunkCursor::size_hint()` and `PatternChunkCursor::size_hint()`: lower bound corrected
   from bogus `(remaining / step) + 1` to `1` (there is always at least one more chunk
   when the cursor is not exhausted). The old lower bound could exceed the true remaining

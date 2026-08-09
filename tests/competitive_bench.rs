@@ -839,7 +839,7 @@ fn competitive_bench() {
     println!("  mmap-chunker-core — Competitive Performance Benchmarks");
     println!("══════════════════════════════════════════════════════════════════");
     println!(
-        "  Version: {} (crates.io v0.2.0)",
+        "  Version: {} (package under test)",
         env!("CARGO_PKG_VERSION")
     );
     println!("  MSRV:    1.77");

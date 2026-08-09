@@ -6,8 +6,8 @@ Three independent version domains:
 
 | Domain        | Current  | Controls                                  |
 |---------------|----------|-------------------------------------------|
-| Crate SemVer  | 0.2.0    | crates.io package, GitHub tag, Release    |
-| C ABI         | 1.2      | Additive C API capability evolution       |
+| Crate SemVer  | 0.2.1    | crates.io package, GitHub tag, Release    |
+| C ABI         | 1.3      | Additive C API capability evolution       |
 | Rust MSRV     | 1.77     | Minimum Supported Rust Version            |
 
 Crate SemVer and C ABI version evolve independently.
