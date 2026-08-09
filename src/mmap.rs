@@ -6,6 +6,9 @@ use std::ffi::CStr;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 compile_error!("mmap-chunker-core only supports Windows, Linux, and macOS");
 
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("mmap-chunker-core requires a 64-bit target: lseek/mmap FFI uses off64_t/i64 which is not ABI-compatible with 32-bit off_t on glibc");
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
     use std::ffi::{c_char, c_int, c_void};
@@ -142,12 +145,13 @@ impl MmapFile {
         // SEEK_END returns the file size without modifying the fd state
         // (we don't need the seek position afterwards).
         let file_size = sys::lseek(fd, 0, sys::SEEK_END);
-        if file_size < 0 {
-            sys::close(fd);
-            return None;
-        }
-
-        let size = file_size as usize;
+        let size = match usize::try_from(file_size) {
+            Ok(s) => s,
+            Err(_) => {
+                sys::close(fd);
+                return None;
+            }
+        };
         if size == 0 {
             sys::close(fd);
             return Some(MmapFile {
@@ -222,7 +226,13 @@ impl MmapFile {
             return None;
         }
 
-        let size = file_size as usize;
+        let size = match usize::try_from(file_size) {
+            Ok(s) => s,
+            Err(_) => {
+                sys::CloseHandle(fh);
+                return None;
+            }
+        };
         if size == 0 {
             sys::CloseHandle(fh);
             return Some(MmapFile {

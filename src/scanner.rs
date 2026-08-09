@@ -24,7 +24,7 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
     let mut start = 0usize;
 
     while start < len {
-        let mut end = start + step;
+        let mut end = start.saturating_add(step);
 
         if end >= len {
             end = len;
@@ -125,7 +125,7 @@ impl<'a> Iterator for ChunkCursor<'a> {
         }
 
         let step = self.chunk_size.max(1);
-        let target = self.position + step;
+        let target = self.position.saturating_add(step);
         let end = if target >= len {
             len
         } else {
@@ -220,7 +220,7 @@ pub fn find_chunk_boundaries_pattern(
     let mut start = 0usize;
 
     while start < len {
-        let mut end = start + step;
+        let mut end = start.saturating_add(step);
 
         if end >= len {
             end = len;
@@ -319,7 +319,7 @@ impl<'a, 'p> Iterator for PatternChunkCursor<'a, 'p> {
 
         let dlen = self.delimiter.len();
         let step = self.chunk_size.max(1);
-        let target = self.position + step;
+        let target = self.position.saturating_add(step);
         let end = if target >= len {
             len
         } else {
@@ -496,10 +496,10 @@ pub fn find_partition_boundaries(
     let n = num_partitions;
     let target_count = n - 1;
 
-    // Overflow-safe: use u64 for multiplication
+    // Overflow-safe: use u128 intermediate for multiplication
     let mut targets: Vec<usize> = Vec::with_capacity(target_count);
     for i in 1..n {
-        let target = (file_len as u64 * i as u64 / n as u64) as usize;
+        let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
         targets.push(target);
     }
 
@@ -2680,5 +2680,73 @@ mod tests {
         assert!(!chunks.is_empty());
         let total: usize = chunks.iter().map(|(s, e)| e - s).sum();
         assert_eq!(total, data.len());
+    }
+
+    // ── Overflow safety — near-usize::MAX arithmetic ──────────────────
+
+    #[test]
+    fn overflow_safe_partition_target_u128() {
+        // On 64-bit, file_len * i can overflow u64. u128 prevents this.
+        let huge: usize = usize::MAX;
+        // file_len = huge, n = 3: product hits 2*huge which overflows u64
+        // but fits in u128. Cannot actually mmap this, so test the formula.
+        let target = (huge as u128) * (2u128) / (3u128);
+        assert!(target < huge as u128);
+
+        // Verify the partition function produces correct boundaries at the
+        // realistic scale: a real file fits in usize but needs correct math.
+        let data = b"aa\nbb\ncc\ndd\nee\n";
+        let partitions = find_partition_boundaries(data, 3, b'\n');
+        let total: usize = partitions.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn overflow_safe_scanner_target_saturates() {
+        // chunk_size near usize::MAX, start near len → saturating_add
+        // prevents wrap. The test verifies the clamped behavior.
+        let data = b"hello\nworld\n";
+        let chunks = find_chunk_boundaries(data, usize::MAX, b'\n');
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn overflow_safe_cursor_target_saturates() {
+        let data = b"hello\nworld\n";
+        let cursor: Vec<&[u8]> = ChunkCursor::new(data, usize::MAX, b'\n').collect();
+        let total: usize = cursor.iter().map(|c| c.len()).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn overflow_safe_pattern_target_saturates() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let chunks = find_chunk_boundaries_pattern(data, usize::MAX, b"\r\n");
+        assert_eq!(chunks, vec![(0, data.len())]);
+    }
+
+    #[test]
+    fn overflow_safe_pattern_cursor_target_saturates() {
+        let data = b"a\r\nb\r\nc\r\n";
+        let cursor: Vec<&[u8]> = PatternChunkCursor::new(data, usize::MAX, b"\r\n").collect();
+        let total: usize = cursor.iter().map(|c| c.len()).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn overflow_safe_fixed_bounds_large_values() {
+        // Already uses saturating_mul/saturating_add — verify correctness
+        // with extreme parameters
+        assert_eq!(fixed_chunk_count(0, usize::MAX), 0);
+        assert_eq!(fixed_chunk_count(1024, usize::MAX), 1);
+        assert_eq!(fixed_chunk_bounds(1024, usize::MAX, 0), Some((0, 1024)));
+
+        // chunk_size = 1 on large file
+        let len: usize = 1000;
+        assert_eq!(fixed_chunk_count(len, 1), len);
+        assert_eq!(fixed_chunk_bounds(len, 1, len - 1), Some((len - 1, len)));
+
+        // Zero file, any chunk_size
+        assert_eq!(fixed_chunk_bounds(0, usize::MAX, 0), None);
     }
 }

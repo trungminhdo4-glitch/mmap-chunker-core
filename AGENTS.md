@@ -57,6 +57,8 @@ mmap_chunker.h    — Public C header with full API docs
 - **Immutable input contract** — file must not mutate while handle lives
 - **Threading**: open/scan/free = single-thread, get_chunk = multi-thread after scan
 - **No harness imports** — this library has no dependency on any agent harness
+- **64-bit only**: `compile_error!` at the pointer-width gate; 32-bit glibc `off_t` is 4 bytes — Rust FFI declares `i64` (8 bytes), which is an ABI mismatch (calling-convention corruption, not just truncation). musl 32-bit has 64-bit `off_t` but is untested and unsupported.
+- **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
 
 ## Public C ABI (10 functions)
 
@@ -81,3 +83,4 @@ mmap_chunker.h    — Public C header with full API docs
 - `extern "C" fn` that are inherently safe (no pointer access) should NOT be `unsafe`
 - Cargo.lock is gitignored (library, not application) but exists in-tree from early commit
 - Python native_io module requires `cargo build --release` before tests
+- **Integer arithmetic**: scanner targets use `saturating_add`, partition uses `u128`, file-size uses `usize::try_from` — do not revert to unchecked `as` casts or `+`
