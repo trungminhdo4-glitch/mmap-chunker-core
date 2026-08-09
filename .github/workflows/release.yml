@@ -3,9 +3,10 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,7 +19,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd7191bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Validate tag matches Cargo.toml version
         id: version
@@ -32,7 +33,7 @@ jobs:
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release (draft)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c359cb4e  # v2.1.0
         with:
           draft: true
           name: "v${{ steps.version.outputs.version }}"
@@ -53,6 +54,7 @@ jobs:
             ```
 
             Each platform archive contains: C header, dynamic library, static library, and licenses.
+            All archives have an accompanying `.sha256` checksum file.
           generate_release_notes: true
 
   build-release:
@@ -81,11 +83,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd7191bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         if: ${{ !matrix.cross }}
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -95,7 +97,7 @@ jobs:
 
       - name: Build (cross, aarch64-linux)
         if: ${{ matrix.cross }}
-        uses: cross-rs/cross@v0.2
+        uses: cross-rs/cross@f8151ae777290430cf2108efacf3976d9528500b  # v0.2.5
         with:
           command: build
           args: --release --target ${{ matrix.target }}
@@ -114,14 +116,27 @@ jobs:
 
           case "${{ runner.os }}" in
             Windows)
-              cp "$TARGET_DIR/mmap_chunker_core.dll" "$STAGING/lib/"  2>/dev/null || true
-              cp "$TARGET_DIR/mmap_chunker_core.dll.lib" "$STAGING/lib/" 2>/dev/null || true
-              cp "$TARGET_DIR/mmap_chunker_core.lib" "$STAGING/lib/" 2>/dev/null || true
+              for lib in mmap_chunker_core.dll mmap_chunker_core.dll.lib mmap_chunker_core.lib; do
+                if [ -f "$TARGET_DIR/$lib" ]; then
+                  cp "$TARGET_DIR/$lib" "$STAGING/lib/"
+                else
+                  echo "ERROR: expected artifact $TARGET_DIR/$lib not found"
+                  ls -la "$TARGET_DIR/" || true
+                  exit 1
+                fi
+              done
               zip -r "${ARCHIVE}.zip" "$STAGING"
               SHA=$(sha256sum "${ARCHIVE}.zip" | awk '{print $1}')
               echo "$SHA  ${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
               ;;
             macOS)
+              for lib in libmmap_chunker_core.dylib libmmap_chunker_core.a; do
+                if [ ! -f "$TARGET_DIR/$lib" ]; then
+                  echo "ERROR: expected artifact $TARGET_DIR/$lib not found"
+                  ls -la "$TARGET_DIR/" || true
+                  exit 1
+                fi
+              done
               cp "$TARGET_DIR/libmmap_chunker_core.dylib" "$STAGING/lib/"
               cp "$TARGET_DIR/libmmap_chunker_core.a" "$STAGING/lib/"
               tar czf "${ARCHIVE}.tar.gz" "$STAGING"
@@ -129,6 +144,13 @@ jobs:
               echo "$SHA  ${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
               ;;
             Linux)
+              for lib in libmmap_chunker_core.so libmmap_chunker_core.a; do
+                if [ ! -f "$TARGET_DIR/$lib" ]; then
+                  echo "ERROR: expected artifact $TARGET_DIR/$lib not found"
+                  ls -la "$TARGET_DIR/" || true
+                  exit 1
+                fi
+              done
               cp "$TARGET_DIR/libmmap_chunker_core.so" "$STAGING/lib/"
               cp "$TARGET_DIR/libmmap_chunker_core.a" "$STAGING/lib/"
               tar czf "${ARCHIVE}.tar.gz" "$STAGING"
@@ -137,8 +159,30 @@ jobs:
               ;;
           esac
 
+          echo "=== Archive contents ==="
+          case "${{ runner.os }}" in
+            Windows) unzip -l "${ARCHIVE}.zip" ;;
+            *) tar tzf "${ARCHIVE}.tar.gz" ;;
+          esac
+
+          echo "=== Binary verification ==="
+          case "${{ runner.os }}" in
+            Windows)
+              file "$STAGING/lib/mmap_chunker_core.dll"
+              ;;
+            macOS)
+              file "$STAGING/lib/libmmap_chunker_core.dylib"
+              file "$STAGING/lib/libmmap_chunker_core.a"
+              ;;
+            Linux)
+              file "$STAGING/lib/libmmap_chunker_core.so"
+              echo "Exported symbols:"
+              nm -D "$STAGING/lib/libmmap_chunker_core.so" | grep -c 'T mmap_engine_' || true
+              ;;
+          esac
+
       - name: Upload artifact to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c359cb4e  # v2.1.0
         with:
           draft: true
           tag_name: ${{ github.ref }}

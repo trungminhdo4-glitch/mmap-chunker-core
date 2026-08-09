@@ -85,4 +85,4 @@ mmap_chunker.h    — Public C header with full API docs
 - Cargo.lock is gitignored (library, not application) but exists in-tree from early commit
 - Python native_io module requires `cargo build --release` before tests
 - **Integer arithmetic**: scanner targets use `saturating_add`, partition uses `u128`, file-size uses `usize::try_from` — do not revert to unchecked `as` casts or `+`
-- **Release workflow**: `release.yml` builds native artifacts per platform on tag push. Uses `cross-rs/cross` for Linux aarch64 cross-compilation. Artifact naming uses Rust target triples. Draft release must be published manually.
+- **Release workflow**: `release.yml` builds native artifacts per platform on tag push. Uses `cross-rs/cross` for Linux aarch64 cross-compilation. Artifact naming uses Rust target triples. Draft release must be published manually. Third-party actions pinned to commit SHA. Workflow fails closed — missing expected artifacts abort the job.
