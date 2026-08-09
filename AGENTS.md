@@ -37,7 +37,7 @@ src/
                  PatternChunkCursor (multi-byte delimiter cursor),
                  find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds,
                  find_partition_boundaries (N-way)
-  ffi.rs      — C ABI: 10 public functions, ChunkLayout enum, panic containment
+  ffi.rs      — C ABI: 11 public functions, ChunkLayout enum, panic containment
 
 tests/
   c_abi_test.rs        — Integration test: C ABI via extern "C" (Rust calling Rust)
@@ -70,7 +70,8 @@ mmap_chunker.h    — Public C header with full API docs
 | `mmap_engine_last_error()`        | Thread-local error diagnostics       |
 | `mmap_engine_open(path)`          | Open + mmap file                     |
 | `mmap_engine_scan_chunks(h, sz)`  | Scan with newline delimiter (v1.0)   |
-| `mmap_engine_scan_chunks_ex(h,sz,delim)` | Scan with configurable delimiter |
+| `mmap_engine_scan_chunks_ex(h,sz,delim)` | Scan with configurable single-byte delimiter |
+| `mmap_engine_scan_chunks_pattern(h,sz,d,len)` | Scan with borrowed multi-byte delimiter (v1.3) |
 | `mmap_engine_scan_fixed(h, sz)`   | Fixed-size arithmetic chunking (v1.1)|
 | `mmap_engine_partition_records(h, n, d)` | Record-aligned N-way partition (v1.2)|
 | `mmap_engine_get_chunk(h, i, out)`| Zero-copy chunk by index (returns 0/-1) |

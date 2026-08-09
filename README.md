@@ -22,7 +22,7 @@ unnecessarily or pull in heavy dependencies. This library provides:
 - Windows and Linux are validated in CI; macOS validation now included
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
-- Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust API
+- Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust and C ABI
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
 - Panic containment at all FFI boundaries
@@ -59,6 +59,9 @@ if (!h) {
 }
 
 size_t count = mmap_engine_scan_chunks_ex(h, 64 * 1024, '\n');
+// For CRLF or another binary pattern, use pointer + length (ABI v1.3):
+// const uint8_t delimiter[] = {'\r', '\n'};
+// count = mmap_engine_scan_chunks_pattern(h, 64 * 1024, delimiter, 2);
 // or: mmap_engine_scan_fixed(h, 4096)              — fixed-size mode
 // or: mmap_engine_partition_records(h, 4, '\n')   — N-way partition planning
 for (size_t i = 0; i < count; i++) {
@@ -169,7 +172,7 @@ Prebuilt native libraries are published on [GitHub Releases](https://github.com/
 import ctypes
 lib = ctypes.CDLL("./libmmap_chunker_core.so")  # or .dll / .dylib
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
-assert lib.mmap_engine_abi_version() == 0x00010002
+assert lib.mmap_engine_abi_version() == 0x00010003
 ```
 
 ```c

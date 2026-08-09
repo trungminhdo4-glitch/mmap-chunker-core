@@ -25,7 +25,7 @@ static void write_test_file(const char *path, const uint8_t *data, size_t len) {
 int main(void) {
     /* ── 1. ABI version ──────────────────────────────────────────── */
     TEST("abi_version");
-    CHECK(mmap_engine_abi_version() == 0x00010002U, "ABI version must be 0x00010002");
+    CHECK(mmap_engine_abi_version() == 0x00010003U, "ABI version must be 0x00010003");
 
     /* ── 2. Capabilities ─────────────────────────────────────────── */
     TEST("capabilities");
@@ -34,6 +34,8 @@ int main(void) {
     CHECK(caps & (1U << 1), "must have CONFIGURABLE_DELIMITER");
     CHECK(caps & (1U << 2), "must have ERROR_STRINGS");
     CHECK(caps & (1U << 3), "must have FIXED_SIZE_CHUNKING");
+    CHECK(caps & (1U << 4), "must have RECORD_PARTITIONING");
+    CHECK(caps & (1U << 5), "must have MULTI_BYTE_DELIMITER");
 
     /* ── 3. Error on NULL path ───────────────────────────────────── */
     TEST("open_null");
@@ -130,7 +132,75 @@ int main(void) {
     mmap_engine_free(ha);
     mmap_engine_free(hb);
 
-    /* ── 13. Empty file → 0 chunks, handle valid ──────────────────── */
+    /* ── 13. Multi-byte delimiter: CRLF + borrowed lifetime ──────── */
+    TEST("scan_pattern_crlf");
+    const uint8_t crlf_content[] = "a\r\nb\r\nc\r\n";
+    write_test_file("c_consumer_pattern_crlf.dat", crlf_content,
+                    sizeof(crlf_content) - 1);
+    CEngineHandle *hpattern = mmap_engine_open("c_consumer_pattern_crlf.dat");
+    CHECK(hpattern != NULL, "must open CRLF file");
+    uint8_t crlf[] = {'\r', '\n'};
+    size_t pattern_count = mmap_engine_scan_chunks_pattern(
+        hpattern, 4, crlf, sizeof(crlf));
+    CHECK(pattern_count == 2, "CRLF should produce 2 chunks");
+    /* The delimiter buffer can be reused immediately after scan. */
+    crlf[0] = 0;
+    CChunkView pattern_view;
+    CHECK(mmap_engine_get_chunk(hpattern, 0, &pattern_view) == 0,
+          "get CRLF chunk");
+    CHECK(pattern_view.len == 6, "first CRLF chunk must include complete delimiter");
+    CHECK(memcmp(pattern_view.data, "a\r\nb\r\n", pattern_view.len) == 0,
+          "CRLF chunk contents");
+
+    /* ── 14. Binary multi-byte delimiter with embedded NUL ───────── */
+    TEST("scan_pattern_binary");
+    const uint8_t binary_content[] = {
+        'A', 0x00, 0xff, 0x00, 'B', 'C', 0x00, 0xff, 0x00, 'D'
+    };
+    write_test_file("c_consumer_pattern_binary.dat", binary_content,
+                    sizeof(binary_content));
+    CEngineHandle *hbinary = mmap_engine_open("c_consumer_pattern_binary.dat");
+    CHECK(hbinary != NULL, "must open binary pattern file");
+    const uint8_t binary_delimiter[] = {0x00, 0xff, 0x00};
+    size_t binary_count = mmap_engine_scan_chunks_pattern(
+        hbinary, 4, binary_delimiter, sizeof(binary_delimiter));
+    CHECK(binary_count == 2, "binary delimiter should produce 2 chunks");
+    CChunkView binary_view;
+    CHECK(mmap_engine_get_chunk(hbinary, 0, &binary_view) == 0,
+          "get binary pattern chunk");
+    CHECK(binary_view.len == 9, "binary chunk must include delimiter bytes");
+    CHECK(memcmp(binary_view.data, binary_content, binary_view.len) == 0,
+          "binary chunk contents");
+    mmap_engine_free(hbinary);
+    remove("c_consumer_pattern_binary.dat");
+
+    /* ── 15. Pattern validation and len=1 equivalence ─────────────── */
+    TEST("scan_pattern_validation");
+    CHECK(mmap_engine_scan_chunks_pattern(
+              hpattern, 4, NULL, 0) == 0,
+          "NULL + zero length must fail");
+    CHECK(mmap_engine_last_error() != NULL, "invalid pattern must set error");
+    CHECK(mmap_engine_get_chunk(hpattern, 0, &pattern_view) == 0,
+          "failed scan must preserve previous layout");
+    const uint8_t newline_pattern[] = {'\n'};
+    CEngineHandle *hlen1 = mmap_engine_open("c_consumer_pattern_crlf.dat");
+    CHECK(hlen1 != NULL, "must open len=1 comparison file");
+    size_t len1_ex = mmap_engine_scan_chunks_ex(hpattern, 4, '\n');
+    size_t len1_pattern = mmap_engine_scan_chunks_pattern(
+        hlen1, 4, newline_pattern, sizeof(newline_pattern));
+    CHECK(len1_ex == len1_pattern, "len=1 pattern count must match scan_chunks_ex");
+    for (size_t i = 0; i < len1_ex; i++) {
+        CChunkView va, vb;
+        CHECK(mmap_engine_get_chunk(hpattern, i, &va) == 0, "get len=1 ex chunk");
+        CHECK(mmap_engine_get_chunk(hlen1, i, &vb) == 0, "get len=1 pattern chunk");
+        CHECK(va.len == vb.len, "len=1 lengths must match");
+        CHECK(memcmp(va.data, vb.data, va.len) == 0, "len=1 contents must match");
+    }
+    mmap_engine_free(hpattern);
+    mmap_engine_free(hlen1);
+    remove("c_consumer_pattern_crlf.dat");
+
+    /* ── 16. Empty file → 0 chunks, handle valid ──────────────────── */
     TEST("empty_file");
     write_test_file("c_consumer_test_empty.dat", (const uint8_t *)"", 0);
     CEngineHandle *he = mmap_engine_open("c_consumer_test_empty.dat");
@@ -139,16 +209,16 @@ int main(void) {
     mmap_engine_free(he);
     remove("c_consumer_test_empty.dat");
 
-    /* ── 14. Free main handle ─────────────────────────────────────── */
+    /* ── 17. Free main handle ─────────────────────────────────────── */
     TEST("free");
     mmap_engine_free(h);
 
-    /* ── 15. struct layout ────────────────────────────────────────── */
+    /* ── 18. struct layout ────────────────────────────────────────── */
     TEST("struct_layout");
     CHECK(sizeof(CChunkView) >= sizeof(void *) + sizeof(size_t),
           "CChunkView must hold pointer + size");
 
-    /* ── 16. Fixed-size: exact split ──────────────────────────────── */
+    /* ── 19. Fixed-size: exact split ──────────────────────────────── */
     TEST("fixed_exact");
     const uint8_t fixed_data[] = "AAAABBBBCCCCDDDDEEEEFFFF";
     size_t fixed_len = sizeof(fixed_data) - 1;

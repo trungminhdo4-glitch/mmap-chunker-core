@@ -18,13 +18,14 @@ use crate::scanner;
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0002;
+pub const ABI_VERSION: u32 = 0x0001_0003;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
 pub const CAP_ERROR_STRINGS: u32 = 1 << 2;
 pub const CAP_FIXED_SIZE_CHUNKING: u32 = 1 << 3;
 pub const CAP_RECORD_PARTITIONING: u32 = 1 << 4;
+pub const CAP_MULTI_BYTE_DELIMITER: u32 = 1 << 5;
 
 const MAX_ERROR_LEN: usize = 256;
 
@@ -91,7 +92,7 @@ struct Engine {
 
 /// Return the ABI version as `(major << 16) | minor`.
 ///
-/// Current: `0x0001_0002` (v1.2). Always succeeds, never panics.
+/// Current: `0x0001_0003` (v1.3). Always succeeds, never panics.
 #[no_mangle]
 pub extern "C" fn mmap_engine_abi_version() -> u32 {
     ABI_VERSION
@@ -102,12 +103,13 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.2):
+/// Current bits (v1.3):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
 ///   - Bit 3: `FIXED_SIZE_CHUNKING` — `mmap_engine_scan_fixed` available
 ///   - Bit 4: `RECORD_PARTITIONING` — `mmap_engine_partition_records` available
+///   - Bit 5: `MULTI_BYTE_DELIMITER` — `mmap_engine_scan_chunks_pattern` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
     CAP_ZERO_COPY
@@ -115,6 +117,7 @@ pub extern "C" fn mmap_engine_capabilities() -> u32 {
         | CAP_ERROR_STRINGS
         | CAP_FIXED_SIZE_CHUNKING
         | CAP_RECORD_PARTITIONING
+        | CAP_MULTI_BYTE_DELIMITER
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -259,6 +262,86 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_ex(
         Ok(count) => count,
         Err(_) => {
             set_error("internal error: panic in mmap_engine_scan_chunks");
+            0
+        }
+    }
+}
+
+/// Scan the mapped file for chunk boundaries using a borrowed byte pattern.
+///
+/// Chunks are created at approximately `chunk_size_bytes` intervals. Each
+/// boundary is placed immediately after the complete `delimiter` pattern
+/// found at or after the target offset. The last chunk extends to EOF.
+///
+/// The delimiter is borrowed only for the duration of this call. The engine
+/// stores only the resulting chunk boundaries, so the caller may release or
+/// reuse the delimiter buffer after the function returns.
+///
+/// `delimiter_len` must be greater than zero. A null `delimiter` is invalid;
+/// embedded NUL bytes are allowed because the delimiter is length-delimited.
+/// The caller must ensure that `delimiter` points to at least
+/// `delimiter_len` readable bytes for the duration of this call.
+///
+/// Returns the number of chunks found, or 0 on invalid input, empty file, or
+/// internal failure. Invalid input and internal failure leave the previous
+/// valid layout unchanged. On error, call `mmap_engine_last_error()`.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by `mmap_engine_open` and must
+/// not have been freed. If `delimiter_len` is non-zero, `delimiter` must be
+/// non-null and point to `delimiter_len` readable bytes for the duration of
+/// this call. The delimiter memory must not be mutated concurrently.
+///
+/// Threading: Same contract as `mmap_engine_scan_chunks()`.
+/// Added in ABI v1.3 (detect with `MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER`).
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_scan_chunks_pattern(
+    handle: *mut CEngineHandle,
+    chunk_size_bytes: usize,
+    delimiter: *const u8,
+    delimiter_len: usize,
+) -> usize {
+    let inner = move || {
+        clear_error();
+
+        if handle.is_null() {
+            set_error("handle is null");
+            return 0;
+        }
+
+        if delimiter_len == 0 {
+            set_error("delimiter_len must be > 0");
+            return 0;
+        }
+
+        if delimiter.is_null() {
+            set_error("delimiter is null");
+            return 0;
+        }
+
+        if delimiter_len > isize::MAX as usize {
+            set_error("delimiter_len exceeds supported range");
+            return 0;
+        }
+
+        let engine = unsafe { &mut *(handle as *mut Engine) };
+        let data = unsafe { engine.mmap.as_slice() };
+
+        // SAFETY: the caller guarantees that `delimiter` points to
+        // `delimiter_len` readable, immutable bytes for this call. The
+        // slice is used only to compute boundaries and is never stored.
+        let delimiter = unsafe { std::slice::from_raw_parts(delimiter, delimiter_len) };
+        let chunks = scanner::find_chunk_boundaries_pattern(data, chunk_size_bytes, delimiter);
+        let count = chunks.len();
+        engine.layout = ChunkLayout::Delimited(chunks);
+        count
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(count) => count,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_scan_chunks_pattern");
             0
         }
     }
@@ -538,6 +621,8 @@ pub unsafe extern "C" fn mmap_engine_free(handle: *mut CEngineHandle) {
 mod tests {
     use super::*;
 
+    type PatternCase<'a> = (&'a str, &'a [u8], &'a [u8], usize, usize);
+
     #[test]
     fn test_null_handle_safety() {
         unsafe {
@@ -716,6 +801,14 @@ mod tests {
             caps & CAP_FIXED_SIZE_CHUNKING != 0,
             "must have FIXED_SIZE_CHUNKING"
         );
+        assert!(
+            caps & CAP_RECORD_PARTITIONING != 0,
+            "must have RECORD_PARTITIONING"
+        );
+        assert!(
+            caps & CAP_MULTI_BYTE_DELIMITER != 0,
+            "must have MULTI_BYTE_DELIMITER"
+        );
     }
 
     #[test]
@@ -871,6 +964,351 @@ mod tests {
             assert_eq!(view.len, 6);
 
             mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn naive_pattern_boundaries(
+        data: &[u8],
+        chunk_size: usize,
+        delimiter: &[u8],
+    ) -> Vec<(usize, usize)> {
+        assert!(!delimiter.is_empty());
+        if data.is_empty() {
+            return Vec::new();
+        }
+
+        let step = chunk_size.max(1);
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < data.len() {
+            let target = start.saturating_add(step);
+            let end = if target >= data.len() {
+                data.len()
+            } else {
+                let remainder = &data[target..];
+                if remainder.len() < delimiter.len() {
+                    data.len()
+                } else {
+                    let match_pos = (0..=remainder.len() - delimiter.len())
+                        .find(|&pos| &remainder[pos..pos + delimiter.len()] == delimiter);
+                    match_pos
+                        .map(|pos| target + pos + delimiter.len())
+                        .unwrap_or(data.len())
+                }
+            };
+            chunks.push((start, end));
+            start = end;
+        }
+        chunks
+    }
+
+    #[test]
+    fn test_scan_chunks_pattern_crlf_binary_and_len_one_equivalence() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pattern_ffi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        let data = b"a\r\nb\r\nc\r\n";
+        std::fs::write(&file_path, data).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let delimiter = vec![b'\r', b'\n'];
+            let count = mmap_engine_scan_chunks_pattern(h, 4, delimiter.as_ptr(), delimiter.len());
+            drop(delimiter);
+            assert_eq!(count, 2);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                b"a\r\nb\r\n"
+            );
+            assert_eq!(mmap_engine_get_chunk(h, 1, &mut view), 0);
+            assert_eq!(std::slice::from_raw_parts(view.data, view.len), b"c\r\n");
+            mmap_engine_free(h);
+        }
+
+        let binary_path = dir.join("binary.dat");
+        let binary_data = b"AB\x00\xff\x00CD\x00\xff\x00EF";
+        std::fs::write(&binary_path, binary_data).unwrap();
+        let binary_c_path = std::ffi::CString::new(binary_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(binary_c_path.as_ptr());
+            assert!(!h.is_null());
+            let delimiter = [0x00, 0xff, 0x00];
+            let count = mmap_engine_scan_chunks_pattern(h, 4, delimiter.as_ptr(), delimiter.len());
+            assert_eq!(count, 2);
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                &binary_data[..10]
+            );
+            mmap_engine_free(h);
+        }
+
+        let h1 = unsafe { mmap_engine_open(c_path.as_ptr()) };
+        let h2 = unsafe { mmap_engine_open(c_path.as_ptr()) };
+        assert!(!h1.is_null() && !h2.is_null());
+        unsafe {
+            let newline = [b'\n'];
+            let count_ex = mmap_engine_scan_chunks_ex(h1, 4, b'\n');
+            let count_pattern =
+                mmap_engine_scan_chunks_pattern(h2, 4, newline.as_ptr(), newline.len());
+            assert_eq!(count_ex, count_pattern);
+            let mut v1 = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let mut v2 = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            for i in 0..count_ex {
+                assert_eq!(mmap_engine_get_chunk(h1, i, &mut v1), 0);
+                assert_eq!(mmap_engine_get_chunk(h2, i, &mut v2), 0);
+                assert_eq!(v1.len, v2.len);
+                assert_eq!(
+                    std::slice::from_raw_parts(v1.data, v1.len),
+                    std::slice::from_raw_parts(v2.data, v2.len)
+                );
+            }
+            mmap_engine_free(h1);
+            mmap_engine_free(h2);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_chunks_pattern_invalid_inputs_preserve_layout() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pattern_invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        std::fs::write(&file_path, b"aaa\nbbb\n").unwrap();
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+            let previous_count = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+            assert_eq!(previous_count, 1);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            let previous_len = view.len;
+
+            assert_eq!(
+                mmap_engine_scan_chunks_pattern(h, 4, std::ptr::null(), 0),
+                0
+            );
+            assert!(
+                !mmap_engine_last_error().is_null(),
+                "zero-length delimiter must set an error"
+            );
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, previous_len);
+
+            assert_eq!(
+                mmap_engine_scan_chunks_pattern(h, 4, std::ptr::null(), 2),
+                0
+            );
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, previous_len);
+
+            let non_null = [b'\n'];
+            assert_eq!(
+                mmap_engine_scan_chunks_pattern(h, 4, non_null.as_ptr(), 0),
+                0
+            );
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, previous_len);
+
+            assert_eq!(
+                mmap_engine_scan_chunks_pattern(
+                    h,
+                    4,
+                    std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                    isize::MAX as usize + 1,
+                ),
+                0
+            );
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, previous_len);
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_chunks_pattern_edge_matrix_and_page_boundary() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pattern_edges");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases: &[PatternCase<'_>] = &[
+            ("short", &b"hi"[..], &b"\r\n\r\n"[..], 1024, 1),
+            ("exact", &b"AB"[..], &b"AB"[..], 1, 1),
+            ("begin", &b"||tail"[..], &b"||"[..], 1, 1),
+            ("eof", &b"tail||"[..], &b"||"[..], 1, 1),
+            ("missing", &b"no marker"[..], &b"||"[..], 4, 1),
+            ("consecutive", &b"||||"[..], &b"||"[..], 1, 2),
+            ("aba", &b"xABABAy"[..], &b"ABA"[..], 1, 2),
+            ("aaaa", &b"AAAAAA"[..], &b"AAAA"[..], 1, 2),
+        ];
+
+        for &(name, data, delimiter, chunk_size, expected_count) in cases {
+            let file_path = dir.join(format!("{name}.dat"));
+            std::fs::write(&file_path, data).unwrap();
+            let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+            unsafe {
+                let h = mmap_engine_open(c_path.as_ptr());
+                assert!(!h.is_null(), "open failed for {name}");
+                let count = mmap_engine_scan_chunks_pattern(
+                    h,
+                    chunk_size,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                );
+                assert_eq!(count, expected_count, "wrong count for {name}");
+                mmap_engine_free(h);
+            }
+        }
+
+        let mut page_data = vec![b'x'; 4095];
+        page_data.extend_from_slice(b"XYZtail");
+        let page_path = dir.join("page_boundary.dat");
+        std::fs::write(&page_path, &page_data).unwrap();
+        let page_c_path = std::ffi::CString::new(page_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(page_c_path.as_ptr());
+            assert!(!h.is_null());
+            let delimiter = b"XYZ";
+            let count =
+                mmap_engine_scan_chunks_pattern(h, 4090, delimiter.as_ptr(), delimiter.len());
+            assert_eq!(count, 2);
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(view.len, 4098, "pattern crossing page boundary not found");
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_chunks_pattern_mode_switching() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pattern_modes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.dat");
+        let data = b"aa\r\nbb\r\ncc\r\ndd\r\n";
+        std::fs::write(&file_path, data).unwrap();
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+            let pattern = b"\r\n";
+            assert!(mmap_engine_scan_chunks_pattern(h, 4, pattern.as_ptr(), pattern.len()) > 0);
+            assert!(mmap_engine_scan_chunks_ex(h, 4, b'\n') > 0);
+            assert!(mmap_engine_scan_fixed(h, 4) > 0);
+            assert!(mmap_engine_partition_records(h, 2, b'\n') > 0);
+            assert!(mmap_engine_scan_chunks_pattern(h, 4, pattern.as_ptr(), pattern.len()) > 0);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                b"aa\r\nbb\r\n"
+            );
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_chunks_pattern_differential_randomized() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pattern_random");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = 0x5eed_u64;
+
+        for case in 0..256usize {
+            let next = |state: &mut u64| {
+                *state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (*state >> 32) as u8
+            };
+            let data_len = (next(&mut state) as usize) % 192;
+            let mut data = vec![0u8; data_len];
+            for byte in &mut data {
+                *byte = next(&mut state);
+            }
+            let delimiter_len = 1 + (next(&mut state) as usize % 8);
+            let mut delimiter = vec![0u8; delimiter_len];
+            for byte in &mut delimiter {
+                *byte = next(&mut state);
+            }
+            let chunk_size = next(&mut state) as usize % 32;
+            let expected = naive_pattern_boundaries(&data, chunk_size, &delimiter);
+            let rust = scanner::find_chunk_boundaries_pattern(&data, chunk_size, &delimiter);
+            assert_eq!(rust, expected, "Rust oracle mismatch in case {case}");
+
+            let file_path = dir.join(format!("case_{case}.dat"));
+            std::fs::write(&file_path, &data).unwrap();
+            let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+            unsafe {
+                let h = mmap_engine_open(c_path.as_ptr());
+                assert!(!h.is_null(), "open failed in case {case}");
+                let count = mmap_engine_scan_chunks_pattern(
+                    h,
+                    chunk_size,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                );
+                assert_eq!(count, expected.len(), "count mismatch in case {case}");
+                let mut view = CChunkView {
+                    data: std::ptr::null(),
+                    len: 0,
+                };
+                for (index, &(start, end)) in expected.iter().enumerate() {
+                    assert_eq!(mmap_engine_get_chunk(h, index, &mut view), 0);
+                    assert_eq!(view.len, end - start, "length mismatch in case {case}");
+                    assert_eq!(
+                        std::slice::from_raw_parts(view.data, view.len),
+                        &data[start..end],
+                        "content mismatch in case {case}"
+                    );
+                }
+                mmap_engine_free(h);
+            }
         }
 
         let _ = std::fs::remove_dir_all(&dir);

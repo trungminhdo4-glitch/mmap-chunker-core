@@ -4,6 +4,10 @@
 
 ### Added
 
+- C ABI multi-byte delimiter scanning via `mmap_engine_scan_chunks_pattern`.
+  The delimiter is a borrowed pointer-plus-length byte range, is validated
+  before scanning, and is not retained by the engine. Added ABI v1.3 and
+  `CAP_MULTI_BYTE_DELIMITER` (bit 5).
 - Safe Rust API (`MmapChunker`) with `Path`/`OsStr` support wrapping `MmapFile`
   with a chunk-layout state machine (`Empty`, `Delimited`, `Fixed`, `Partitioned`)
 - Lazy streaming `ChunkCursor` — O(1) memory (~40 bytes on 64-bit) delimiter-aware

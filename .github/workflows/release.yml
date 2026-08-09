@@ -285,7 +285,7 @@ jobs:
           lib = ctypes.CDLL(path)
           lib.mmap_engine_abi_version.restype = ctypes.c_uint32
           lib.mmap_engine_capabilities.restype = ctypes.c_uint32
-          assert lib.mmap_engine_abi_version() == 0x00010002
+          assert lib.mmap_engine_abi_version() == 0x00010003
           assert lib.mmap_engine_capabilities() & 0x1
           print("PASS: ctypes loaded extracted dynamic library")
           PY

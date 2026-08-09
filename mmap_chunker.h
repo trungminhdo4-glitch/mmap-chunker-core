@@ -21,7 +21,7 @@ typedef struct {
 
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010002U
+#define MMAP_ENGINE_ABI_VERSION 0x00010003U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
@@ -30,13 +30,14 @@ typedef struct {
 #define MMAP_ENGINE_CAP_ERROR_STRINGS          (1U << 2)
 #define MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING    (1U << 3)
 #define MMAP_ENGINE_CAP_RECORD_PARTITIONING    (1U << 4)
+#define MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER   (1U << 5)
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010002 (v1.2). Always succeeds, never panics.
+ * Current: 0x00010003 (v1.3). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -49,6 +50,7 @@ uint32_t mmap_engine_abi_version(void);
  * Bit 2: ERROR_STRINGS          — mmap_engine_last_error() returns diagnostic text
  * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
  * Bit 4: RECORD_PARTITIONING    — mmap_engine_partition_records() available
+ * Bit 5: MULTI_BYTE_DELIMITER   — mmap_engine_scan_chunks_pattern() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -139,6 +141,39 @@ size_t mmap_engine_scan_chunks(CEngineHandle *handle, size_t chunk_size_bytes);
 size_t mmap_engine_scan_chunks_ex(CEngineHandle *handle,
                                   size_t chunk_size_bytes,
                                   uint8_t delimiter);
+
+/**
+ * Scan the mapped file for chunk boundaries using a byte pattern delimiter.
+ *
+ * Each boundary is placed immediately after the complete `delimiter` pattern
+ * found at or after the target offset. The last chunk extends to EOF. A
+ * length-delimited byte pattern is used, so embedded NUL bytes are allowed.
+ *
+ * The delimiter memory is borrowed only for this call and is not retained by
+ * the engine. The caller may release or reuse it after the function returns.
+ * The caller must keep `delimiter` readable for `delimiter_len` bytes during
+ * the call; the pointer must be non-NULL and `delimiter_len` must be > 0.
+ *
+ * Invalid delimiter arguments return 0, set mmap_engine_last_error(), and do
+ * not replace the previous valid layout. A delimiter longer than the file is
+ * valid and produces one chunk for a non-empty file. `chunk_size_bytes` of 0
+ * is silently clamped to 1, like the other scan functions.
+ *
+ * @param handle            Valid handle from mmap_engine_open().
+ * @param chunk_size_bytes  Approximate chunk size in bytes.
+ * @param delimiter         Pointer to delimiter bytes (not NUL-terminated).
+ * @param delimiter_len     Number of delimiter bytes; must be > 0.
+ * @return                  Number of chunks found, or 0 on error / empty file.
+ *                          On error, call mmap_engine_last_error().
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.3 (detect with MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER).
+ */
+size_t mmap_engine_scan_chunks_pattern(CEngineHandle *handle,
+                                       size_t chunk_size_bytes,
+                                       const uint8_t *delimiter,
+                                       size_t delimiter_len);
 
 /**
  * Scan the mapped file into sequential fixed-size chunks.
@@ -290,6 +325,7 @@ void mmap_engine_free(CEngineHandle *handle);
  *   v1.0 (0x00010000): Initial release — 8 core functions.
  *   v1.1 (0x00010001): Added mmap_engine_scan_fixed() + CAP_FIXED_SIZE_CHUNKING.
  *   v1.2 (0x00010002): Added mmap_engine_partition_records() + CAP_RECORD_PARTITIONING.
+ *   v1.3 (0x00010003): Added mmap_engine_scan_chunks_pattern() + CAP_MULTI_BYTE_DELIMITER.
  *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *
