@@ -95,12 +95,13 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Install cross CLI
+        if: ${{ matrix.cross }}
+        run: cargo install cross --version 0.2.5 --locked
+
       - name: Build (cross, aarch64-linux)
         if: ${{ matrix.cross }}
-        uses: cross-rs/cross@f8151ae777290430cf2108efacf3976d9528500b # v0.2.5
-        with:
-          command: build
-          args: --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package, verify, and consume archive
         shell: bash
