@@ -1063,7 +1063,7 @@ mod tests {
         let h2 = unsafe { mmap_engine_open(c_path.as_ptr()) };
         assert!(!h1.is_null() && !h2.is_null());
         unsafe {
-            let newline = [b'\n'];
+            let newline = *b"\n";
             let count_ex = mmap_engine_scan_chunks_ex(h1, 4, b'\n');
             let count_pattern =
                 mmap_engine_scan_chunks_pattern(h2, 4, newline.as_ptr(), newline.len());
@@ -1132,7 +1132,7 @@ mod tests {
             assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
             assert_eq!(view.len, previous_len);
 
-            let non_null = [b'\n'];
+            let non_null = *b"\n";
             assert_eq!(
                 mmap_engine_scan_chunks_pattern(h, 4, non_null.as_ptr(), 0),
                 0
