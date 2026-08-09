@@ -16,3 +16,6 @@ name = "mmap_chunker_core"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]
+
+[dev-dependencies]
+memchr = "2"

@@ -19,6 +19,7 @@ Benchmarks:
 ```sh
 cargo test --test benchmark -- --ignored --nocapture           # I/O mmap vs fs::read
 cargo test --release scanner::tests::bench_cursor_vs_eager -- --ignored --nocapture  # Cursor TFC
+cargo test --release --test competitive_bench -- --ignored --nocapture  # Full competitive suite (Lanes A-F)
 ```
 
 Python tests (requires release build first):
@@ -39,8 +40,9 @@ src/
   ffi.rs      — C ABI: 10 public functions, ChunkLayout enum, panic containment
 
 tests/
-  c_abi_test.rs   — Integration test: C ABI via extern "C" (Rust calling Rust)
-  benchmark.rs    — Performance: mmap vs fs::read
+  c_abi_test.rs        — Integration test: C ABI via extern "C" (Rust calling Rust)
+  benchmark.rs         — Performance: mmap vs fs::read
+  competitive_bench.rs — Competitive: SWAR vs memchr, pattern search, chunking, partitions (Lanes A-F)
 
 native_io/        — Python ctypes consumer (standalone, no harness dependency)
 mmap_chunker.h    — Public C header with full API docs
@@ -73,6 +75,7 @@ mmap_chunker.h    — Public C header with full API docs
 
 ## Gotchas
 
+- **`memchr` is dev-only** (in `[dev-dependencies]`) — used only in `tests/competitive_bench.rs` for baseline comparison. Zero runtime dependencies maintained.
 - Windows GNU toolchain (`x86_64-pc-windows-gnu`) by default — MSVC also installed
 - Redundant `unsafe` blocks inside outer `unsafe` blocks trigger clippy `unused_unsafe`
 - `extern "C" fn` that are inherently safe (no pointer access) should NOT be `unsafe`
