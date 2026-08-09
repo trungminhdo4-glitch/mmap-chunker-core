@@ -219,13 +219,13 @@ jobs:
             Windows)
               if command -v dumpbin.exe >/dev/null 2>&1; then
                 dumpbin.exe /exports "$DYNAMIC" \
-                  | awk '$NF ~ /^mmap_engine_/ {print $NF}' | sort > "$VERIFY_ROOT/actual.symbols"
+                  | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
               elif command -v llvm-nm.exe >/dev/null 2>&1; then
                 llvm-nm.exe --defined-only "$DYNAMIC" \
-                  | awk '$3 ~ /^mmap_engine_/ {print $3}' | sort > "$VERIFY_ROOT/actual.symbols"
+                  | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
               elif command -v llvm-nm >/dev/null 2>&1; then
                 llvm-nm --defined-only "$DYNAMIC" \
-                  | awk '$3 ~ /^mmap_engine_/ {print $3}' | sort > "$VERIFY_ROOT/actual.symbols"
+                  | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > "$VERIFY_ROOT/actual.symbols"
               else
                 echo "ERROR: no PE export inspection tool (dumpbin.exe or llvm-nm.exe)"
                 exit 1
