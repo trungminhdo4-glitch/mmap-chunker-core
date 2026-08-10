@@ -42,7 +42,19 @@ fn elapsed_per_iter(iters: u64, mut f: impl FnMut()) -> f64 {
     start.elapsed().as_nanos() as f64 / iters as f64
 }
 
-fn bench_print(label: &str, ns: &[f64], total_bytes: f64) {
+fn throughput_bytes_per_second(bytes_processed: f64, elapsed_seconds: f64) -> f64 {
+    if bytes_processed <= 0.0 || elapsed_seconds <= 0.0 {
+        0.0
+    } else {
+        bytes_processed / elapsed_seconds
+    }
+}
+
+fn throughput_gib_per_second(bytes_per_iter: f64, ns_per_iter: f64) -> f64 {
+    throughput_bytes_per_second(bytes_per_iter, ns_per_iter * 1e-9) / (1 << 30) as f64
+}
+
+fn bench_print(label: &str, ns: &[f64], bytes_per_iter: f64) {
     let p50 = median(ns.to_vec());
     println!(
         "  {:45} p50={:>10.1}ns  p10={:>10.1}  p90={:>10.1}  {:>8.2} GiB/s",
@@ -50,8 +62,25 @@ fn bench_print(label: &str, ns: &[f64], total_bytes: f64) {
         p50,
         percentile(ns, 0.10),
         percentile(ns, 0.90),
-        total_bytes / p50 * 1e9 / (1 << 30) as f64,
+        throughput_gib_per_second(bytes_per_iter, p50),
     );
+}
+
+#[test]
+fn throughput_contract_does_not_double_normalize_iterations() {
+    let bytes_per_iter = 1_048_576.0;
+    let elapsed_per_iter_seconds = 0.002;
+    let iters = 17.0;
+
+    let per_iter = throughput_bytes_per_second(bytes_per_iter, elapsed_per_iter_seconds);
+    let batched =
+        throughput_bytes_per_second(bytes_per_iter * iters, elapsed_per_iter_seconds * iters);
+    let old_double_normalized =
+        throughput_bytes_per_second(bytes_per_iter * iters, elapsed_per_iter_seconds);
+
+    assert!((per_iter - 524_288_000.0).abs() < 0.1);
+    assert!((batched - per_iter).abs() < 0.1);
+    assert!((old_double_normalized - per_iter * iters).abs() < 0.1);
 }
 
 // ─── Test data generators ──────────────────────────────────────────────────
@@ -236,7 +265,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("our SWAR   dense", &ns, size as f64 * iters as f64);
+            bench_print("our SWAR   dense", &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -249,7 +278,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("memchr     dense", &ns, size as f64 * iters as f64);
+            bench_print("memchr     dense", &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -262,7 +291,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("scalar     dense", &ns, size as f64 * iters as f64);
+            bench_print("scalar     dense", &ns, size as f64);
         }
 
         // No-delimiter data: one large SWAR call (worst-case for search)
@@ -290,7 +319,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("our SWAR   absent", &ns, size as f64 * iters as f64);
+            bench_print("our SWAR   absent", &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -302,7 +331,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("memchr     absent", &ns, size as f64 * iters as f64);
+            bench_print("memchr     absent", &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -314,7 +343,7 @@ fn bench_lane_a_single_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("scalar     absent", &ns, size as f64 * iters as f64);
+            bench_print("scalar     absent", &ns, size as f64);
         }
     }
 }
@@ -425,7 +454,7 @@ fn bench_lane_b_multi_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("our pattern", &ns, size as f64 * iters as f64);
+            bench_print("our pattern", &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -437,7 +466,7 @@ fn bench_lane_b_multi_byte() {
                     black_box(result);
                 }));
             }
-            bench_print("memmem finder", &ns, size as f64 * iters as f64);
+            bench_print("memmem finder", &ns, size as f64);
         }
     }
 
@@ -473,11 +502,7 @@ fn bench_lane_b_multi_byte() {
                     black_box(result);
                 }));
             }
-            bench_print(
-                &format!("our adv    {label}"),
-                &ns,
-                size as f64 * iters as f64,
-            );
+            bench_print(&format!("our adv    {label}"), &ns, size as f64);
         }
         {
             let mut ns = Vec::with_capacity(sample_count);
@@ -492,11 +517,7 @@ fn bench_lane_b_multi_byte() {
                     black_box(result);
                 }));
             }
-            bench_print(
-                &format!("memmem adv {label}"),
-                &ns,
-                size as f64 * iters as f64,
-            );
+            bench_print(&format!("memmem adv {label}"), &ns, size as f64);
         }
     }
 }
@@ -609,9 +630,8 @@ fn bench_lane_c_chunking() {
             }));
         }
 
-        let total_bytes = size as f64 * *iters as f64;
         for (i, ns) in all_ns.iter().enumerate() {
-            bench_print(labels[i], ns, total_bytes);
+            bench_print(labels[i], ns, size as f64);
         }
         println!(
             "  metadata: {} bytes ({} chunks x 16B)",
