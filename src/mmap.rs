@@ -21,7 +21,7 @@ mod sys {
     pub const SEEK_END: c_int = 2;
 
     extern "C" {
-        pub fn open(pathname: *const c_char, flags: c_int, mode: c_int) -> c_int;
+        pub fn open(pathname: *const c_char, flags: c_int, ...) -> c_int;
         pub fn close(fd: c_int) -> c_int;
         pub fn mmap(
             addr: *mut c_void,
@@ -136,7 +136,8 @@ impl MmapFile {
     unsafe fn open_unix(path: &CStr) -> Option<Self> {
         // SAFETY: `path.as_ptr()` is a valid null-terminated string;
         // `open()` is a POSIX syscall that only reads from the path.
-        let fd = sys::open(path.as_ptr(), sys::O_RDONLY, 0);
+        // O_RDONLY does not require the variadic mode argument.
+        let fd = sys::open(path.as_ptr(), sys::O_RDONLY);
         if fd < 0 {
             return None;
         }
