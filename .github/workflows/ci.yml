@@ -44,8 +44,8 @@ jobs:
 
       - name: Build and run C consumer
         run: |
-          cc -o c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread -ldl
-          ./c_consumer
+          cc -o /tmp/mmap_chunker_c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread -ldl
+          /tmp/mmap_chunker_c_consumer
 
       - name: Verify ABI v1 symbols (Linux cdylib)
         run: |
