@@ -5,8 +5,9 @@ use mmap_chunker_core::scanner::{fixed_chunk_bounds, fixed_chunk_count};
 
 fn read_usize(input: &[u8], offset: usize) -> usize {
     let mut word = [0u8; 8];
-    let available = input.len().saturating_sub(offset).min(word.len());
-    word[..available].copy_from_slice(&input[offset..offset + available]);
+    let tail = input.get(offset..).unwrap_or(&[]);
+    let available = tail.len().min(word.len());
+    word[..available].copy_from_slice(&tail[..available]);
     u64::from_le_bytes(word) as usize
 }
 
