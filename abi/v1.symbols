@@ -1,9 +1,9 @@
 # ABI v1.x — required exported symbols
 # ===================================
 # Additive-only policy:
-#   - Required symbols must always be present.
-#   - Missing or renamed symbol → CI FAIL.
-#   - Additional symbols → PASS (additive is allowed).
+#   - This manifest is the exact public mmap_engine_* export set for v1.x.
+#   - Missing, renamed, or additional mmap_engine_* symbols → CI FAIL.
+#   - Additive ABI changes must update this manifest deliberately.
 # Covers v1.0 through v1.x.
 
 mmap_engine_abi_version

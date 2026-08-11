@@ -49,20 +49,40 @@ jobs:
 
       - name: Verify ABI v1 symbols (Linux cdylib)
         run: |
-          nm -D target/release/libmmap_chunker_core.so | grep -oP 'T \Kmmap_engine_\w+' | sort > /tmp/actual.symbols
-          grep '^mmap_engine_' abi/v1.symbols | sort > /tmp/expected.symbols
+          nm -D --defined-only target/release/libmmap_chunker_core.so \
+            | awk '$3 ~ /^mmap_engine_/ {print $3}' \
+            | sort > /tmp/actual.symbols
+          grep -vE '^[[:space:]]*(#|$)' abi/v1.symbols | sort > /tmp/expected.symbols
           echo "=== ABI v1 symbol check ==="
-          echo "Required:"
+          echo "Expected:"
           cat /tmp/expected.symbols
           echo "Exported:"
           cat /tmp/actual.symbols
-          for sym in $(grep '^mmap_engine_' abi/v1.symbols); do
-            if ! grep -qFx "$sym" /tmp/actual.symbols; then
-              echo "FAIL: required symbol '$sym' not exported"
+          diff -u /tmp/expected.symbols /tmp/actual.symbols
+          echo "PASS: exported mmap_engine_* symbols exactly match abi/v1.symbols"
+
+      - name: Verify Cargo package contract
+        run: |
+          set -euo pipefail
+          cargo package
+          package=$(find target/package -maxdepth 1 -name '*.crate' -print -quit)
+          test -n "$package"
+          tar tf "$package" | sed 's|^[^/]*/||' | sort > /tmp/package.files
+          echo "=== Cargo package contents ==="
+          cat /tmp/package.files
+
+          for path in Cargo.toml README.md LICENSE-MIT LICENSE-APACHE mmap_chunker.h abi/v1.symbols examples/c_consumer.c src/lib.rs; do
+            if ! grep -qFx "$path" /tmp/package.files; then
+              echo "FAIL: required package file '$path' is missing"
               exit 1
             fi
           done
-          echo "PASS: all required v1 symbols present"
+
+          if grep -nE '(^|/)(\.env[^/]*|\.agents|\.codex|AGENTS\.md|AGENT_LOG\.md|native_io|target|\.vscode|\.idea|__pycache__)(/|$)|(^|/)[^/]*\.(pyc|pyo|db|sqlite|sqlite3)$|(^|/)fuzz/(artifacts|target|crashers|work|tmp)(/|$)' /tmp/package.files; then
+            echo "FAIL: private, local, or generated file found in Cargo package"
+            exit 1
+          fi
+          echo "PASS: Cargo package contains required distribution files and no forbidden local artifacts"
 
   windows:
     runs-on: windows-latest
