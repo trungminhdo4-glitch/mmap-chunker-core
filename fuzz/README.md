@@ -17,5 +17,7 @@ cargo +nightly fuzz run --sanitizer none fixed_extremes -- -max_len=32 -max_tota
 `scanner_differential` caps source data at 4 KiB, patterns at 32 bytes, and
 requested partitions at 64. `fixed_extremes` uses an independent `u128` oracle
 and includes fixed extreme-value classes in addition to raw 64-bit inputs.
-The targets use coverage instrumentation but no sanitizer because the existing
-Unix `open` FFI binding is incompatible with ASan's runtime-symbol check.
+The current CI smoke lane uses coverage instrumentation without a sanitizer.
+The POSIX `open` ABI was corrected after this lane was introduced; ASan
+compatibility should be re-checked on a supported Linux host before enabling it
+in CI.
