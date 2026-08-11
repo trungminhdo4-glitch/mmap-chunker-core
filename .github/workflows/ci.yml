@@ -24,9 +24,9 @@ jobs:
     env:
       ASAN_TOOLCHAIN: nightly-2026-08-10
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-      CARGO_TARGET_DIR: target/asan
+      ASAN_RUST_TARGET_DIR: target/asan-rust
+      ASAN_MIXED_TARGET_DIR: target/asan-mixed
       CC: clang
-      RUSTFLAGS: "-Zsanitizer=address -Zexternal-clangrt"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -44,24 +44,25 @@ jobs:
           trap 'rm -rf "$control_dir"' EXIT
           mkdir "$control_dir/src"
           printf '%s\n' '[package]' 'name = "asan-negative-control"' 'version = "0.0.0"' 'edition = "2021"' > "$control_dir/Cargo.toml"
-          printf '%s\n' 'fn main() {' '    let bytes = [0_u8; 1];' '    unsafe { std::ptr::read_volatile(bytes.as_ptr().add(1)); }' '}' > "$control_dir/src/main.rs"
+          printf '%s\n' 'fn main() {' '    let xs = [0, 1, 2, 3];' '    let _y = unsafe { *xs.as_ptr().offset(4) };' '}' > "$control_dir/src/main.rs"
           set +e
-          cargo +"$ASAN_TOOLCHAIN" run --manifest-path "$control_dir/Cargo.toml" -Zbuild-std --target x86_64-unknown-linux-gnu > "$control_dir/output" 2>&1
+          RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR="$ASAN_RUST_TARGET_DIR" cargo +"$ASAN_TOOLCHAIN" run --manifest-path "$control_dir/Cargo.toml" -Zbuild-std --target x86_64-unknown-linux-gnu > "$control_dir/output" 2>&1
           status=$?
           set -e
+          cat "$control_dir/output"
           test "$status" -ne 0
           grep -F 'ERROR: AddressSanitizer' "$control_dir/output"
 
       - name: Run focused mmap and FFI tests under ASan
         run: |
-          cargo +${{ env.ASAN_TOOLCHAIN }} test --lib mmap::tests -Zbuild-std --target x86_64-unknown-linux-gnu
-          cargo +${{ env.ASAN_TOOLCHAIN }} test --lib ffi::tests -Zbuild-std --target x86_64-unknown-linux-gnu
-          cargo +${{ env.ASAN_TOOLCHAIN }} test --test c_abi_test -Zbuild-std --target x86_64-unknown-linux-gnu
+          RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR="${{ env.ASAN_RUST_TARGET_DIR }}" cargo +${{ env.ASAN_TOOLCHAIN }} test --lib mmap::tests -Zbuild-std --target x86_64-unknown-linux-gnu
+          RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR="${{ env.ASAN_RUST_TARGET_DIR }}" cargo +${{ env.ASAN_TOOLCHAIN }} test --lib ffi::tests -Zbuild-std --target x86_64-unknown-linux-gnu
+          RUSTFLAGS="-Zsanitizer=address" CARGO_TARGET_DIR="${{ env.ASAN_RUST_TARGET_DIR }}" cargo +${{ env.ASAN_TOOLCHAIN }} test --test c_abi_test -Zbuild-std --target x86_64-unknown-linux-gnu
 
       - name: Run native C consumer against ASan Rust staticlib
         run: |
-          cargo +${{ env.ASAN_TOOLCHAIN }} build --release -Zbuild-std --target x86_64-unknown-linux-gnu
-          clang -fsanitize=address -fno-omit-frame-pointer -o /tmp/mmap_chunker_asan_c_consumer examples/c_consumer.c target/asan/x86_64-unknown-linux-gnu/release/libmmap_chunker_core.a -lpthread -ldl
+          RUSTFLAGS="-Zsanitizer=address -Zexternal-clangrt" CARGO_TARGET_DIR="${{ env.ASAN_MIXED_TARGET_DIR }}" cargo +${{ env.ASAN_TOOLCHAIN }} build --release -Zbuild-std --target x86_64-unknown-linux-gnu
+          clang -fsanitize=address -fno-omit-frame-pointer -o /tmp/mmap_chunker_asan_c_consumer examples/c_consumer.c target/asan-mixed/x86_64-unknown-linux-gnu/release/libmmap_chunker_core.a -lpthread -ldl
           /tmp/mmap_chunker_asan_c_consumer
 
   ubuntu:
