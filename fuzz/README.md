@@ -10,10 +10,12 @@ and build outputs are ignored.
 Run on a supported Nightly/libFuzzer host:
 
 ```sh
-cargo +nightly fuzz run scanner_differential -- -max_len=4352 -max_total_time=90 -timeout=5 -rss_limit_mb=1024
-cargo +nightly fuzz run fixed_extremes -- -max_len=32 -max_total_time=90 -timeout=5 -rss_limit_mb=1024
+cargo +nightly fuzz run --sanitizer none scanner_differential -- -max_len=4352 -max_total_time=90 -timeout=5 -rss_limit_mb=1024
+cargo +nightly fuzz run --sanitizer none fixed_extremes -- -max_len=32 -max_total_time=90 -timeout=5 -rss_limit_mb=1024
 ```
 
 `scanner_differential` caps source data at 4 KiB, patterns at 32 bytes, and
 requested partitions at 64. `fixed_extremes` uses an independent `u128` oracle
 and includes fixed extreme-value classes in addition to raw 64-bit inputs.
+The targets use coverage instrumentation but no sanitizer because the existing
+Unix `open` FFI binding is incompatible with ASan's runtime-symbol check.

@@ -44,12 +44,12 @@ jobs:
 
       - name: Build target
         working-directory: fuzz
-        run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build ${{ matrix.target }}
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build --sanitizer none ${{ matrix.target }}
 
       - name: Run bounded target
         working-directory: fuzz
         run: >-
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run ${{ matrix.target }} --
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run --sanitizer none ${{ matrix.target }} --
           -max_len=${{ matrix.target == 'scanner_differential' && '4352' || '32' }}
           -max_total_time=${{ env.FUZZ_TIME }} -timeout=5 -rss_limit_mb=1024
 
