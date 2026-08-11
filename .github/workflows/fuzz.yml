@@ -1,0 +1,62 @@
+name: Bounded Fuzz Smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "src/scanner.rs"
+      - "src/plan.rs"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_FUZZ_VERSION: "0.13.2"
+  FUZZ_TOOLCHAIN: nightly-2026-08-10
+  FUZZ_TIME: "90"
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [scanner_differential, fixed_extremes]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pinned Nightly
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version ${{ env.CARGO_FUZZ_VERSION }} --locked
+
+      - name: Build target
+        working-directory: fuzz
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build --sanitizer none ${{ matrix.target }}
+
+      - name: Run bounded target
+        working-directory: fuzz
+        run: >-
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run --sanitizer none ${{ matrix.target }} --
+          -max_len=${{ matrix.target == 'scanner_differential' && '4352' || '32' }}
+          -max_total_time=${{ env.FUZZ_TIME }} -timeout=5 -rss_limit_mb=1024
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

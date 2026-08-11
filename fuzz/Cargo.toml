@@ -1,0 +1,29 @@
+[package]
+name = "mmap-chunker-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mmap-chunker-core = { path = ".." }
+
+[[bin]]
+name = "scanner_differential"
+path = "fuzz_targets/scanner_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fixed_extremes"
+path = "fuzz_targets/fixed_extremes.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
