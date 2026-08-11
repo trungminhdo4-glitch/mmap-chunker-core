@@ -42,6 +42,9 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
+      - name: Python C-ABI semantic parity
+        run: python3 tests/python_parity.py
+
       - name: Build and run C consumer
         run: |
           cc -o /tmp/mmap_chunker_c_consumer examples/c_consumer.c target/release/libmmap_chunker_core.a -lpthread -ldl
