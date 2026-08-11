@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr};
 
 use crate::mmap::MmapFile;
+use crate::plan::ChunkPlan;
 use crate::scanner;
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
@@ -73,19 +74,9 @@ pub struct CEngineHandle {
 
 // ─── Internal engine state ────────────────────────────────────────────────────
 
-enum ChunkLayout {
-    Empty,
-    Delimited(Vec<(usize, usize)>),
-    Fixed {
-        chunk_size: usize,
-        chunk_count: usize,
-    },
-    Partitioned(Vec<(usize, usize)>),
-}
-
 struct Engine {
     mmap: MmapFile,
-    layout: ChunkLayout,
+    plan: ChunkPlan,
 }
 
 // ─── ABI discovery ────────────────────────────────────────────────────────────
@@ -172,7 +163,7 @@ pub unsafe extern "C" fn mmap_engine_open(path: *const c_char) -> *mut CEngineHa
                 mmap.advise_sequential();
                 let engine = Box::new(Engine {
                     mmap,
-                    layout: ChunkLayout::Empty,
+                    plan: ChunkPlan::empty(),
                 });
                 Box::into_raw(engine) as *mut CEngineHandle
             }
@@ -248,14 +239,13 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_ex(
 
         let data = unsafe { engine.mmap.as_slice() };
         if data.is_empty() {
-            engine.layout = ChunkLayout::Empty;
+            engine.plan = ChunkPlan::empty();
             return 0;
         }
 
         let chunks = scanner::find_chunk_boundaries(data, chunk_size_bytes, delimiter);
-        let count = chunks.len();
-        engine.layout = ChunkLayout::Delimited(chunks);
-        count
+        engine.plan = ChunkPlan::from_ranges(chunks);
+        engine.plan.len()
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
@@ -333,9 +323,8 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_pattern(
         // slice is used only to compute boundaries and is never stored.
         let delimiter = unsafe { std::slice::from_raw_parts(delimiter, delimiter_len) };
         let chunks = scanner::find_chunk_boundaries_pattern(data, chunk_size_bytes, delimiter);
-        let count = chunks.len();
-        engine.layout = ChunkLayout::Delimited(chunks);
-        count
+        engine.plan = ChunkPlan::from_ranges(chunks);
+        engine.plan.len()
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
@@ -383,19 +372,8 @@ pub unsafe extern "C" fn mmap_engine_scan_fixed(
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
 
-        let file_len = engine.mmap.len();
-        if file_len == 0 {
-            engine.layout = ChunkLayout::Empty;
-            return 0;
-        }
-
-        let effective_size = chunk_size_bytes.max(1);
-        let count = file_len.div_ceil(effective_size);
-        engine.layout = ChunkLayout::Fixed {
-            chunk_size: effective_size,
-            chunk_count: count,
-        };
-        count
+        engine.plan = ChunkPlan::fixed(engine.mmap.len(), chunk_size_bytes);
+        engine.plan.len()
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
@@ -481,7 +459,7 @@ pub unsafe extern "C" fn mmap_engine_partition_records(
 
         let file_len = engine.mmap.len();
         if file_len == 0 {
-            engine.layout = ChunkLayout::Empty;
+            engine.plan = ChunkPlan::empty();
             return 0;
         }
 
@@ -493,9 +471,8 @@ pub unsafe extern "C" fn mmap_engine_partition_records(
         let data = unsafe { engine.mmap.as_slice() };
         let partitions = scanner::find_partition_boundaries(data, requested_partitions, delimiter);
 
-        let count = partitions.len();
-        engine.layout = ChunkLayout::Partitioned(partitions);
-        count
+        engine.plan = ChunkPlan::from_ranges(partitions);
+        engine.plan.len()
     };
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
@@ -543,33 +520,16 @@ pub unsafe extern "C" fn mmap_engine_get_chunk(
 
         let engine = unsafe { &*(handle as *mut Engine) };
 
-        let (start, end) = match &engine.layout {
-            ChunkLayout::Empty => {
-                set_error("chunk index out of bounds");
+        if index >= engine.plan.len() {
+            set_error("chunk index out of bounds");
+            return -1;
+        }
+
+        let (start, end) = match engine.plan.range_at(index, engine.mmap.len()) {
+            Some(bounds) => bounds,
+            None => {
+                set_error("internal error: fixed chunk bounds overflow");
                 return -1;
-            }
-            ChunkLayout::Delimited(chunks) | ChunkLayout::Partitioned(chunks) => {
-                if index >= chunks.len() {
-                    set_error("chunk index out of bounds");
-                    return -1;
-                }
-                chunks[index]
-            }
-            ChunkLayout::Fixed {
-                chunk_size,
-                chunk_count,
-            } => {
-                if index >= *chunk_count {
-                    set_error("chunk index out of bounds");
-                    return -1;
-                }
-                match scanner::fixed_chunk_bounds(engine.mmap.len(), *chunk_size, index) {
-                    Some(bounds) => bounds,
-                    None => {
-                        set_error("internal error: fixed chunk bounds overflow");
-                        return -1;
-                    }
-                }
             }
         };
 

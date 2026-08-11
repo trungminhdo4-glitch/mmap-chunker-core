@@ -2,6 +2,8 @@ pub mod ffi;
 pub mod mmap;
 pub mod scanner;
 
+mod plan;
+
 pub use ffi::{
     CChunkView, CEngineHandle, ABI_VERSION, CAP_CONFIGURABLE_DELIMITER, CAP_ERROR_STRINGS,
     CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER, CAP_RECORD_PARTITIONING, CAP_ZERO_COPY,
@@ -10,19 +12,10 @@ pub use mmap::MmapFile;
 pub use scanner::ChunkCursor;
 pub use scanner::PatternChunkCursor;
 
-#[derive(Debug)]
-pub(crate) enum ChunkLayout {
-    Empty,
-    Delimited(Vec<(usize, usize)>),
-    Fixed {
-        chunk_size: usize,
-        chunk_count: usize,
-    },
-    Partitioned(Vec<(usize, usize)>),
-}
-
 use std::io;
 use std::path::Path;
+
+use plan::ChunkPlan;
 
 /// Safe Rust interface for memory-mapped file chunking.
 ///
@@ -57,7 +50,7 @@ use std::path::Path;
 #[derive(Debug)]
 pub struct MmapChunker {
     mmap: MmapFile,
-    layout: ChunkLayout,
+    plan: ChunkPlan,
 }
 
 impl MmapChunker {
@@ -90,7 +83,7 @@ impl MmapChunker {
         let mmap = MmapFile::open_path(path)?;
         Ok(Self {
             mmap,
-            layout: ChunkLayout::Empty,
+            plan: ChunkPlan::empty(),
         })
     }
 
@@ -99,11 +92,7 @@ impl MmapChunker {
     /// Returns 0 if no scan has been performed or if the file is empty.
     #[inline]
     pub fn chunk_count(&self) -> usize {
-        match &self.layout {
-            ChunkLayout::Empty => 0,
-            ChunkLayout::Delimited(chunks) | ChunkLayout::Partitioned(chunks) => chunks.len(),
-            ChunkLayout::Fixed { chunk_count, .. } => *chunk_count,
-        }
+        self.plan.len()
     }
 
     /// Scan the file with the given approximate chunk size and
@@ -117,13 +106,12 @@ impl MmapChunker {
     pub fn scan_delimited(&mut self, chunk_size: usize, delimiter: u8) -> usize {
         let data = self.mmap.as_bytes();
         if data.is_empty() {
-            self.layout = ChunkLayout::Empty;
+            self.plan = ChunkPlan::empty();
             return 0;
         }
         let chunks = scanner::find_chunk_boundaries(data, chunk_size, delimiter);
-        let count = chunks.len();
-        self.layout = ChunkLayout::Delimited(chunks);
-        count
+        self.plan = ChunkPlan::from_ranges(chunks);
+        self.plan.len()
     }
 
     /// Partition the file into sequential fixed-size chunks.
@@ -134,17 +122,8 @@ impl MmapChunker {
     /// Replaces any previous layout. Returns the number of chunks.
     pub fn scan_fixed(&mut self, chunk_size: usize) -> usize {
         let file_len = self.mmap.len();
-        if file_len == 0 {
-            self.layout = ChunkLayout::Empty;
-            return 0;
-        }
-        let effective_size = chunk_size.max(1);
-        let count = file_len.div_ceil(effective_size);
-        self.layout = ChunkLayout::Fixed {
-            chunk_size: effective_size,
-            chunk_count: count,
-        };
-        count
+        self.plan = ChunkPlan::fixed(file_len, chunk_size);
+        self.plan.len()
     }
 
     /// Plan record-aligned partition byte ranges for N-way parallel
@@ -162,13 +141,12 @@ impl MmapChunker {
         let data = self.mmap.as_bytes();
         let file_len = data.len();
         if file_len == 0 || num_partitions == 0 {
-            self.layout = ChunkLayout::Empty;
+            self.plan = ChunkPlan::empty();
             return 0;
         }
         let partitions = scanner::find_partition_boundaries(data, num_partitions, delimiter);
-        let count = partitions.len();
-        self.layout = ChunkLayout::Partitioned(partitions);
-        count
+        self.plan = ChunkPlan::from_ranges(partitions);
+        self.plan.len()
     }
 
     /// Create a lazy streaming cursor for sequential chunk consumption.
@@ -213,13 +191,12 @@ impl MmapChunker {
     pub fn scan_delimited_pattern(&mut self, chunk_size: usize, delimiter: &[u8]) -> usize {
         let data = self.mmap.as_bytes();
         if data.is_empty() {
-            self.layout = ChunkLayout::Empty;
+            self.plan = ChunkPlan::empty();
             return 0;
         }
         let chunks = scanner::find_chunk_boundaries_pattern(data, chunk_size, delimiter);
-        let count = chunks.len();
-        self.layout = ChunkLayout::Delimited(chunks);
-        count
+        self.plan = ChunkPlan::from_ranges(chunks);
+        self.plan.len()
     }
 
     /// Create a lazy streaming cursor with a multi-byte delimiter.
@@ -261,21 +238,7 @@ impl MmapChunker {
     /// The returned slice is valid for the lifetime of `self`.
     pub fn get_chunk(&self, index: usize) -> Option<&[u8]> {
         let data = self.mmap.as_bytes();
-        let (start, end) = match &self.layout {
-            ChunkLayout::Empty => return None,
-            ChunkLayout::Delimited(chunks) | ChunkLayout::Partitioned(chunks) => {
-                *chunks.get(index)?
-            }
-            ChunkLayout::Fixed {
-                chunk_size,
-                chunk_count,
-            } => {
-                if index >= *chunk_count {
-                    return None;
-                }
-                scanner::fixed_chunk_bounds(data.len(), *chunk_size, index)?
-            }
-        };
+        let (start, end) = self.plan.range_at(index, data.len())?;
         Some(&data[start..end])
     }
 
