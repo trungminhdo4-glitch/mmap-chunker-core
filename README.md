@@ -269,15 +269,16 @@ One bounded Windows proof run (Windows 11, x86_64, 12 logical CPUs, Python
 
 | Mode | Median planning | Median worker startup | Median processing | Median end-to-end |
 |------|----------------:|----------------------:|------------------:|------------------:|
-| Single-process reference | — | — | — | 317.5 ms |
-| 1 worker | 0.230 ms | 6.8 ms | 488.5 ms | 495.5 ms |
-| 2 workers | 0.207 ms | 12.5 ms | 276.2 ms | 290.2 ms |
-| 4 workers | 0.201 ms | 20.9 ms | 217.1 ms | 247.1 ms |
+| Single-process reference | — | — | — | 1,220.3 ms |
+| 1 worker | 1,868.1 ms | 6.1 ms | 421.5 ms | 2,314.2 ms |
+| 2 workers | 0.2 ms | 11.3 ms | 283.6 ms | 295.1 ms |
+| 4 workers | 0.2 ms | 24.0 ms | 278.2 ms | 302.4 ms |
 
 All modes processed the same 100,000 records and 11,518,914 bytes and produced
-the same value sum. This is an adoption/correctness proof, not a universal
-performance claim: Python process startup and JSON decoding dominate this
-small local workload.
+the same value sum of 49,843,048,239. The 1-worker planning measurement
+included a one-time cold-start outlier on this run; these figures are an
+adoption/correctness proof, not a universal performance claim. Python process
+startup and JSON decoding dominate this small local workload.
 
 ## Build
 
