@@ -103,6 +103,19 @@ def plan_ranges(lib: ctypes.CDLL, path: Path, requested_workers: int) -> dict:
     if offset != file_size:
         raise AssertionError(f"partition coverage {offset} != file size {file_size}")
 
+    cursor = 0
+    with path.open("rb") as input_file:
+        for index, (range_offset, length) in enumerate(ranges):
+            if range_offset != cursor or length <= 0:
+                raise AssertionError(f"invalid contiguous range at index {index}: {ranges[index]}")
+            if index < len(ranges) - 1:
+                input_file.seek(range_offset + length - 1)
+                if input_file.read(1) != b"\n":
+                    raise AssertionError(f"partition {index} splits a newline-delimited record")
+            cursor += length
+    if cursor != file_size:
+        raise AssertionError(f"range coverage {cursor} != file size {file_size}")
+
     return {
         "requested_workers": requested_workers,
         "actual_partitions": len(ranges),
