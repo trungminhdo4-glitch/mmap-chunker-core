@@ -37,6 +37,14 @@ CSV or other structured formats, pair the range planner with a format-aware
 parser and only use a delimiter when its record-boundary rules are compatible
 with the file.
 
+## Non-goals
+
+This is not a CSV or JSON parser, ETL/dataframe engine, distributed scheduler,
+RAG/text chunker, content-defined chunker, or general-purpose byte-search
+package. It is a small local-file framing and partitioning primitive; parsing,
+validation, worker scheduling, and cross-machine coordination remain with the
+consumer.
+
 ## Features
 
 - Targets Windows and POSIX platforms (Linux, macOS)
