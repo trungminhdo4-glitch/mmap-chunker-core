@@ -209,9 +209,12 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks(
 /// Scan the mapped file for chunk boundaries.
 ///
 /// Chunks are created at approximately `chunk_size_bytes` intervals.
-/// Each chunk boundary is placed immediately after a `delimiter` byte
+/// Each chunk boundary is placed immediately after a raw `delimiter` byte
 /// found at or after the target offset. The last chunk extends to the
 /// end of the file.
+///
+/// Quoting, escaping, and other format-level rules are the consumer's
+/// responsibility; this function does not parse CSV, JSON, or another format.
 ///
 /// Returns the number of chunks found, or 0 on error (null handle,
 /// empty file, or internal failure). On error, call

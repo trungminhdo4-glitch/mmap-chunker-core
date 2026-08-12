@@ -118,9 +118,9 @@ size_t mmap_engine_scan_chunks(CEngineHandle *handle, size_t chunk_size_bytes);
  * found at or after the target offset. The last chunk extends to the
  * end of the file.
  *
- * Common delimiter values:
+ * Common raw framing delimiters:
  *   '\\n' (0x0A) — newline (JSONL, NDJSON, logs)
- *   ','  (0x2C) — comma (CSV)
+ *   ','  (0x2C) — comma (raw comma-delimited framing; not CSV parsing)
  *   '\\t' (0x09) — tab (TSV)
  *   '|'  (0x7C) — pipe
  *   '\\0' (0x00) — NUL byte (binary framing)
@@ -130,7 +130,9 @@ size_t mmap_engine_scan_chunks(CEngineHandle *handle, size_t chunk_size_bytes);
  * @param handle            Valid handle from mmap_engine_open().
  * @param chunk_size_bytes  Approximate chunk size in bytes (minimum 1;
  *                          values of 0 are silently clamped to 1).
- * @param delimiter         Byte value used to detect record boundaries.
+ * @param delimiter         Byte value used to detect raw record boundaries.
+ *                          Quoting, escaping, and other format-level rules
+ *                          are the consumer's responsibility.
  * @return                  Number of chunks found, or 0 on error / empty file.
  *                          On error, call mmap_engine_last_error() for diagnostics.
  *

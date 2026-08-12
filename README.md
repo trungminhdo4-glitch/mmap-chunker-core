@@ -1,27 +1,56 @@
 # mmap-chunker-core
 
 [![CI](https://github.com/trungminhdo4-glitch/mmap-chunker-core/actions/workflows/ci.yml/badge.svg)](https://github.com/trungminhdo4-glitch/mmap-chunker-core/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/mmap-chunker-core.svg)](https://crates.io/crates/mmap-chunker-core)
+[![docs.rs](https://docs.rs/mmap-chunker-core/badge.svg)](https://docs.rs/mmap-chunker-core)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 
-Zero-dependency data chunking engine with native memory-mapped I/O and a stable C ABI.
+Record-aligned byte-range planning for large immutable local files, with
+zero-copy framing and a stable C ABI.
+
+The core is a zero-dependency Rust library that maps a file, finds framing
+boundaries, and returns views or contiguous ranges for independent consumers.
 
 ## Why
 
-Splitting large files into record-delimited chunks is a common task in data
-pipelines, log processing, and ETL workloads. Most solutions either copy data
-unnecessarily or pull in heavy dependencies. This library provides:
+When a large JSONL/NDJSON or newline-delimited log file must be processed by N
+independent local workers, the awkward part is choosing balanced byte ranges
+without splitting a record. This library provides the small planning and
+framing primitive underneath that worker pipeline:
 
 - **Zero-copy** chunk views backed by OS-level memory mapping
 - **Zero runtime dependencies** — pure Rust with direct syscall FFI
 - **Language-agnostic C ABI** — usable from C, Python, Go, C#, and any language with FFI
-- **Three planning modes**: delimiter-aware chunking, fixed-size chunking, and record-aligned N-way partitioning
+- **Record-aligned N-way partitioning** — deterministic, contiguous ranges for independent workers
+- **Three planning modes**: delimiter framing, fixed-size chunking, and record-aligned partitioning
+
+## Framing, not parsing
+
+The engine is byte- and delimiter-aware; it does not parse a file format. A
+comma delimiter means raw comma framing, not CSV semantics. Quoted commas,
+escaped delimiters, and multiline quoted CSV records are not interpreted.
+Likewise, JSON grammar, protobuf framing, compression, and application-level
+validation remain the consumer's responsibility.
+
+Use newline framing for one-record-per-line JSONL/NDJSON and ordinary logs. For
+CSV or other structured formats, pair the range planner with a format-aware
+parser and only use a delimiter when its record-boundary rules are compatible
+with the file.
+
+## Non-goals
+
+This is not a CSV or JSON parser, ETL/dataframe engine, distributed scheduler,
+RAG/text chunker, content-defined chunker, or general-purpose byte-search
+package. It is a small local-file framing and partitioning primitive; parsing,
+validation, worker scheduling, and cross-machine coordination remain with the
+consumer.
 
 ## Features
 
 - Targets Windows and POSIX platforms (Linux, macOS)
 - Windows and Linux are validated in CI; macOS validation now included
 - POSIX `mmap` / Windows `CreateFileMappingW`
-- Configurable single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
+- Configurable raw single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
 - Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust and C ABI
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
@@ -157,7 +186,7 @@ let partitions = scanner::find_partition_boundaries(data, 4, b'\n');
 
 ## Prebuilt Libraries (C / Python / Go / FFI)
 
-Prebuilt native libraries are published on [GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases) for every tagged version. Each platform archive contains the C header, dynamic library, static library, and licenses.
+Verified prebuilt native libraries are published on [GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases) for releases that carry native assets (currently v0.2.1). Each platform archive contains the C header, dynamic library, static library, and licenses.
 
 | Platform | Archive | Contents |
 |----------|---------|----------|
@@ -183,6 +212,29 @@ uint32_t ver = mmap_engine_abi_version();
 ```
 
 See `mmap_chunker.h` for the complete C API reference with threading and safety contracts.
+
+## Example: parallel JSONL worker ranges
+
+[`examples/jsonl_multiprocessing_proof.py`](examples/jsonl_multiprocessing_proof.py)
+is a dependency-free reference integration, not a Python binding. It loads the
+native library with stdlib `ctypes`, calls
+`mmap_engine_partition_records()`, reads each partition length through the
+existing `CChunkView`, and reconstructs `(offset, length)` ranges by cumulative
+addition. Each spawned worker opens the original file independently and parses
+only its assigned range.
+
+Run it after `cargo build --release`:
+
+```sh
+python examples/jsonl_multiprocessing_proof.py \
+  --records 100000 --payload-bytes 64 --workers 1,2,4 --repeats 3
+```
+
+The proof checks exact record count, numeric sum, byte coverage, and deterministic
+results against a single-process reference. It reports partition planning,
+worker startup, processing, and end-to-end wall time separately. Process startup
+and application parsing can dominate small workloads, so the example makes no
+universal multiprocessing speed claim.
 
 ## Safety Contract
 
@@ -211,17 +263,30 @@ cargo test --test benchmark -- --ignored --nocapture
 cargo test --release scanner::tests::bench_cursor_vs_eager -- --ignored --nocapture
 ```
 
-Time-to-first-chunk (TFC) advantage with lazy cursor on JSONL/log data (64 KiB chunks, release build, 7-sample p50):
+The cursor benchmark reports time-to-first-chunk and full traversal for
+synthetic JSONL/log-like byte buffers. It uses a release build, seven samples
+per case, and prints p10/p50/p90 in nanoseconds. These are API-shape
+measurements—not end-to-end file-processing throughput—and are expected to
+vary by CPU, toolchain, and workload. The I/O benchmark is separately labeled
+as warm/cached mmap versus `fs::read`; run the commands above for current
+machine-specific output.
 
-| File Size | Eager TFC  | Lazy TFC | Speedup | Chunks |
-|-----------|-----------|----------|---------|--------|
-| 100 KB    | 139 ns    | 8.5 ns   | 16x     | 2      |
-| 1 MB      | 554 ns    | 10 ns    | 55x     | 16     |
-| 10 MB     | 2,780 ns  | 10 ns    | 278x    | 153    |
+One bounded Windows proof run (Windows 11, x86_64, 12 logical CPUs, Python
+3.12.6, release DLL, 3-sample medians, 100,000 generated JSONL records,
+11,518,914 bytes) produced:
 
-Full traversal converges as file size grows (both do equivalent scan work).
-Lazy is 2.2x faster at 1 MB and 1.3x faster at 10 MB (Vec allocation overhead).
-I/O benchmark runs on 1 MB–64 MB files with 64 KB–1 MB chunk sizes.
+| Mode | Median planning | Median worker startup | Median processing | Median end-to-end |
+|------|----------------:|----------------------:|------------------:|------------------:|
+| Single-process reference | — | — | — | 483.2 ms |
+| 1 worker | 0.3 ms | 9.5 ms | 425.5 ms | 432.0 ms |
+| 2 workers | 0.3 ms | 11.0 ms | 289.7 ms | 301.0 ms |
+| 4 workers | 0.4 ms | 14.2 ms | 215.0 ms | 234.7 ms |
+
+All modes processed the same 100,000 records and 11,518,914 bytes and produced
+the same value sum of 49,843,048,239. These figures are an
+adoption/correctness proof, not a universal performance claim. Python process
+startup and JSON decoding dominate this small local workload, and timings vary
+with machine state and workload.
 
 ## Build
 
@@ -248,8 +313,8 @@ The suite covers delimiter semantics, cursor equivalence, fixed-size chunking,
 partitioning, C ABI behavior, and edge cases.
 
 Companion test suites:
-- 30 external C ABI assertions via `examples/c_consumer.c` (CI-validated on Linux and macOS)
-- 53 Python ctypes integration tests (local, companion module)
+- External C ABI consumer scenarios covering ABI discovery, errors, delimiter/pattern/fixed/partition modes, layout, and coverage (CI-validated on Linux and macOS)
+- Deterministic Python ctypes semantic parity in `tests/python_parity.py` (CI-validated on Linux)
 
 ## Limitations
 
@@ -259,7 +324,8 @@ Companion test suites:
 
 ## Roadmap
 
-- SIMD-accelerated byte search (runtime dispatch)
+- More real consumer integrations for record-aligned local worker pipelines
+- Benchmark-backed search backend decisions; no custom SIMD promise without a measured win
 
 ## License
 
