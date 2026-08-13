@@ -1,0 +1,1 @@
+abi_version=65539;capabilities=63;partition_count=3;partition_lengths=61,36,55;total_length=152;record_count=4;fnv1a64=3816681e4b966d25;deterministic=1;n0_error=requested_partitions must be > 0;chunk_view_size=16;chunk_view_data_offset=0;chunk_view_len_offset=8
