@@ -65,6 +65,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: tar.gz
+            cross: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             ext: tar.gz
@@ -99,7 +100,7 @@ jobs:
         if: ${{ matrix.cross }}
         run: cargo install cross --version 0.2.5 --locked
 
-      - name: Build (cross, aarch64-linux)
+      - name: Build (cross)
         if: ${{ matrix.cross }}
         run: cross build --release --target ${{ matrix.target }}
 
@@ -203,6 +204,32 @@ jobs:
               DYNAMIC="$ARCHIVE_ROOT/lib/libmmap_chunker_core.so"
               ;;
           esac
+
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            LINUX_GLIBC_MAX="2.17"
+            echo "=== Packaged GLIBC symbol ceiling (declared $LINUX_GLIBC_MAX) ==="
+            GLIBC_VERSIONS=$(readelf --version-info "$DYNAMIC" \
+              | grep -oE 'GLIBC_[0-9.]+' | sort -Vu)
+            printf '%s\n' "$GLIBC_VERSIONS"
+            MAX_GLIBC=$(printf '%s\n' "$GLIBC_VERSIONS" | sort -V | tail -n 1)
+            if [ -z "$MAX_GLIBC" ]; then
+              echo "ERROR: packaged Linux shared library has no GLIBC version inventory"
+              exit 1
+            fi
+            if ! awk -v found="$MAX_GLIBC" -v declared="GLIBC_$LINUX_GLIBC_MAX" '
+              BEGIN {
+                sub(/^GLIBC_/, "", found)
+                sub(/^GLIBC_/, "", declared)
+                split(found, f, ".")
+                split(declared, d, ".")
+                exit !(f[1] < d[1] || (f[1] == d[1] && f[2] <= d[2]))
+              }
+            '; then
+              echo "ERROR: packaged Linux shared library requires $MAX_GLIBC, above GLIBC_$LINUX_GLIBC_MAX"
+              exit 1
+            fi
+            echo "PASS: packaged Linux shared library is at or below GLIBC_$LINUX_GLIBC_MAX"
+          fi
 
           echo "=== Dynamic ABI symbol verification ==="
           grep -vE '^[[:space:]]*(#|$)' abi/v1.symbols | sort > "$VERIFY_ROOT/expected.symbols"
