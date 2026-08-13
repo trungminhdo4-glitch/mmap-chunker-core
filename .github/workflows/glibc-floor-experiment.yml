@@ -2,6 +2,12 @@ name: GLIBC floor experiment
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - Cross.toml
+      - .github/workflows/glibc-floor-experiment.yml
+      - tests/glibc_floor/**
 
 permissions:
   contents: read
