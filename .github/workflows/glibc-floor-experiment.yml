@@ -169,7 +169,6 @@ jobs:
               cat /etc/os-release
               ldd --version
               gcc --version
-              python3 --version
             } | tee runtime-environment.txt
             grep -F "ldd (GNU libc) 2.17" runtime-environment.txt
             archive=$(find candidate-artifact -name "*.tar.gz" -print -quit)
