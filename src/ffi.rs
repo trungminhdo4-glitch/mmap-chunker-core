@@ -1678,6 +1678,39 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_records_huge_request_does_not_overflow() {
+        let dir = std::env::temp_dir().join("mmap_chunker_test_partition_huge_request");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        let content = b"a\nb\nc\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_partition_records(h, usize::MAX, b'\n');
+            assert_eq!(count, 3);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let mut total = 0usize;
+            for index in 0..count {
+                assert_eq!(mmap_engine_get_chunk(h, index, &mut view), 0);
+                total += view.len;
+            }
+            assert_eq!(total, content.len());
+
+            mmap_engine_free(h);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_partition_records_no_delimiter() {
         let dir = std::env::temp_dir().join("mmap_chunker_test_partition_nodelim");
         let _ = std::fs::remove_dir_all(&dir);
