@@ -1,0 +1,285 @@
+name: GLIBC floor experiment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+  CROSS_IMAGE: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main-centos@sha256:e83bb2c28b1cee027d3a430154495e936d404fd977b36d924e032bf35b198260
+
+jobs:
+  normal-source-head:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build current source head normally
+        run: cargo build --release --target "$TARGET"
+
+      - name: Audit normal source-head ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          so="target/$TARGET/release/libmmap_chunker_core.so"
+          ar="target/$TARGET/release/libmmap_chunker_core.a"
+          {
+            echo "source_sha=$GITHUB_SHA"
+            echo "rustc=$(rustc --version)"
+            echo "gcc=$(cc --version | head -n 1)"
+            echo "=== dynamic section ==="
+            readelf -d "$so" | grep -E 'NEEDED|SONAME|RPATH|RUNPATH' || true
+            echo "=== GLIBC/GCC version inventory ==="
+            readelf --version-info "$so" | grep -oE '(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
+            echo "max_glibc=$(readelf --version-info "$so" | grep -oE 'GLIBC_[0-9.]+ ' | sort -V | tail -n 1 | tr -d ' ')"
+            echo "=== versioned imported symbols ==="
+            readelf --dyn-syms --wide "$so" | grep -oE '[A-Za-z0-9_]+@(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
+            echo "=== exported ABI ==="
+            nm -D --defined-only "$so" | awk '$3 ~ /^mmap_engine_/ {print $3}' | sort
+            echo "=== sizes ==="
+            stat -c '%n %s' "$so" "$ar"
+          } | tee normal-source-head-audit.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: glibc-floor-normal-source-head
+          path: normal-source-head-audit.txt
+          if-no-files-found: error
+
+  candidate-cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Resolve and inspect pinned cross image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$CROSS_IMAGE"
+          docker image inspect "$CROSS_IMAGE" --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}'
+          docker run --rm --entrypoint /bin/bash "$CROSS_IMAGE" -lc '
+            cat /etc/os-release
+            ldd --version | head -n 1
+            gcc --version | head -n 1
+          '
+
+      - name: Install existing cross tool
+        run: cargo install cross --version 0.2.5 --locked
+
+      - name: Build GLIBC 2.17 candidate
+        run: cross build --release --target "$TARGET"
+
+      - name: Package and audit candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          so="target/$TARGET/release/libmmap_chunker_core.so"
+          ar="target/$TARGET/release/libmmap_chunker_core.a"
+          staging="$RUNNER_TEMP/staging"
+          rm -rf "$staging"
+          mkdir -p "$staging/include" "$staging/lib"
+          cp mmap_chunker.h "$staging/include/"
+          cp LICENSE-MIT LICENSE-APACHE "$staging/"
+          cp "$so" "$ar" "$staging/lib/"
+          archive="$RUNNER_TEMP/mmap-chunker-core-glibc-floor-${TARGET}.tar.gz"
+          tar czf "$archive" -C "$RUNNER_TEMP" staging
+          sha256sum "$archive" > "$archive.sha256"
+
+          expected=$(grep -vE '^[[:space:]]*(#|$)' abi/v1.symbols | sort)
+          actual=$(nm -D --defined-only "$so" | awk '$3 ~ /^mmap_engine_/ {print $3}' | sort)
+          test "$expected" = "$actual"
+
+          {
+            echo "source_sha=$GITHUB_SHA"
+            echo "cross_image=$CROSS_IMAGE"
+            echo "cross=$(cross --version)"
+            echo "rustc=$(cross rustc --target "$TARGET" -- --version)"
+            echo "=== archive checksum ==="
+            cat "$archive.sha256"
+            echo "=== archive contents ==="
+            tar tzf "$archive"
+            echo "=== dynamic section ==="
+            readelf -d "$so" | grep -E 'NEEDED|SONAME|RPATH|RUNPATH' || true
+            echo "=== GLIBC/GCC version inventory ==="
+            readelf --version-info "$so" | grep -oE '(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
+            max_glibc=$(readelf --version-info "$so" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -n 1)
+            echo "max_glibc=$max_glibc"
+            test "$max_glibc" = GLIBC_2.17
+            if readelf --dyn-syms --wide "$so" | grep -E 'GLIBC_([2-9]|1[0-9])' | grep -vE 'GLIBC_2\.1[0-7]([[:space:]]|$)' ; then
+              echo "FAIL: imported GLIBC symbol newer than 2.17"
+              exit 1
+            fi
+            echo "=== versioned imported symbols ==="
+            readelf --dyn-syms --wide "$so" | grep -oE '[A-Za-z0-9_]+@(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
+            echo "=== exact GLIBC 2.17 symbols ==="
+            readelf --dyn-syms --wide "$so" | grep 'GLIBC_2.17' || true
+            echo "=== exported ABI ==="
+            printf '%s\n' "$actual"
+            echo "=== sizes ==="
+            stat -c '%n %s' "$so" "$ar" "$archive"
+          } | tee candidate-audit.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: glibc-floor-candidate
+          path: |
+            ${{ runner.temp }}/mmap-chunker-core-glibc-floor-*.tar.gz
+            ${{ runner.temp }}/mmap-chunker-core-glibc-floor-*.sha256
+            candidate-audit.txt
+          if-no-files-found: error
+
+  glibc-217-runtime:
+    needs: candidate-cross
+    runs-on: ubuntu-24.04
+    container: quay.io/pypa/manylinux2014_x86_64
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: glibc-floor-candidate
+          path: candidate-artifact
+
+      - name: Verify runtime environment and run candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "=== runtime identity ==="
+            cat /etc/os-release
+            ldd --version | head -n 1
+            gcc --version | head -n 1
+            python3 --version
+          } | tee runtime-environment.txt
+          grep -E 'GLIBC[^0-9]*2\.17|GNU C Library.*2\.17' runtime-environment.txt
+          archive=$(find candidate-artifact -name '*.tar.gz' -print -quit)
+          mkdir extracted
+          tar xzf "$archive" -C extracted
+          root="$PWD/extracted/staging"
+          fixture_dir="$RUNNER_TEMP/mmap-conformance-Δ"
+          mkdir -p "$fixture_dir"
+          cp tests/conformance/corpus.jsonl "$fixture_dir/input.jsonl"
+          cc -std=c11 -Wall -Wextra -Werror \
+            -I"$root/include" tests/glibc_floor/runtime_consumer.c \
+            "$root/lib/libmmap_chunker_core.so" \
+            -Wl,-rpath,"$root/lib" -o runtime_consumer
+          ldd "$root/lib/libmmap_chunker_core.so" | tee runtime-ldd.txt
+          ./runtime_consumer "$fixture_dir/input.jsonl" | tee runtime-result.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: glibc-floor-runtime
+          path: |
+            runtime-environment.txt
+            runtime-ldd.txt
+            runtime-result.txt
+          if-no-files-found: error
+
+  modern-conformance:
+    needs: candidate-cross
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: '1.24.6'
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '8.0.416'
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: glibc-floor-candidate
+          path: candidate-artifact
+
+      - name: Run all modern consumers against the same candidate library
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate-artifact -name '*.tar.gz' -print -quit)
+          mkdir extracted
+          tar xzf "$archive" -C extracted
+          root="$PWD/extracted/staging"
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir"' EXIT
+          fixture_dir="$work_dir/mmap-conformance-Δ"
+          mkdir -p "$fixture_dir" "$work_dir/results"
+          cp tests/conformance/corpus.jsonl "$fixture_dir/input.jsonl"
+          fixture="$fixture_dir/input.jsonl"
+          expected="$PWD/tests/conformance/expected.txt"
+          library="$root/lib/libmmap_chunker_core.so"
+          library_dir=$(dirname "$library")
+
+          cc -std=c11 -Wall -Wextra -Werror -I"$root/include" \
+            tests/conformance/c_consumer.c "$library" \
+            -Wl,-rpath,"$library_dir" -o "$work_dir/c_consumer"
+          "$work_dir/c_consumer" "$fixture" "$expected" "$work_dir/results/c"
+          python3 tests/conformance/python_consumer.py \
+            --library "$library" --fixture "$fixture" --expected "$expected" \
+            --output "$work_dir/results/python"
+          CGO_CFLAGS="-I$root/include" \
+          CGO_LDFLAGS="$library -Wl,-rpath,$library_dir" \
+            go build -o "$work_dir/go_consumer" ./tests/conformance/go
+          "$work_dir/go_consumer" --library "$library" --fixture "$fixture" \
+            --expected "$expected" --output "$work_dir/results/go"
+          dotnet build tests/conformance/csharp/Conformance.csproj \
+            --configuration Release --nologo
+          dotnet tests/conformance/csharp/bin/Release/net8.0/Conformance.dll \
+            --library "$library" --fixture "$fixture" --expected "$expected" \
+            --output "$work_dir/results/csharp"
+          diff -u "$work_dir/results/c" "$work_dir/results/python"
+          diff -u "$work_dir/results/c" "$work_dir/results/go"
+          diff -u "$work_dir/results/c" "$work_dir/results/csharp"
+          diff -u "$expected" "$work_dir/results/c"
+          echo 'PASS: C, Python, Go/cgo, and C# agree on the 2.17-built library'
+
+  static-library:
+    needs: candidate-cross
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: glibc-floor-candidate
+          path: candidate-artifact
+
+      - name: Link and inspect a C executable from the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find candidate-artifact -name '*.tar.gz' -print -quit)
+          mkdir extracted
+          tar xzf "$archive" -C extracted
+          root="$PWD/extracted/staging"
+          cc -std=c11 -Wall -Wextra -Werror -I"$root/include" \
+            tests/glibc_floor/runtime_consumer.c "$root/lib/libmmap_chunker_core.a" \
+            -lpthread -ldl -o static_consumer
+          {
+            echo "gcc=$(cc --version | head -n 1)"
+            echo "=== dynamic section ==="
+            readelf -d static_consumer | grep -E 'NEEDED|SONAME|RPATH|RUNPATH' || true
+            echo "=== GLIBC/GCC version inventory ==="
+            readelf --version-info static_consumer | grep -oE '(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
+            echo "=== file ==="
+            file static_consumer
+          } | tee static-library-audit.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: glibc-floor-static-library
+          path: static-library-audit.txt
+          if-no-files-found: error
