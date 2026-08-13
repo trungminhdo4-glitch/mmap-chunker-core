@@ -158,7 +158,8 @@ jobs:
           rustc --version
           cargo --version
           go version
-          dotnet --version
+          dotnet --list-sdks
+          test "$(cd tests/conformance/csharp && dotnet --version)" = "8.0.416"
           python3 --version
           cc --version | head -n 1
           test "$(go env CGO_ENABLED)" = "1"
