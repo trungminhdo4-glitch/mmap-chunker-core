@@ -211,6 +211,27 @@ assert lib.mmap_engine_abi_version() == 0x00010003
 uint32_t ver = mmap_engine_abi_version();
 ```
 
+### Linux x86_64 compatibility
+
+The `x86_64-unknown-linux-gnu` release workflow declares a `GLIBC_2.17`
+symbol ceiling and checks it from the final extracted archive. Each candidate
+also runs that extracted `.so` with the maintained C conformance consumer in a
+digest-pinned manylinux2014 (GNU libc 2.17) environment. The runtime gate checks
+loading, ABI/capability discovery, UTF-8 paths, deterministic record partitions,
+exact reconstruction, the N=0 error contract, and clean handle release. The
+same archive also has C, Python ctypes, Go/cgo, and C# conformance coverage on
+the modern Linux runner. This is a bounded release contract, not a claim that
+every system with glibc at or above that version has been tested.
+
+The extracted archive layout is `staging/include/mmap_chunker.h` and
+`staging/lib/` for the shared and static libraries. For a shared-library
+consumer, use the platform loader's normal search configuration, such as an
+RPATH/RUNPATH or `LD_LIBRARY_PATH`; the library itself does not embed a
+SONAME, RPATH, or RUNPATH. The static file is a static library archive, not a
+fully static executable. A typical Linux link supplies the system libraries,
+for example `cc -I staging/include -L staging/lib -o app app.c
+-lmmap_chunker_core -lpthread -ldl`.
+
 See `mmap_chunker.h` for the complete C API reference with threading and safety contracts.
 
 ## Example: parallel JSONL worker ranges

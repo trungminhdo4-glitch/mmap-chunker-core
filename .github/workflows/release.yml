@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  GLIBC_217_RUNTIME_IMAGE: quay.io/pypa/manylinux2014_x86_64@sha256:41269ff9c2edb74de6fe65eb8c9db2b5e03370ce7f3da313aa7e3134c9371892
 
 jobs:
   prepare:
@@ -65,6 +66,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: tar.gz
+            cross: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             ext: tar.gz
@@ -99,7 +101,7 @@ jobs:
         if: ${{ matrix.cross }}
         run: cargo install cross --version 0.2.5 --locked
 
-      - name: Build (cross, aarch64-linux)
+      - name: Build (cross)
         if: ${{ matrix.cross }}
         run: cross build --release --target ${{ matrix.target }}
 
@@ -204,6 +206,72 @@ jobs:
               ;;
           esac
 
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            LINUX_GLIBC_MAX="2.17"
+            echo "=== Packaged GLIBC symbol ceiling (declared $LINUX_GLIBC_MAX) ==="
+            GLIBC_VERSIONS=$(readelf --version-info "$DYNAMIC" \
+              | grep -oE 'GLIBC_[0-9.]+' | sort -Vu)
+            printf '%s\n' "$GLIBC_VERSIONS"
+            MAX_GLIBC=$(printf '%s\n' "$GLIBC_VERSIONS" | sort -V | tail -n 1)
+            if [ -z "$MAX_GLIBC" ]; then
+              echo "ERROR: packaged Linux shared library has no GLIBC version inventory"
+              exit 1
+            fi
+            if ! awk -v found="$MAX_GLIBC" -v declared="GLIBC_$LINUX_GLIBC_MAX" '
+              BEGIN {
+                sub(/^GLIBC_/, "", found)
+                sub(/^GLIBC_/, "", declared)
+                split(found, f, ".")
+                split(declared, d, ".")
+                exit !(f[1] < d[1] || (f[1] == d[1] && f[2] <= d[2]))
+              }
+            '; then
+              echo "ERROR: packaged Linux shared library requires $MAX_GLIBC, above GLIBC_$LINUX_GLIBC_MAX"
+              exit 1
+            fi
+            echo "PASS: packaged Linux shared library is at or below GLIBC_$LINUX_GLIBC_MAX"
+
+            echo "=== Packaged GLIBC 2.17 runtime conformance ==="
+            echo "runtime_image=$GLIBC_217_RUNTIME_IMAGE"
+            docker pull "$GLIBC_217_RUNTIME_IMAGE"
+            docker image inspect "$GLIBC_217_RUNTIME_IMAGE" \
+              --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}'
+            docker run --rm \
+              -v "$VERIFY_ROOT:/verify:ro" \
+              -v "$GITHUB_WORKSPACE:/source:ro" \
+              "$GLIBC_217_RUNTIME_IMAGE" \
+              bash -lc '
+                set -euo pipefail
+                glibc_version=$(ldd --version 2>&1)
+                printf "%s\\n" "$glibc_version"
+                case "$glibc_version" in
+                  *"GNU libc) 2.17"*) ;;
+                  *)
+                    echo "ERROR: runtime environment is not GNU libc 2.17"
+                    exit 1
+                    ;;
+                esac
+
+                root=/verify/extracted/staging
+                library="$root/lib/libmmap_chunker_core.so"
+                test -f "$library"
+                ldd "$library"
+
+                work_dir=$(mktemp -d)
+                trap "rm -rf \"$work_dir\"" EXIT
+                fixture_dir="$work_dir/mmap-conformance-Δ"
+                mkdir -p "$fixture_dir"
+                cp /source/tests/conformance/corpus.jsonl "$fixture_dir/input.jsonl"
+                gcc -std=c11 -Wall -Wextra -Werror \
+                  -I"$root/include" /source/tests/conformance/c_consumer.c \
+                  "$library" -Wl,-rpath,"$root/lib" -o "$work_dir/c_consumer"
+                "$work_dir/c_consumer" "$fixture_dir/input.jsonl" \
+                  /source/tests/conformance/expected.txt "$work_dir/result.txt"
+                diff -u /source/tests/conformance/expected.txt "$work_dir/result.txt"
+                echo "PASS: packaged artifact ran under GNU libc 2.17"
+              '
+          fi
+
           echo "=== Dynamic ABI symbol verification ==="
           grep -vE '^[[:space:]]*(#|$)' abi/v1.symbols | sort > "$VERIFY_ROOT/expected.symbols"
           case "${{ runner.os }}" in
@@ -240,8 +308,8 @@ jobs:
           esac
           diff -u "$VERIFY_ROOT/expected.symbols" "$VERIFY_ROOT/actual.symbols"
 
-          if [ "${{ matrix.cross || false }}" = "true" ]; then
-            echo "SKIP: native C and ctypes runtime checks for cross-compiled aarch64 artifact"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "SKIP: native C and ctypes runtime checks for aarch64 artifact"
           else
             echo "=== C consumer from extracted archive ==="
             CONSUMER="$VERIFY_ROOT/c_consumer.c"
@@ -299,8 +367,8 @@ jobs:
             Windows) 7z l "$PACKAGE" ;;
             *) tar tzf "$PACKAGE" ;;
           esac
-          if [ "${{ matrix.cross || false }}" = "true" ]; then
-            echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only cross coverage"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only aarch64 coverage"
           else
             echo "PASS: $PACKAGE has verified checksum, contents, ABI, C, and ctypes coverage"
           fi
