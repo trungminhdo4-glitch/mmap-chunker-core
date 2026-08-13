@@ -146,7 +146,6 @@ jobs:
   glibc-217-runtime:
     needs: candidate-cross
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux2014_x86_64
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -160,32 +159,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "=== runtime identity ==="
-            cat /etc/os-release
-            ldd --version | head -n 1
-            gcc --version | head -n 1
-            python3 --version
-          } | tee runtime-environment.txt
-          grep -E 'GLIBC[^0-9]*2\.17|GNU C Library.*2\.17' runtime-environment.txt
-          archive=$(find candidate-artifact -name '*.tar.gz' -print -quit)
-          mkdir extracted
-          tar xzf "$archive" -C extracted
-          root="$PWD/extracted/staging"
-          fixture_dir="$RUNNER_TEMP/mmap-conformance-Δ"
-          mkdir -p "$fixture_dir"
-          cp tests/conformance/corpus.jsonl "$fixture_dir/input.jsonl"
-          cc -std=c11 -Wall -Wextra -Werror \
-            -I"$root/include" tests/glibc_floor/runtime_consumer.c \
-            "$root/lib/libmmap_chunker_core.so" \
-            -Wl,-rpath,"$root/lib" -o runtime_consumer
-          ldd "$root/lib/libmmap_chunker_core.so" | tee runtime-ldd.txt
-          ./runtime_consumer "$fixture_dir/input.jsonl" | tee runtime-result.txt
+          runtime_image=quay.io/pypa/manylinux2014_x86_64
+          docker pull "$runtime_image"
+          docker image inspect "$runtime_image" --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}' | tee runtime-image.txt
+          docker run --rm -v "$PWD:/work" -w /work "$runtime_image" bash -lc '
+            set -euo pipefail
+            {
+              echo "=== runtime identity ==="
+              cat /etc/os-release
+              ldd --version | head -n 1
+              gcc --version | head -n 1
+              python3 --version
+            } | tee runtime-environment.txt
+            grep -E "GLIBC[^0-9]*2\\.17|GNU C Library.*2\\.17" runtime-environment.txt
+            archive=$(find candidate-artifact -name "*.tar.gz" -print -quit)
+            rm -rf runtime-extracted
+            mkdir runtime-extracted
+            tar xzf "$archive" -C runtime-extracted
+            root="$PWD/runtime-extracted/staging"
+            fixture_dir="/tmp/mmap-conformance-Δ"
+            mkdir -p "$fixture_dir"
+            cp tests/conformance/corpus.jsonl "$fixture_dir/input.jsonl"
+            cc -std=c11 -Wall -Wextra -Werror \
+              -I"$root/include" tests/glibc_floor/runtime_consumer.c \
+              "$root/lib/libmmap_chunker_core.so" \
+              -Wl,-rpath,"$root/lib" -o runtime_consumer
+            ldd "$root/lib/libmmap_chunker_core.so" | tee runtime-ldd.txt
+            ./runtime_consumer "$fixture_dir/input.jsonl" | tee runtime-result.txt
+          '
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: glibc-floor-runtime
           path: |
+            runtime-image.txt
             runtime-environment.txt
             runtime-ldd.txt
             runtime-result.txt
@@ -236,6 +243,7 @@ jobs:
           python3 tests/conformance/python_consumer.py \
             --library "$library" --fixture "$fixture" --expected "$expected" \
             --output "$work_dir/results/python"
+          GO111MODULE=off CGO_ENABLED=1 \
           CGO_CFLAGS="-I$root/include" \
           CGO_LDFLAGS="$library -Wl,-rpath,$library_dir" \
             go build -o "$work_dir/go_consumer" ./tests/conformance/go
