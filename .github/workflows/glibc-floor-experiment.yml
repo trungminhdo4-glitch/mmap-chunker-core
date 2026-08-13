@@ -167,12 +167,11 @@ jobs:
             {
               echo "=== runtime identity ==="
               cat /etc/os-release
-              ldd --version | head -n 1
-              gcc --version | head -n 1
+              ldd --version
+              gcc --version
               python3 --version
             } | tee runtime-environment.txt
-            runtime_glibc=$(ldd --version 2>&1 | sed -n '1p')
-            test "$runtime_glibc" = "ldd (GNU libc) 2.17"
+            grep -F "ldd (GNU libc) 2.17" runtime-environment.txt
             archive=$(find candidate-artifact -name "*.tar.gz" -print -quit)
             test -n "$archive"
             echo "runtime_archive=$archive"
