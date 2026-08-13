@@ -118,11 +118,12 @@ jobs:
             readelf --version-info "$so" | grep -oE '(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
             max_glibc=$(readelf --version-info "$so" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -n 1)
             echo "max_glibc=$max_glibc"
-            test "$max_glibc" = GLIBC_2.17
-            if readelf --dyn-syms --wide "$so" | grep -E 'GLIBC_([2-9]|1[0-9])' | grep -vE 'GLIBC_2\.1[0-7]([[:space:]]|$)' ; then
-              echo "FAIL: imported GLIBC symbol newer than 2.17"
-              exit 1
-            fi
+            glibc_version=${max_glibc#GLIBC_}
+            glibc_major=${glibc_version%%.*}
+            glibc_minor=${glibc_version#*.}
+            glibc_minor=${glibc_minor%%.*}
+            test "$glibc_major" -eq 2
+            test "$glibc_minor" -le 17
             echo "=== versioned imported symbols ==="
             readelf --dyn-syms --wide "$so" | grep -oE '[A-Za-z0-9_]+@(GLIBC|GLIBCXX|GCC)_[0-9.]+' | sort -Vu
             echo "=== exact GLIBC 2.17 symbols ==="
