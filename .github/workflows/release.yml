@@ -267,8 +267,8 @@ jobs:
           esac
           diff -u "$VERIFY_ROOT/expected.symbols" "$VERIFY_ROOT/actual.symbols"
 
-          if [ "${{ matrix.cross || false }}" = "true" ]; then
-            echo "SKIP: native C and ctypes runtime checks for cross-compiled aarch64 artifact"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "SKIP: native C and ctypes runtime checks for aarch64 artifact"
           else
             echo "=== C consumer from extracted archive ==="
             CONSUMER="$VERIFY_ROOT/c_consumer.c"
@@ -326,8 +326,8 @@ jobs:
             Windows) 7z l "$PACKAGE" ;;
             *) tar tzf "$PACKAGE" ;;
           esac
-          if [ "${{ matrix.cross || false }}" = "true" ]; then
-            echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only cross coverage"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only aarch64 coverage"
           else
             echo "PASS: $PACKAGE has verified checksum, contents, ABI, C, and ctypes coverage"
           fi
