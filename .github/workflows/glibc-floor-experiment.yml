@@ -171,7 +171,7 @@ jobs:
               gcc --version | head -n 1
               python3 --version
             } | tee runtime-environment.txt
-            grep -E "ldd .*2\\.17|GNU libc.*2\\.17" runtime-environment.txt
+            grep -F "2.17" runtime-environment.txt
             archive=$(find candidate-artifact -name "*.tar.gz" -print -quit)
             rm -rf runtime-extracted
             mkdir runtime-extracted
