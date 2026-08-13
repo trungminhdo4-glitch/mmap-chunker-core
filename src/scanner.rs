@@ -634,6 +634,26 @@ mod differential_tests {
             );
         }
     }
+
+    #[test]
+    fn partition_request_above_file_len_matches_file_len_oracle() {
+        for case in 0..4096 {
+            let (data, _, delimiter) = generated_partition_case(PARTITION_SEED, case);
+            if data.is_empty() {
+                continue;
+            }
+
+            let expected = find_partition_boundaries(&data, data.len(), delimiter);
+            for requested in [data.len() + 1, usize::MAX] {
+                assert_eq!(
+                    find_partition_boundaries(&data, requested, delimiter),
+                    expected,
+                    "request above file length changed output: seed={PARTITION_SEED:#018x}, case={case}, data_len={}, requested={requested}, delimiter={delimiter:#04x}",
+                    data.len()
+                );
+            }
+        }
+    }
 }
 
 /// A lazy, streaming cursor that yields delimiter-aligned chunks
@@ -1068,6 +1088,7 @@ pub fn fixed_chunk_bounds(
 /// | `num_partitions == 1` | Returns `[(0, data.len())]` |
 /// | No delimiter in entire file | Returns `[(0, data.len())]` |
 /// | Fewer records than `N` | Produces ≤ record_count partitions |
+/// | `num_partitions > data.len()` | Equivalent to requesting `data.len()` |
 /// | Giant record spanning multiple targets | Boundaries collapse, no record split |
 pub fn find_partition_boundaries(
     data: &[u8],
@@ -1082,20 +1103,20 @@ pub fn find_partition_boundaries(
         return vec![(0, file_len)];
     }
 
-    let n = num_partitions;
-    let target_count = n - 1;
+    // A non-empty byte slice can contain at most `file_len` non-empty
+    // partitions. For larger requests, the original absolute-target
+    // algorithm produces the same ordered set of useful target offsets as
+    // requesting exactly `file_len` partitions. Cap the request before
+    // iterating or allocating so an untrusted count cannot cause a capacity
+    // overflow or an impractically long run on a small input.
+    let n = num_partitions.min(file_len);
 
-    // Overflow-safe: use u128 intermediate for multiplication
-    let mut targets: Vec<usize> = Vec::with_capacity(target_count);
-    for i in 1..n {
-        let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
-        targets.push(target);
-    }
-
-    let mut boundaries: Vec<usize> = Vec::with_capacity(target_count);
+    let mut boundaries = Vec::new();
     let mut last_boundary: usize = 0;
 
-    for &target in &targets {
+    for i in 1..n {
+        // Overflow-safe: use u128 intermediate for multiplication.
+        let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
         if target <= last_boundary {
             continue;
         }
@@ -2537,6 +2558,16 @@ mod tests {
     fn partition_zero_partitions() {
         let data = b"hello\nworld\n";
         assert_eq!(find_partition_boundaries(data, 0, b'\n'), vec![]);
+    }
+
+    #[test]
+    fn partition_request_far_above_file_len_is_bounded() {
+        let data = b"a\nb\nc\n";
+
+        assert_eq!(
+            find_partition_boundaries(data, usize::MAX, b'\n'),
+            vec![(0, 2), (2, 4), (4, 6)]
+        );
     }
 
     #[test]

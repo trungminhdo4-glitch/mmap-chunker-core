@@ -239,6 +239,8 @@ size_t mmap_engine_scan_fixed(CEngineHandle *handle, size_t chunk_size_bytes);
  *   - No delimiter anywhere in file: returns 1 (entire file)
  *   - Giant record spanning multiple ideal targets: boundaries collapse,
  *     effective partition count < requested count
+ *   - Requested partitions greater than file length: equivalent to requesting
+ *     file length (a byte slice cannot produce more non-empty partitions)
  *   - Empty file: returns 0 (no partitions)
  *
  * Calling this function replaces any previously computed chunk boundaries
