@@ -145,9 +145,9 @@ fn supports_paths_with_spaces_and_non_ascii_characters() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
-fn supports_non_utf8_unix_paths() {
+fn supports_non_utf8_linux_paths() {
     use std::os::unix::ffi::OsStringExt;
 
     let (directory, path) = write_fixture(
