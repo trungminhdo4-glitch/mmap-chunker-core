@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-08-14
+
+### Added
+
+- Optional `--worker K` output selection for one zero-based CLI partition.
+- Optional `--delimiter-byte B` framing with raw byte values from 0 to 255.
+- Standalone five-platform CLI archives with matching SHA-256 checksums.
+- `cargo-binstall` release metadata for the standalone CLI assets.
+
+### Changed
+
+- The release workflow now verifies standalone CLI artifacts alongside native-library artifacts.
+
+### Release validation
+
+- Exact archive file sets, runtime CLI smoke, and Linux CLI GLIBC ceiling/runtime proof; existing native ABI and consumer guarantees remain preserved.
+
 ## [0.2.2] — 2026-08-14
 
 ### Added
