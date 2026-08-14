@@ -264,6 +264,8 @@ Install the CLI with Cargo:
 ```sh
 cargo install mmap-chunker-core
 mmap-chunker partition records.jsonl --parts 8
+# Ask an independently launched worker for only its zero-based range.
+mmap-chunker partition records.jsonl --parts 8 --worker 3
 ```
 
 `partition` writes one tab-separated numeric range per line; stdout has no header:
@@ -280,6 +282,11 @@ record-aligned; the actual range count can be lower than requested when giant
 records span multiple ideal partition positions. The input file must remain
 immutable while it is mapped. This CLI performs framing and planning only; it
 does not parse JSON or any other file format.
+
+With `--worker K`, `K` must be less than `--parts` and the CLI emits only the
+zero-based range at index `K`. This lets independently launched workers request
+their own byte range. If record-aligned boundaries collapse and no actual range
+exists at a valid index, the command succeeds with no output.
 
 ## Safety Contract
 
