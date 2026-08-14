@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-08-14
+
+### Added
+
+- `mmap-chunker partition FILE --parts N` CLI for deterministic, contiguous,
+  newline-record-aligned byte ranges emitted as numeric TSV without a header.
+- A dependency-free JSONL multiprocessing proof for independent local workers.
+
+### Changed
+
+- Repositioned the documentation around record-aligned byte-range planning for
+  immutable local files and clarified that delimiters provide raw framing, not
+  CSV/JSON parsing.
+- Centralized internal chunk-plan state without changing the public Rust or C
+  ABI surfaces.
+
+### Fixed
+
+- Corrected the POSIX `open` declaration and call shape for the variadic mode
+  argument contract.
+- Bounded extreme record-partition requests and documented the resulting
+  non-empty partition limit.
+
+### Release validation
+
+- Added independent scanner differential oracles, bounded fuzz smoke targets,
+  focused ASan FFI coverage, and exact C ABI/package-content checks.
+- Added Linux C/Python/Go/cgo/C# conformance against one native library and
+  enforced the x86_64 GNU/Linux GLIBC_2.17 packaged-artifact/runtime contract.
+- Added a decision-grade performance baseline; no scanner optimization or
+  production dependency was introduced.
+
 ## [0.2.1] — 2026-08-09
 
 ### Added

@@ -186,7 +186,7 @@ let partitions = scanner::find_partition_boundaries(data, 4, b'\n');
 
 ## Prebuilt Libraries (C / Python / Go / FFI)
 
-Verified prebuilt native libraries are published on [GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases) for releases that carry native assets (currently v0.2.1). Each platform archive contains the C header, dynamic library, static library, and licenses.
+Verified prebuilt native libraries are published on [GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases) for tagged releases that carry native assets. Each platform archive contains the C header, dynamic library, static library, and licenses.
 
 | Platform | Archive | Contents |
 |----------|---------|----------|

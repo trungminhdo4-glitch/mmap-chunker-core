@@ -1,17 +1,17 @@
 [package]
 name = "mmap-chunker-core"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.77"
-description = "Zero-dependency data chunking engine with native mmap and C-ABI"
+description = "Record-aligned byte-range planning for large immutable files with zero-copy mmap framing, CLI, and a stable C ABI."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/trungminhdo4-glitch/mmap-chunker-core"
 homepage = "https://github.com/trungminhdo4-glitch/mmap-chunker-core#readme"
 documentation = "https://docs.rs/mmap-chunker-core"
 readme = "README.md"
-keywords = ["mmap", "chunking", "ffi", "zero-copy", "c-abi"]
-categories = ["filesystem", "memory-management", "development-tools::ffi"]
-exclude = ["/native_io/", "/tests/test_native_io.py", "/tests/python_parity.py", "/AGENTS.md", "/AGENT_LOG.md", "/Cargo.lock"]
+keywords = ["mmap", "jsonl", "ndjson", "byte-ranges", "ffi"]
+categories = ["filesystem", "memory-management", "development-tools::ffi", "command-line-utilities"]
+exclude = ["/native_io/", "/tests/test_native_io.py", "/tests/python_parity.py", "/AGENTS.md", "/AGENT_LOG.md"]
 
 [lib]
 name = "mmap_chunker_core"
