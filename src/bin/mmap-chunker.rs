@@ -10,15 +10,18 @@ const HELP: &str = "\
 mmap-chunker - record-aligned byte-range planning for immutable local files
 
 Usage:
-  mmap-chunker partition FILE --parts N [--worker K]
+  mmap-chunker partition FILE --parts N [--delimiter-byte B] [--worker K]
   mmap-chunker --help
   mmap-chunker --version
 
 Commands:
-  partition    Emit newline-record-aligned byte ranges for FILE.
+  partition    Emit record-aligned byte ranges for FILE using one raw delimiter byte.
 
 Options:
   --parts N     Request N record-aligned partitions.
+  --delimiter-byte B
+                Record delimiter byte in decimal (0..255). Defaults to 10
+                (LF/newline). Raw byte framing only; no CSV/JSON quoting semantics.
   --worker K    Emit only zero-based worker K's actual partition. K must be
                 less than --parts. If record-aligned boundaries collapse and
                 no actual partition K exists, the command succeeds silently.
@@ -26,10 +29,10 @@ Options:
 Output:
   index<TAB>start<TAB>end_exclusive<TAB>length
 
-The default and only delimiter is newline (byte 0x0A). Offsets are bytes; starts
-are inclusive and ends are exclusive. The input file must remain immutable while
-it is mapped. The actual number of ranges can be lower than N when records span
-multiple ideal partition positions.\n";
+The delimiter is one raw byte; multi-byte partition delimiters are not supported.
+Offsets are bytes; starts are inclusive and ends are exclusive. The input file
+must remain immutable while it is mapped. The actual number of ranges can be
+lower than N when records span multiple ideal partition positions.\n";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1)) {
@@ -67,6 +70,8 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
 
     let mut file = None;
     let mut parts = None;
+    let mut delimiter = 0x0A;
+    let mut delimiter_seen = false;
     let mut worker = None;
     let mut index = 0;
     while index < arguments.len() {
@@ -80,6 +85,16 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
                 .get(index)
                 .ok_or_else(|| "missing value for `--parts`".to_owned())?;
             parts = Some(parse_parts(value)?);
+        } else if argument == "--delimiter-byte" {
+            if delimiter_seen {
+                return Err("duplicate option `--delimiter-byte`".to_owned());
+            }
+            delimiter_seen = true;
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--delimiter-byte`".to_owned())?;
+            delimiter = parse_delimiter_byte(value)?;
         } else if argument == "--worker" {
             if worker.is_some() {
                 return Err("duplicate option `--worker`".to_owned());
@@ -109,9 +124,9 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
         if worker >= parts {
             return Err("`--worker` must be less than `--parts`".to_owned());
         }
-        emit_partitions(file, parts, Some(worker))
+        emit_partitions(file, parts, delimiter, Some(worker))
     } else {
-        emit_partitions(file, parts, None)
+        emit_partitions(file, parts, delimiter, None)
     }
 }
 
@@ -140,11 +155,40 @@ fn parse_worker(value: &OsStr) -> Result<usize, String> {
         })
 }
 
-fn emit_partitions(path: PathBuf, parts: usize, worker: Option<usize>) -> Result<(), String> {
+fn parse_delimiter_byte(value: &OsStr) -> Result<u8, String> {
+    let value_text = value.to_str().ok_or_else(|| {
+        "`--delimiter-byte` must be a decimal byte in the range 0..255".to_owned()
+    })?;
+    if value_text.is_empty() || !value_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "invalid value for `--delimiter-byte`: `{}` (expected decimal byte 0..255)",
+            value.to_string_lossy()
+        ));
+    }
+    let parsed = value_text.parse::<u16>().map_err(|_| {
+        format!(
+            "invalid value for `--delimiter-byte`: `{}` (expected decimal byte 0..255)",
+            value.to_string_lossy()
+        )
+    })?;
+    u8::try_from(parsed).map_err(|_| {
+        format!(
+            "invalid value for `--delimiter-byte`: `{}` (expected decimal byte 0..255)",
+            value.to_string_lossy()
+        )
+    })
+}
+
+fn emit_partitions(
+    path: PathBuf,
+    parts: usize,
+    delimiter: u8,
+    worker: Option<usize>,
+) -> Result<(), String> {
     // Safety: the CLI's contract requires the input file to remain immutable while mapped.
     let mut chunker = unsafe { MmapChunker::open(&path) }
         .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    let count = chunker.partition_records(parts, b'\n');
+    let count = chunker.partition_records(parts, delimiter);
     let source = chunker.as_bytes();
     let base = source.as_ptr();
     let stdout = io::stdout();
@@ -175,7 +219,7 @@ fn emit_partitions(path: PathBuf, parts: usize, worker: Option<usize>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_parts, parse_worker};
+    use super::{parse_delimiter_byte, parse_parts, parse_worker};
     use std::ffi::OsStr;
 
     #[test]
@@ -191,5 +235,18 @@ mod tests {
         assert_eq!(parse_worker(OsStr::new("3")), Ok(3));
         assert!(parse_worker(OsStr::new("-1")).is_err());
         assert!(parse_worker(OsStr::new("nope")).is_err());
+    }
+
+    #[test]
+    fn delimiter_byte_accepts_only_decimal_u8_values() {
+        assert_eq!(parse_delimiter_byte(OsStr::new("0")), Ok(0));
+        assert_eq!(parse_delimiter_byte(OsStr::new("10")), Ok(10));
+        assert_eq!(parse_delimiter_byte(OsStr::new("000")), Ok(0));
+        assert_eq!(parse_delimiter_byte(OsStr::new("255")), Ok(255));
+        assert!(parse_delimiter_byte(OsStr::new("-1")).is_err());
+        assert!(parse_delimiter_byte(OsStr::new("256")).is_err());
+        assert!(parse_delimiter_byte(OsStr::new("0x0a")).is_err());
+        assert!(parse_delimiter_byte(OsStr::new("+10")).is_err());
+        assert!(parse_delimiter_byte(OsStr::new("nope")).is_err());
     }
 }

@@ -5,6 +5,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+type BinaryDelimiterCase<'a> = (&'a str, &'a [u8], u8, &'a str, Option<usize>);
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_mmap-chunker")
@@ -31,6 +32,24 @@ fn run(arguments: &[&std::ffi::OsStr]) -> Output {
     Command::new(binary()).args(arguments).output().unwrap()
 }
 
+fn run_partition(path: &Path, parts: &str, delimiter: Option<u8>, worker: Option<usize>) -> Output {
+    let mut arguments = vec![
+        OsString::from("partition"),
+        path.as_os_str().to_owned(),
+        OsString::from("--parts"),
+        OsString::from(parts),
+    ];
+    if let Some(delimiter) = delimiter {
+        arguments.push(OsString::from("--delimiter-byte"));
+        arguments.push(OsString::from(delimiter.to_string()));
+    }
+    if let Some(worker) = worker {
+        arguments.push(OsString::from("--worker"));
+        arguments.push(OsString::from(worker.to_string()));
+    }
+    Command::new(binary()).args(arguments).output().unwrap()
+}
+
 fn parse_ranges(stdout: &[u8]) -> Vec<(usize, usize, usize, usize)> {
     let text = std::str::from_utf8(stdout).unwrap();
     text.lines()
@@ -47,14 +66,9 @@ fn parse_ranges(stdout: &[u8]) -> Vec<(usize, usize, usize, usize)> {
         .collect()
 }
 
-fn assert_worker_projection_oracle(path: &Path, parts: usize) {
+fn assert_worker_projection_oracle(path: &Path, parts: usize, delimiter: Option<u8>) {
     let parts_text = parts.to_string();
-    let full = run(&[
-        std::ffi::OsStr::new("partition"),
-        path.as_os_str(),
-        std::ffi::OsStr::new("--parts"),
-        std::ffi::OsStr::new(&parts_text),
-    ]);
+    let full = run_partition(path, &parts_text, delimiter, None);
     assert!(
         full.status.success(),
         "stderr: {}",
@@ -64,15 +78,7 @@ fn assert_worker_projection_oracle(path: &Path, parts: usize) {
     let ranges = parse_ranges(&full.stdout);
 
     for worker in 0..parts {
-        let worker_text = worker.to_string();
-        let selected = run(&[
-            std::ffi::OsStr::new("partition"),
-            path.as_os_str(),
-            std::ffi::OsStr::new("--parts"),
-            std::ffi::OsStr::new(&parts_text),
-            std::ffi::OsStr::new("--worker"),
-            std::ffi::OsStr::new(&worker_text),
-        ]);
+        let selected = run_partition(path, &parts_text, delimiter, Some(worker));
         assert!(
             selected.status.success(),
             "worker {worker} stderr: {}",
@@ -93,24 +99,24 @@ fn assert_worker_projection_oracle(path: &Path, parts: usize) {
 }
 
 fn assert_partition_oracle(path: &Path, parts: &str, expected_count: Option<usize>) {
-    let first = run(&[
-        std::ffi::OsStr::new("partition"),
-        path.as_os_str(),
-        std::ffi::OsStr::new("--parts"),
-        std::ffi::OsStr::new(parts),
-    ]);
+    assert_partition_oracle_with_delimiter(path, parts, None, b'\n', expected_count);
+}
+
+fn assert_partition_oracle_with_delimiter(
+    path: &Path,
+    parts: &str,
+    delimiter: Option<u8>,
+    expected_delimiter: u8,
+    expected_count: Option<usize>,
+) {
+    let first = run_partition(path, parts, delimiter, None);
     assert!(
         first.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(first.stderr.is_empty());
-    let second = run(&[
-        std::ffi::OsStr::new("partition"),
-        path.as_os_str(),
-        std::ffi::OsStr::new("--parts"),
-        std::ffi::OsStr::new(parts),
-    ]);
+    let second = run_partition(path, parts, delimiter, None);
     assert_eq!(
         first.stdout, second.stdout,
         "CLI output was not deterministic"
@@ -135,7 +141,11 @@ fn assert_partition_oracle(path: &Path, parts: &str, expected_count: Option<usiz
         assert!(end <= source.len());
         reconstructed.extend_from_slice(&source[start..end]);
         if index + 1 < ranges.len() {
-            assert_eq!(source[end - 1], b'\n', "range {index} split a record");
+            assert_eq!(
+                source[end - 1],
+                expected_delimiter,
+                "range {index} split a record"
+            );
         }
         cursor = end;
     }
@@ -175,9 +185,113 @@ fn partitions_cover_representative_record_layouts() {
     for (label, contents, parts, expected_count) in cases {
         let (directory, path) = write_fixture(label, OsString::from("records.jsonl"), contents);
         assert_partition_oracle(&path, parts, *expected_count);
-        assert_worker_projection_oracle(&path, parts.parse().unwrap());
+        assert_worker_projection_oracle(&path, parts.parse().unwrap(), None);
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn configurable_delimiter_covers_required_bytes_and_default_equivalence() {
+    let cases: &[(&str, &[u8], u8, &str)] = &[
+        ("lf", b"one\ntwo\nthree\n", b'\n', "records.txt"),
+        (
+            "nul",
+            &[0x01, 0x00, 0xFE, 0x02, 0x00, 0x00, 0x80, 0x00],
+            0x00,
+            "records.bin",
+        ),
+        ("comma", b"left,right,,tail", b',', "records.bin"),
+        ("pipe", b"left|middle||tail", b'|', "records.bin"),
+        (
+            "ff",
+            &[0x00, 0xFF, 0x10, 0xFF, 0xFF, 0x80],
+            0xFF,
+            "records.bin",
+        ),
+    ];
+
+    for (label, contents, delimiter, name) in cases {
+        let (directory, path) = write_fixture(label, OsString::from(name), contents);
+        assert_partition_oracle_with_delimiter(&path, "8", Some(*delimiter), *delimiter, None);
+        assert_worker_projection_oracle(&path, 8, Some(*delimiter));
+
+        if *delimiter == b'\n' {
+            let default = run_partition(&path, "8", None, None);
+            let explicit = run_partition(&path, "8", Some(0x0A), None);
+            assert!(default.status.success());
+            assert!(explicit.status.success());
+            assert_eq!(default.stdout, explicit.stdout);
+            assert_eq!(default.stderr, explicit.stderr);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn configurable_delimiter_covers_binary_and_boundary_edge_cases() {
+    let cases: &[BinaryDelimiterCase<'_>] = &[
+        ("empty_binary", b"", 0xFF, "8", Some(0)),
+        ("no_delimiter", &[0x01, 0x02, 0x03], 0x00, "4", Some(1)),
+        ("every_byte_delimiter", &[0, 0, 0, 0], 0x00, "8", None),
+        (
+            "delimiter_at_start_and_eof",
+            &[0, 0x10, 0x20, 0],
+            0x00,
+            "2",
+            None,
+        ),
+        ("no_final_delimiter", b"aa\0bb\0cc", 0x00, "4", None),
+        (
+            "giant_record",
+            &[0x10, 0x10, 0x10, 0x10, 0x10, 0x7C, 0x01, 0x7C],
+            0x7C,
+            "8",
+            None,
+        ),
+        (
+            "sparse_delimiters",
+            &[0x20, 0x20, 0x20, 0x20, 0x2C, 0x01, 0x2C],
+            b',',
+            "8",
+            None,
+        ),
+    ];
+
+    for (label, contents, delimiter, parts, expected_count) in cases {
+        let (directory, path) =
+            write_fixture(label, OsString::from("binary records.bin"), contents);
+        assert_partition_oracle_with_delimiter(
+            &path,
+            parts,
+            Some(*delimiter),
+            *delimiter,
+            *expected_count,
+        );
+        assert_worker_projection_oracle(&path, parts.parse().unwrap(), Some(*delimiter));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn cr_delimiter_is_single_byte_not_crlf() {
+    let (directory, path) = write_fixture(
+        "crlf_semantics",
+        OsString::from("records-ä.txt"),
+        b"a\r\nb\r\nc\r\n",
+    );
+    let output = run_partition(&path, "2", Some(0x0D), None);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ranges = parse_ranges(&output.stdout);
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].2, 5);
+    let source = fs::read(&path).unwrap();
+    assert_eq!(source[ranges[0].2 - 1], 0x0D);
+    assert_eq!(source[ranges[0].2], 0x0A);
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -188,7 +302,7 @@ fn supports_paths_with_spaces_and_non_ascii_characters() {
         b"first\nsecond\nthird\n",
     );
     assert_partition_oracle(&path, "2", Some(2));
-    assert_worker_projection_oracle(&path, 2);
+    assert_worker_projection_oracle(&path, 2, None);
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -203,7 +317,7 @@ fn supports_non_utf8_linux_paths() {
         b"first\nsecond\n",
     );
     assert_partition_oracle(&path, "2", None);
-    assert_worker_projection_oracle(&path, 2);
+    assert_worker_projection_oracle(&path, 2, None);
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -216,6 +330,55 @@ fn reports_invalid_invocations_to_stderr() {
         &["partition", "records.jsonl", "--parts", "nope"],
         &["partition", "records.jsonl", "--parts", "0"],
         &["partition", "records.jsonl", "--parts", "1", "--parts", "2"],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+        ],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+            "nope",
+        ],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+            "-1",
+        ],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+            "256",
+        ],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+            "0x0a",
+        ],
+        &[
+            "partition",
+            "records.jsonl",
+            "--parts",
+            "1",
+            "--delimiter-byte",
+            "10",
+            "--delimiter-byte",
+            "10",
+        ],
         &["partition", "records.jsonl", "--parts", "1", "--worker"],
         &[
             "partition",
@@ -361,6 +524,10 @@ fn help_and_version_are_available() {
     assert!(help.stderr.is_empty());
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("Usage:"));
+    assert!(help_text.contains("--delimiter-byte B"));
+    assert!(help_text.contains("0..255"));
+    assert!(help_text.contains("Raw byte framing only"));
+    assert!(help_text.contains("multi-byte partition delimiters are not supported"));
     assert!(help_text.contains("--worker K"));
     assert!(help_text.contains("no actual partition K exists"));
 
