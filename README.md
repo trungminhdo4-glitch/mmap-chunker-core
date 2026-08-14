@@ -266,6 +266,8 @@ cargo install mmap-chunker-core
 mmap-chunker partition records.jsonl --parts 8
 # Ask an independently launched worker for only its zero-based range.
 mmap-chunker partition records.jsonl --parts 8 --worker 3
+# Partition binary records on the NUL byte.
+mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
 ```
 
 `partition` writes one tab-separated numeric range per line; stdout has no header:
@@ -276,12 +278,14 @@ mmap-chunker partition records.jsonl --parts 8 --worker 3
 ```
 
 Offsets are bytes. Starts are inclusive and ends are exclusive, so
-`end_exclusive - start == length`. The default (and current only) record
-delimiter is newline byte `0x0A`. Ranges are deterministic, contiguous, and
-record-aligned; the actual range count can be lower than requested when giant
-records span multiple ideal partition positions. The input file must remain
-immutable while it is mapped. This CLI performs framing and planning only; it
-does not parse JSON or any other file format.
+`end_exclusive - start == length`. The default record delimiter remains newline
+byte `0x0A`. `--delimiter-byte B` accepts one decimal raw byte in the range
+`0..255`, including arbitrary binary delimiters such as NUL and `0xFF`. Ranges
+are deterministic, contiguous, and record-aligned; the actual range count can
+be lower than requested when giant records span multiple ideal partition
+positions. This is framing and planning only, not CSV/JSON parsing; multi-byte
+partition delimiters are not supported. The input file must remain immutable
+while it is mapped.
 
 With `--worker K`, `K` must be less than `--parts` and the CLI emits only the
 zero-based range at index `K`. This lets independently launched workers request
