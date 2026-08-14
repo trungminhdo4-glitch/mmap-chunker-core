@@ -31,7 +31,10 @@ Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`:
 - Validates tag == `Cargo.toml` version
 - Creates a draft GitHub Release
 - Matrix-builds 5 platforms (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64)
-- Uploads per-platform archives (header + dynamic + static library) + sha256 checksums
+- Uploads 5 native-library archives (header + dynamic + static library) and 5
+  standalone CLI archives, each with a sha256 checksum sidecar
+- The draft release therefore contains 20 assets: 10 native-library assets and
+  10 standalone CLI assets
 
 The draft is published manually after review. crates.io publish remains a separate manual step (see Publish Order below).
 

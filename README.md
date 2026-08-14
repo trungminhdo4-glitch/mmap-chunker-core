@@ -292,6 +292,25 @@ zero-based range at index `K`. This lets independently launched workers request
 their own byte range. If record-aligned boundaries collapse and no actual range
 exists at a valid index, the command succeeds with no output.
 
+### Installing the standalone CLI
+
+Rust users can install the CLI from source with Cargo:
+
+```sh
+cargo install mmap-chunker-core
+```
+
+Standalone users can download the matching
+`mmap-chunker-<version>-<target>.tar.gz` (or Windows `.zip`) archive from
+[GitHub Releases](https://github.com/trungminhdo4-glitch/mmap-chunker-core/releases),
+verify its `.sha256` sidecar, extract it, and run `mmap-chunker`. The archive
+contains only the executable and the MIT/Apache license files; it does not
+include the native-library package.
+
+Once a crate release carrying this metadata is published, users with
+`cargo-binstall` can run `cargo binstall mmap-chunker-core`; it will use the
+prebuilt CLI when an archive exists for the target.
+
 ## Safety Contract
 
 - **Handle owns all resources**: mmap, chunk metadata. Freed with `mmap_engine_free`.

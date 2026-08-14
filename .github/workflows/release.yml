@@ -362,15 +362,160 @@ jobs:
             fi
           fi
 
+          echo "=== Standalone CLI package ==="
+          CLI_ARCHIVE="mmap-chunker-${RELEASE_VERSION}-${{ matrix.target }}"
+          CLI_STAGING="cli-staging"
+          rm -rf "$CLI_STAGING"
+          mkdir -p "$CLI_STAGING"
+          case "${{ runner.os }}" in
+            Windows) CLI_BINARY_NAME="mmap-chunker.exe" ;;
+            *) CLI_BINARY_NAME="mmap-chunker" ;;
+          esac
+          CLI_BINARY="target/${{ matrix.target }}/release/$CLI_BINARY_NAME"
+          test -f "$CLI_BINARY"
+          cp "$CLI_BINARY" "$CLI_STAGING/$CLI_BINARY_NAME"
+          cp LICENSE-MIT LICENSE-APACHE "$CLI_STAGING/"
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x "$CLI_STAGING/$CLI_BINARY_NAME"
+          fi
+
+          case "${{ runner.os }}" in
+            Windows)
+              (cd "$CLI_STAGING" && 7z a -tzip -mx=9 "../${CLI_ARCHIVE}.zip" \
+                "$CLI_BINARY_NAME" LICENSE-MIT LICENSE-APACHE >/dev/null)
+              sha256sum "${CLI_ARCHIVE}.zip" > "${CLI_ARCHIVE}.zip.sha256"
+              CLI_CHECKSUM_FILE="${CLI_ARCHIVE}.zip.sha256"
+              CLI_PACKAGE="${CLI_ARCHIVE}.zip"
+              ;;
+            macOS)
+              tar czf "${CLI_ARCHIVE}.tar.gz" -C "$CLI_STAGING" \
+                "$CLI_BINARY_NAME" LICENSE-MIT LICENSE-APACHE
+              shasum -a 256 "${CLI_ARCHIVE}.tar.gz" > "${CLI_ARCHIVE}.tar.gz.sha256"
+              CLI_CHECKSUM_FILE="${CLI_ARCHIVE}.tar.gz.sha256"
+              CLI_PACKAGE="${CLI_ARCHIVE}.tar.gz"
+              ;;
+            Linux)
+              tar czf "${CLI_ARCHIVE}.tar.gz" -C "$CLI_STAGING" \
+                "$CLI_BINARY_NAME" LICENSE-MIT LICENSE-APACHE
+              sha256sum "${CLI_ARCHIVE}.tar.gz" > "${CLI_ARCHIVE}.tar.gz.sha256"
+              CLI_CHECKSUM_FILE="${CLI_ARCHIVE}.tar.gz.sha256"
+              CLI_PACKAGE="${CLI_ARCHIVE}.tar.gz"
+              ;;
+          esac
+
+          echo "=== CLI checksum verification ==="
+          case "${{ runner.os }}" in
+            macOS) shasum -a 256 -c "$CLI_CHECKSUM_FILE" ;;
+            *) sha256sum -c "$CLI_CHECKSUM_FILE" ;;
+          esac
+
+          echo "=== Fresh CLI archive extraction ==="
+          CLI_ARCHIVE_ROOT="$VERIFY_ROOT/cli-extracted"
+          mkdir "$CLI_ARCHIVE_ROOT"
+          case "${{ runner.os }}" in
+            Windows) 7z x -y "$CLI_PACKAGE" "-o$CLI_ARCHIVE_ROOT" >/dev/null ;;
+            *) tar xzf "$CLI_PACKAGE" -C "$CLI_ARCHIVE_ROOT" ;;
+          esac
+          test -f "$CLI_ARCHIVE_ROOT/$CLI_BINARY_NAME"
+          test -f "$CLI_ARCHIVE_ROOT/LICENSE-MIT"
+          test -f "$CLI_ARCHIVE_ROOT/LICENSE-APACHE"
+          printf '%s\n' "$CLI_BINARY_NAME" LICENSE-MIT LICENSE-APACHE \
+            | sort > "$VERIFY_ROOT/expected-cli-files"
+          (
+            cd "$CLI_ARCHIVE_ROOT"
+            find . -type f -print | sed 's#^\./##' | sort
+          ) > "$VERIFY_ROOT/actual-cli-files"
+          diff -u "$VERIFY_ROOT/expected-cli-files" "$VERIFY_ROOT/actual-cli-files"
+
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            echo "SKIP: native CLI runtime checks for aarch64 artifact"
+          else
+            CLI_EXTRACTED="$CLI_ARCHIVE_ROOT/$CLI_BINARY_NAME"
+            if [ "${{ runner.os }}" != "Windows" ]; then
+              test -x "$CLI_EXTRACTED"
+            fi
+            test "$("$CLI_EXTRACTED" --version)" = "mmap-chunker $RELEASE_VERSION"
+            "$CLI_EXTRACTED" --help >/dev/null
+            CLI_FIXTURE="$VERIFY_ROOT/cli-fixture.bin"
+            printf 'aa,bb,cc,dd' > "$CLI_FIXTURE"
+            printf '0\t0\t6\t6\n1\t6\t11\t5\n' > "$VERIFY_ROOT/expected-cli-output"
+            "$CLI_EXTRACTED" partition "$CLI_FIXTURE" --parts 2 --delimiter-byte 44 \
+              > "$VERIFY_ROOT/actual-cli-output"
+            diff -u "$VERIFY_ROOT/expected-cli-output" "$VERIFY_ROOT/actual-cli-output"
+            echo "PASS: extracted CLI --version, --help, and partition smoke tests"
+          fi
+
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            CLI_GLIBC_VERSIONS=$(readelf --version-info "$CLI_ARCHIVE_ROOT/$CLI_BINARY_NAME" \
+              | grep -oE 'GLIBC_[0-9.]+' | sort -Vu || true)
+            printf '%s\n' "$CLI_GLIBC_VERSIONS"
+            CLI_MAX_GLIBC=$(printf '%s\n' "$CLI_GLIBC_VERSIONS" | sort -V | tail -n 1)
+            if [ -z "$CLI_MAX_GLIBC" ]; then
+              echo "ERROR: extracted Linux CLI has no GLIBC version inventory"
+              exit 1
+            fi
+            if ! awk -v found="$CLI_MAX_GLIBC" -v declared="GLIBC_2.17" '
+              BEGIN {
+                sub(/^GLIBC_/, "", found)
+                sub(/^GLIBC_/, "", declared)
+                split(found, f, ".")
+                split(declared, d, ".")
+                exit !(f[1] < d[1] || (f[1] == d[1] && f[2] <= d[2]))
+              }
+            '; then
+              echo "ERROR: extracted Linux CLI requires $CLI_MAX_GLIBC, above GLIBC_2.17"
+              exit 1
+            fi
+            echo "PASS: extracted Linux CLI is at or below GLIBC_2.17"
+
+            echo "=== Extracted CLI GLIBC 2.17 runtime conformance ==="
+            docker run --rm \
+              -v "$VERIFY_ROOT:/verify:ro" \
+              -e RELEASE_VERSION="$RELEASE_VERSION" \
+              "$GLIBC_217_RUNTIME_IMAGE" \
+              bash -lc '
+                set -euo pipefail
+                glibc_version=$(ldd --version 2>&1)
+                printf "%s\\n" "$glibc_version"
+                case "$glibc_version" in
+                  *"GNU libc) 2.17"*) ;;
+                  *)
+                    echo "ERROR: runtime environment is not GNU libc 2.17"
+                    exit 1
+                    ;;
+                esac
+
+                cli=/verify/cli-extracted/mmap-chunker
+                test -x "$cli"
+                test "$("$cli" --version)" = "mmap-chunker $RELEASE_VERSION"
+                "$cli" --help >/dev/null
+                work_dir=$(mktemp -d)
+                trap "rm -rf \"$work_dir\"" EXIT
+                printf "aa,bb,cc,dd" > "$work_dir/cli-fixture.bin"
+                printf "0\\t0\\t6\\t6\\n1\\t6\\t11\\t5\\n" > "$work_dir/expected-cli-output"
+                "$cli" partition "$work_dir/cli-fixture.bin" --parts 2 --delimiter-byte 44 \
+                  > "$work_dir/actual-cli-output"
+                diff -u "$work_dir/expected-cli-output" "$work_dir/actual-cli-output"
+                echo "PASS: extracted CLI ran under GNU libc 2.17"
+              '
+          fi
+
           echo "=== Archive contents ==="
           case "${{ runner.os }}" in
             Windows) 7z l "$PACKAGE" ;;
             *) tar tzf "$PACKAGE" ;;
           esac
+          echo "=== CLI archive contents ==="
+          case "${{ runner.os }}" in
+            Windows) 7z l "$CLI_PACKAGE" ;;
+            *) tar tzf "$CLI_PACKAGE" ;;
+          esac
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             echo "PASS: $PACKAGE has verified checksum, contents, ABI, and package-only aarch64 coverage"
+            echo "PASS: $CLI_PACKAGE has verified checksum, contents, and package-only aarch64 coverage"
           else
             echo "PASS: $PACKAGE has verified checksum, contents, ABI, C, and ctypes coverage"
+            echo "PASS: $CLI_PACKAGE has verified checksum, contents, and runtime smoke coverage"
           fi
 
       - name: Upload verified artifact for release or dry run
@@ -381,6 +526,9 @@ jobs:
             mmap-chunker-core-*.tar.gz
             mmap-chunker-core-*.zip
             mmap-chunker-core-*.sha256
+            mmap-chunker-[0-9]*.tar.gz
+            mmap-chunker-[0-9]*.zip
+            mmap-chunker-[0-9]*.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -403,7 +551,9 @@ jobs:
         run: |
           set -euo pipefail
           find dist -maxdepth 1 -type f -print
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 10
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 20
+          test "$(find dist -maxdepth 1 -type f -name 'mmap-chunker-core-*' | wc -l)" -eq 10
+          test "$(find dist -maxdepth 1 -type f -name 'mmap-chunker-[0-9]*' | wc -l)" -eq 10
 
       - name: Create draft release and upload artifacts
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -414,9 +564,11 @@ jobs:
           body: |
             ## mmap-chunker-core v${{ needs.prepare.outputs.version }}
 
-            Prebuilt native libraries for C, Python, Go, and other FFI consumers.
+            Prebuilt native libraries for C, Python, Go, and other FFI consumers,
+            plus standalone `mmap-chunker` CLI archives.
 
-            Each archive contains the C header, dynamic library, static library, and licenses.
+            Native archives contain the C header, dynamic library, static library, and licenses.
+            CLI archives contain the versioned `mmap-chunker` executable and licenses.
             Every archive has an accompanying `.sha256` checksum file.
           generate_release_notes: true
           files: |
