@@ -257,6 +257,30 @@ worker startup, processing, and end-to-end wall time separately. Process startup
 and application parsing can dominate small workloads, so the example makes no
 universal multiprocessing speed claim.
 
+## Command-line partitioning
+
+Install the CLI with Cargo:
+
+```sh
+cargo install mmap-chunker-core
+mmap-chunker partition records.jsonl --parts 8
+```
+
+`partition` writes one tab-separated numeric range per line; stdout has no header:
+
+```text
+0	0	12739120	12739120
+1	12739120	25478291	12739171
+```
+
+Offsets are bytes. Starts are inclusive and ends are exclusive, so
+`end_exclusive - start == length`. The default (and current only) record
+delimiter is newline byte `0x0A`. Ranges are deterministic, contiguous, and
+record-aligned; the actual range count can be lower than requested when giant
+records span multiple ideal partition positions. The input file must remain
+immutable while it is mapped. This CLI performs framing and planning only; it
+does not parse JSON or any other file format.
+
 ## Safety Contract
 
 - **Handle owns all resources**: mmap, chunk metadata. Freed with `mmap_engine_free`.
