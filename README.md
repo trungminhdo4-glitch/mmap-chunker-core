@@ -292,6 +292,47 @@ zero-based range at index `K`. This lets independently launched workers request
 their own byte range. If record-aligned boundaries collapse and no actual range
 exists at a valid index, the command succeeds with no output.
 
+### Ordered multi-file logical dataset proof
+
+The CLI also contains a deliberately small composition proof for an ordered set
+of independent local files:
+
+```sh
+mmap-chunker partition-files --parts 8 file-a.jsonl file-b.jsonl file-c.jsonl
+# The delimiter option is the same raw single-byte framing contract:
+mmap-chunker partition-files --parts 8 --delimiter-byte 0 file-a.bin file-b.bin
+```
+
+`partition-files` accepts only the explicitly ordered file paths shown on the
+command line. Each input is mapped independently and remains a separate source;
+the CLI does not concatenate files, copy them into a temporary file, or create a
+virtual contiguous address space. Duplicate paths are valid and are treated as
+distinct sources in the order supplied. Directory traversal, globbing, stdin,
+manifests, and watching are not part of this proof.
+
+Its headerless TSV output has exactly five fields per row:
+
+```text
+worker_index<TAB>source_index<TAB>start<TAB>end_exclusive<TAB>length
+```
+
+`source_index` is the zero-based input argument index. `start` is inclusive and
+`end_exclusive` is exclusive local byte offset within that source, and
+`end_exclusive - start == length`. Rows are ordered by compact zero-based
+`worker_index`, then by ascending `source_index`; a worker can therefore emit
+multiple source ranges. Empty sources produce no rows. A dataset containing only
+empty sources succeeds with empty stdout. Omitting all source paths is an error.
+
+The planner computes ideal worker targets over the sum of all source lengths. A
+target at a file boundary is kept because file boundaries are valid logical
+segment boundaries. A target inside a source is projected forward to the next
+single-byte delimiter boundary, or to that source's EOF when no delimiter
+remains. Records never cross a source boundary or a worker boundary. The actual
+worker count can be lower than `--parts` when multiple ideal targets fall inside
+one record; `worker_index` is then compacted to the workers that received bytes.
+The result is deterministic. This is planning/framing only: record alignment can
+dominate the ideal byte targets, so no universal balance guarantee is implied.
+
 ### Installing the standalone CLI
 
 Rust users can install the CLI from source with Cargo:
