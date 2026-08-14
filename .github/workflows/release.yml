@@ -239,7 +239,6 @@ jobs:
             docker run --rm \
               -v "$VERIFY_ROOT:/verify:ro" \
               -v "$GITHUB_WORKSPACE:/source:ro" \
-              -e RELEASE_VERSION="$RELEASE_VERSION" \
               "$GLIBC_217_RUNTIME_IMAGE" \
               bash -lc '
                 set -euo pipefail
@@ -270,17 +269,6 @@ jobs:
                   /source/tests/conformance/expected.txt "$work_dir/result.txt"
                 diff -u /source/tests/conformance/expected.txt "$work_dir/result.txt"
                 echo "PASS: packaged artifact ran under GNU libc 2.17"
-
-                cli=/verify/cli-extracted/mmap-chunker
-                test -x "$cli"
-                test "$("$cli" --version)" = "mmap-chunker $RELEASE_VERSION"
-                "$cli" --help >/dev/null
-                printf "aa,bb,cc,dd" > "$work_dir/cli-fixture.bin"
-                printf "0\t0\t6\t6\n1\t6\t11\t5\n" > "$work_dir/expected-cli-output"
-                "$cli" partition "$work_dir/cli-fixture.bin" --parts 2 --delimiter-byte 44 \
-                  > "$work_dir/actual-cli-output"
-                diff -u "$work_dir/expected-cli-output" "$work_dir/actual-cli-output"
-                echo "PASS: extracted CLI ran under GNU libc 2.17"
               '
           fi
 
@@ -387,6 +375,9 @@ jobs:
           test -f "$CLI_BINARY"
           cp "$CLI_BINARY" "$CLI_STAGING/$CLI_BINARY_NAME"
           cp LICENSE-MIT LICENSE-APACHE "$CLI_STAGING/"
+          if [ "${{ runner.os }}" != "Windows" ]; then
+            chmod +x "$CLI_STAGING/$CLI_BINARY_NAME"
+          fi
 
           case "${{ runner.os }}" in
             Windows)
@@ -476,6 +467,37 @@ jobs:
               exit 1
             fi
             echo "PASS: extracted Linux CLI is at or below GLIBC_2.17"
+
+            echo "=== Extracted CLI GLIBC 2.17 runtime conformance ==="
+            docker run --rm \
+              -v "$VERIFY_ROOT:/verify:ro" \
+              -e RELEASE_VERSION="$RELEASE_VERSION" \
+              "$GLIBC_217_RUNTIME_IMAGE" \
+              bash -lc '
+                set -euo pipefail
+                glibc_version=$(ldd --version 2>&1)
+                printf "%s\\n" "$glibc_version"
+                case "$glibc_version" in
+                  *"GNU libc) 2.17"*) ;;
+                  *)
+                    echo "ERROR: runtime environment is not GNU libc 2.17"
+                    exit 1
+                    ;;
+                esac
+
+                cli=/verify/cli-extracted/mmap-chunker
+                test -x "$cli"
+                test "$("$cli" --version)" = "mmap-chunker $RELEASE_VERSION"
+                "$cli" --help >/dev/null
+                work_dir=$(mktemp -d)
+                trap "rm -rf \"$work_dir\"" EXIT
+                printf "aa,bb,cc,dd" > "$work_dir/cli-fixture.bin"
+                printf "0\\t0\\t6\\t6\\n1\\t6\\t11\\t5\\n" > "$work_dir/expected-cli-output"
+                "$cli" partition "$work_dir/cli-fixture.bin" --parts 2 --delimiter-byte 44 \
+                  > "$work_dir/actual-cli-output"
+                diff -u "$work_dir/expected-cli-output" "$work_dir/actual-cli-output"
+                echo "PASS: extracted CLI ran under GNU libc 2.17"
+              '
           fi
 
           echo "=== Archive contents ==="
