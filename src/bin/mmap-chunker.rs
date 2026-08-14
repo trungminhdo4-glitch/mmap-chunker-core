@@ -273,7 +273,9 @@ fn plan_logical_partitions(
     // still performed in u128 so many independent files compose safely.
     let effective_parts = requested_parts.min(usize::try_from(total).unwrap_or(usize::MAX));
     let mut states = vec![BoundarySearchState::default(); sources.len()];
-    let mut cut_points = Vec::with_capacity(effective_parts.saturating_sub(1));
+    // Do not reserve one entry per requested partition up front: a giant
+    // record or a sparse delimiter layout may collapse almost every target.
+    let mut cut_points = Vec::new();
     let mut last_cut = 0u128;
 
     for partition in 1..effective_parts {

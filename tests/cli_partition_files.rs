@@ -227,7 +227,7 @@ fn proves_empty_sources_no_final_delimiter_and_partition_count_edges() {
         &[b"", b"", b"one\n", b"two\nthree", b"single record"],
     );
     assert_dataset_oracle(&paths, 1, None);
-    let rows = assert_dataset_oracle(&paths, 32, None);
+    let rows = assert_dataset_oracle(&paths, usize::MAX, None);
     assert!(
         rows.len() <= 5,
         "record alignment should collapse excess targets"
@@ -318,6 +318,21 @@ fn rejects_empty_file_list_missing_paths_and_invalid_options() {
         .output()
         .unwrap();
     assert!(!unexpected_worker.status.success());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn opens_all_sources_before_emitting_machine_readable_output() {
+    let (directory, paths) = write_sources("atomic_open", &[b"first\n", b"second\n"]);
+    let missing = directory.join("missing-middle.dat");
+    let output = run_partition_files(&[&paths[0], &paths[1], &missing], 3, None);
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "open failures must not emit TSV rows"
+    );
+    assert!(!output.stderr.is_empty());
     fs::remove_dir_all(directory).unwrap();
 }
 
