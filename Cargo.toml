@@ -13,6 +13,15 @@ keywords = ["mmap", "jsonl", "ndjson", "byte-ranges", "ffi"]
 categories = ["filesystem", "memory-management", "development-tools::ffi", "command-line-utilities"]
 exclude = ["/native_io/", "/tests/test_native_io.py", "/tests/python_parity.py", "/AGENTS.md", "/AGENT_LOG.md"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mmap-chunker-{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/mmap-chunker-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [lib]
 name = "mmap_chunker_core"
 crate-type = ["lib", "staticlib", "cdylib"]
