@@ -155,7 +155,7 @@ fn supports_non_utf8_unix_paths() {
         OsString::from_vec(b"records-\xff.jsonl".to_vec()),
         b"first\nsecond\n",
     );
-    assert_partition_oracle(&path, "2", Some(2));
+    assert_partition_oracle(&path, "2", None);
     fs::remove_dir_all(directory).unwrap();
 }
 
