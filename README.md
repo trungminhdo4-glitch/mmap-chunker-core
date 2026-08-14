@@ -266,12 +266,11 @@ cargo install mmap-chunker-core
 mmap-chunker partition records.jsonl --parts 8
 ```
 
-`partition` writes one tab-separated range per line:
+`partition` writes one tab-separated numeric range per line; stdout has no header:
 
 ```text
-index    start    end_exclusive    length
-0        0        12739120         12739120
-1        12739120 25478291         12739171
+0	0	12739120	12739120
+1	12739120	25478291	12739171
 ```
 
 Offsets are bytes. Starts are inclusive and ends are exclusive, so
