@@ -17,13 +17,9 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
-import inspect
 import json
-import multiprocessing as mp
 import os
 from pathlib import Path
-import platform
-import queue
 import subprocess
 import sys
 import tempfile
@@ -31,18 +27,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import jsonl_multi_file_workers as reference
+from jsonl_multi_file_workers import RangeRow, decode_records, execute_workers
+from jsonl_multi_file_workers import group_rows_by_worker, parse_plan
+
 
 MAX_SUPPORTED_WORKERS = 16
 DEFAULT_DELIMITER = 0x0A
-
-
-@dataclass(frozen=True)
-class RangeRow:
-    worker_index: int
-    source_index: int
-    start: int
-    end_exclusive: int
-    length: int
 
 
 @dataclass(frozen=True)
@@ -108,27 +99,6 @@ def write_records(
                 output.write(delimiter_bytes)
 
 
-def split_records(data: bytes, delimiter: int) -> list[bytes]:
-    parts = data.split(bytes((delimiter,)))
-    if parts and parts[-1] == b"":
-        parts.pop()
-    if any(part == b"" for part in parts):
-        raise AssertionError("fixture contains an empty record")
-    return parts
-
-
-def decode_records(data: bytes, delimiter: int) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for raw in split_records(data, delimiter):
-        value = json.loads(raw)
-        if not isinstance(value, dict) or not isinstance(value.get("id"), int):
-            raise AssertionError(f"invalid JSON record: {raw!r}")
-        if not isinstance(value.get("value"), int):
-            raise AssertionError(f"invalid numeric value in record: {raw!r}")
-        records.append(value)
-    return records
-
-
 def expected_oracle(paths: tuple[Path, ...], delimiter: int) -> dict[str, Any]:
     source_data = [path.read_bytes() for path in paths]
     expected_keys: Counter[tuple[int, int]] = Counter()
@@ -161,12 +131,11 @@ def checksum(keys: Counter[tuple[int, int]]) -> str:
     return digest.hexdigest()
 
 
-def invoke_planner(cli: Path, paths: tuple[Path, ...], parts: int, delimiter: int) -> tuple[bytes, float, int]:
+def invoke_planner(cli: Path, paths: tuple[Path, ...], parts: int, delimiter: int) -> tuple[bytes, float]:
     arguments = [str(cli), "partition-files", "--parts", str(parts)]
     if delimiter != DEFAULT_DELIMITER:
         arguments.extend(["--delimiter-byte", str(delimiter)])
     arguments.extend(str(path) for path in paths)
-    argv_bytes = sum(len(os.fsencode(argument)) + 1 for argument in arguments)
     started = time.perf_counter()
     try:
         completed = subprocess.run(arguments, capture_output=True, check=False)
@@ -180,32 +149,7 @@ def invoke_planner(cli: Path, paths: tuple[Path, ...], parts: int, delimiter: in
         )
     if completed.stderr:
         raise AssertionError(f"planner wrote unexpected stderr: {completed.stderr!r}")
-    return completed.stdout, planning_ms, argv_bytes
-
-
-def parse_plan(stdout: bytes) -> list[RangeRow]:
-    try:
-        text = stdout.decode("ascii")
-    except UnicodeDecodeError as error:
-        raise AssertionError("planner TSV was not ASCII") from error
-    rows: list[RangeRow] = []
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        fields = line.split("\t")
-        if len(fields) != 5:
-            raise AssertionError(f"line {line_number} has {len(fields)} fields, expected five")
-        try:
-            values = [int(field) for field in fields]
-        except ValueError as error:
-            raise AssertionError(f"line {line_number} contains a non-numeric field") from error
-        rows.append(RangeRow(*values))
-    return rows
-
-
-def group_rows_by_worker(rows: list[RangeRow]) -> dict[int, list[RangeRow]]:
-    grouped: dict[int, list[RangeRow]] = {}
-    for row in rows:
-        grouped.setdefault(row.worker_index, []).append(row)
-    return grouped
+    return completed.stdout, planning_ms
 
 
 def validate_plan(
@@ -215,7 +159,6 @@ def validate_plan(
 ) -> dict[str, Any]:
     source_data: list[bytes] = oracle["source_data"]
     source_cursors = [0] * len(source_data)
-    source_segments: list[list[bytes]] = [[] for _ in source_data]
     worker_bytes: Counter[int] = Counter()
     previous_sort_key: tuple[int, int, int] | None = None
 
@@ -246,15 +189,11 @@ def validate_plan(
                 f"expected {source_cursors[row.source_index]}, got {row.start}"
             )
         source_cursors[row.source_index] = row.end_exclusive
-        source_segments[row.source_index].append(source[row.start : row.end_exclusive])
         worker_bytes[row.worker_index] += row.length
 
     for source_index, (cursor, source) in enumerate(zip(source_cursors, source_data)):
         if cursor != len(source):
             raise AssertionError(f"source {source_index} coverage ends at {cursor}, expected {len(source)}")
-        reconstructed = b"".join(source_segments[source_index])
-        if reconstructed != source:
-            raise AssertionError(f"source {source_index} reconstruction differs from source bytes")
 
     workers = group_rows_by_worker(rows)
     worker_indices = sorted(workers)
@@ -274,187 +213,23 @@ def validate_plan(
     }
 
 
-def worker_main(
-    worker_index: int,
-    source_paths: tuple[str, ...],
-    rows: list[RangeRow],
-    delimiter: int,
-    ready_queue: Any,
-    start_event: Any,
-    result_queue: Any,
-) -> None:
-    handles: dict[int, Any] = {}
-    try:
-        assigned_sources = sorted({row.source_index for row in rows})
-        for source_index in assigned_sources:
-            handles[source_index] = open(source_paths[source_index], "rb")
-        ready_queue.put({"kind": "ready", "worker": worker_index, "pid": os.getpid()})
-        if not start_event.wait(60):
-            raise RuntimeError("worker start event timed out")
-
-        started = time.perf_counter()
-        observed_keys: Counter[tuple[int, int]] = Counter()
-        value_sum = 0
-        processed_bytes = 0
-        for row in rows:
-            handle = handles[row.source_index]
-            handle.seek(row.start)
-            data = handle.read(row.length)
-            if len(data) != row.length:
-                raise AssertionError(
-                    f"short read for worker={worker_index} source={row.source_index}: "
-                    f"expected {row.length}, got {len(data)}"
-                )
-            processed_bytes += len(data)
-            for record in decode_records(data, delimiter):
-                key = (row.source_index, int(record["id"]))
-                observed_keys[key] += 1
-                value_sum += int(record["value"])
-
-        result_queue.put(
-            {
-                "kind": "result",
-                "ok": True,
-                "worker": worker_index,
-                "pid": os.getpid(),
-                "record_count": sum(observed_keys.values()),
-                "value_sum": value_sum,
-                "processed_bytes": processed_bytes,
-                "keys": list(observed_keys.elements()),
-                "worker_ms": (time.perf_counter() - started) * 1000.0,
-            }
-        )
-    except BaseException as error:  # pragma: no cover - exercised through parent error handling
-        result_queue.put(
-            {
-                "kind": "result",
-                "ok": False,
-                "worker": worker_index,
-                "pid": os.getpid(),
-                "error": f"{type(error).__name__}: {error}",
-            }
-        )
-    finally:
-        for handle in handles.values():
-            handle.close()
-
-
-def execute_workers(
-    paths: tuple[Path, ...],
-    rows: list[RangeRow],
-    delimiter: int,
-) -> dict[str, Any]:
-    grouped = group_rows_by_worker(rows)
-    if not grouped:
-        return {
-            "record_count": 0,
-            "value_sum": 0,
-            "processed_bytes": 0,
-            "worker_startup_ms": 0.0,
-            "processing_ms": 0.0,
-            "worker_processing_ms": 0.0,
-            "observed_keys": Counter(),
-            "worker_pids": [],
-        }
-
-    context = mp.get_context("spawn")
-    ready_queue = context.Queue()
-    result_queue = context.Queue()
-    start_event = context.Event()
-    source_paths = tuple(str(path) for path in paths)
-    processes: list[Any] = []
-    startup_started = time.perf_counter()
-    for worker_index in sorted(grouped):
-        process = context.Process(
-            target=worker_main,
-            args=(
-                worker_index,
-                source_paths,
-                grouped[worker_index],
-                delimiter,
-                ready_queue,
-                start_event,
-                result_queue,
-            ),
-        )
-        process.start()
-        processes.append(process)
-
-    ready_workers: set[int] = set()
-    while len(ready_workers) < len(processes):
-        try:
-            message = ready_queue.get(timeout=60)
-        except queue.Empty as error:
-            start_event.set()
-            for process in processes:
-                if process.is_alive():
-                    process.terminate()
-            raise RuntimeError("timed out waiting for worker startup") from error
-        if message.get("kind") == "ready":
-            ready_workers.add(int(message["worker"]))
-        else:
-            raise RuntimeError(f"unexpected worker startup message: {message}")
-
-    worker_startup_ms = (time.perf_counter() - startup_started) * 1000.0
-    processing_started = time.perf_counter()
-    start_event.set()
-    # Drain results while children are still running.  Joining first can
-    # deadlock on Windows when a child blocks flushing a multiprocessing.Queue.
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=120))
-    except queue.Empty as error:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        raise RuntimeError("timed out waiting for worker results") from error
-    processing_ms = (time.perf_counter() - processing_started) * 1000.0
-    for process in processes:
-        process.join(30)
-        if process.is_alive():
-            process.terminate()
-            raise RuntimeError("worker did not finish within bounded timeout")
-        if process.exitcode != 0:
-            raise RuntimeError(f"worker exited with code {process.exitcode}")
-    failures = [result for result in results if not result.get("ok")]
-    if failures:
-        raise RuntimeError(f"worker failure: {failures[0]}")
-
-    observed_keys: Counter[tuple[int, int]] = Counter()
-    for result in results:
-        observed_keys.update(tuple(key) for key in result["keys"])
-    return {
-        "record_count": sum(int(result["record_count"]) for result in results),
-        "value_sum": sum(int(result["value_sum"]) for result in results),
-        "processed_bytes": sum(int(result["processed_bytes"]) for result in results),
-        "worker_startup_ms": worker_startup_ms,
-        "processing_ms": processing_ms,
-        "worker_processing_ms": max(float(result["worker_ms"]) for result in results),
-        "observed_keys": observed_keys,
-        "worker_pids": sorted(int(result["pid"]) for result in results),
-    }
-
-
 def run_case(cli: Path, scenario: Scenario, requested_workers: int, repeats: int) -> dict[str, Any]:
     oracle = expected_oracle(scenario.paths, scenario.delimiter)
-    plan_outputs: list[bytes] = []
+    first_plan: bytes | None = None
     planning_times: list[float] = []
-    plan_argv_bytes = 0
     rows: list[RangeRow] | None = None
     plan_checks: dict[str, Any] | None = None
 
     for _ in range(repeats):
-        output, planning_ms, argv_bytes = invoke_planner(
+        output, planning_ms = invoke_planner(
             cli, scenario.paths, requested_workers, scenario.delimiter
         )
-        plan_outputs.append(output)
         planning_times.append(planning_ms)
-        plan_argv_bytes = argv_bytes
         if rows is None:
+            first_plan = output
             rows = parse_plan(output)
             plan_checks = validate_plan(rows, oracle, scenario.delimiter)
-        elif output != plan_outputs[0]:
+        elif output != first_plan:
             raise AssertionError("repeated planner output was not byte-identical")
 
     assert rows is not None
@@ -505,7 +280,7 @@ def run_case(cli: Path, scenario: Scenario, requested_workers: int, repeats: int
                 for planning, run in zip(planning_times, worker_runs)
             ]
         ),
-        "determinism": all(output == plan_outputs[0] for output in plan_outputs[1:]),
+        "determinism": True,
         "coverage_ok": plan_checks["coverage_ok"],
         "boundary_ok": plan_checks["boundary_ok"],
         "exact_once": True,
@@ -514,27 +289,28 @@ def run_case(cli: Path, scenario: Scenario, requested_workers: int, repeats: int
         "numeric_aggregate": oracle["value_sum"],
         "total_processed_bytes": oracle["total_bytes"],
         "delimiter": scenario.delimiter,
-        "planner_argv_bytes": plan_argv_bytes,
-        "worker_filtering_glue_lines": len(
-            [line for line in inspect.getsource(group_rows_by_worker).splitlines() if line.strip()]
-        ),
-        "source_mapping_glue_lines": 1,
-        "peak_rss": "unavailable",
-        "virtual_memory": "unavailable",
-        "open_handles": "unavailable",
     }
 
 
-def run_failure_probe(cli: Path, existing_path: Path) -> dict[str, Any]:
-    missing = existing_path.parent / "definitely-missing-worker-proof-source.jsonl"
+def crashing_worker(task: tuple[Any, ...]) -> dict[str, Any]:
+    os._exit(17)
+
+
+def hanging_worker(task: tuple[Any, ...]) -> dict[str, Any]:
+    while True:
+        time.sleep(1)
+
+
+def run_failure_probe(cli: Path, paths: tuple[Path, ...], delimiter: int) -> dict[str, Any]:
+    missing = paths[1].parent / "definitely-missing-worker-proof-source.jsonl"
     cases = [
         (
             "missing_source",
-            [str(cli), "partition-files", "--parts", "2", str(existing_path), str(missing)],
+            [str(cli), "partition-files", "--parts", "2", str(paths[1]), str(missing)],
         ),
         (
             "invalid_parts",
-            [str(cli), "partition-files", "--parts", "0", str(existing_path)],
+            [str(cli), "partition-files", "--parts", "0", str(paths[1])],
         ),
     ]
     results: dict[str, Any] = {}
@@ -547,6 +323,70 @@ def run_failure_probe(cli: Path, existing_path: Path) -> dict[str, Any]:
             "stdout_empty": not completed.stdout,
             "stderr_nonempty": bool(completed.stderr),
         }
+
+    try:
+        invoke_planner(cli.parent / "definitely-missing-mmap-chunker", paths, 2, delimiter)
+    except RuntimeError as error:
+        results["missing_planner"] = {"failed": True, "phase_context": "planner" in str(error)}
+    else:
+        raise AssertionError("missing_planner probe unexpectedly succeeded")
+
+    try:
+        parse_plan(b"0\t1\t2")
+    except AssertionError:
+        results["malformed_tsv"] = {"failed": True}
+    else:
+        raise AssertionError("malformed_tsv probe unexpectedly succeeded")
+
+    output, _ = invoke_planner(cli, paths, 2, delimiter)
+    rows = parse_plan(output)
+    try:
+        reference.execute_workers(
+            paths,
+            rows,
+            delimiter,
+            worker_target=crashing_worker,
+            worker_timeout=2.0,
+        )
+    except (RuntimeError, TimeoutError) as error:
+        results["worker_process_failure"] = {
+            "failed": True,
+            "phase_context": "phase" in str(error),
+        }
+    else:
+        raise AssertionError("worker_process_failure probe unexpectedly succeeded")
+
+    try:
+        reference.execute_workers(
+            paths,
+            rows,
+            delimiter,
+            worker_target=hanging_worker,
+            worker_timeout=0.2,
+        )
+    except TimeoutError as error:
+        results["worker_timeout"] = {
+            "failed": True,
+            "phase_context": "phase" in str(error),
+        }
+    else:
+        raise AssertionError("worker_timeout probe unexpectedly succeeded")
+
+    original = paths[1].read_bytes()
+    paths[1].write_bytes(original[:-1])
+    try:
+        try:
+            reference.execute_workers(paths, rows, delimiter, worker_timeout=2.0)
+        except RuntimeError as error:
+            results["short_read_after_mutation"] = {
+                "failed": True,
+                "source_context": "source=" in str(error),
+            }
+        else:
+            raise AssertionError("short_read_after_mutation probe unexpectedly succeeded")
+    finally:
+        paths[1].write_bytes(original)
+
     return results
 
 
@@ -651,14 +491,13 @@ def main() -> int:
         json.dumps(
             {
                 "type": "metadata",
-                "platform": platform.platform(),
+                "platform": sys.platform,
                 "python": sys.version.split()[0],
                 "start_method": "spawn",
                 "cli": str(cli),
                 "source_counts": source_counts,
                 "workers": workers,
                 "repeats": args.repeats,
-                "resource_metrics": "unavailable",
             },
             sort_keys=True,
         )
@@ -739,8 +578,11 @@ def main() -> int:
 
         failure_results = {}
         if not args.skip_failure_probes:
-            failure_results = run_failure_probe(cli, edge_paths[1])
-            print(json.dumps({"type": "failure_probes", "results": failure_results}, sort_keys=True), flush=True)
+            failure_results = run_failure_probe(cli, edge_paths, DEFAULT_DELIMITER)
+            print(
+                json.dumps({"type": "failure_probes", "results": failure_results}, sort_keys=True),
+                flush=True,
+            )
 
     all_true = all(
         row["determinism"]
@@ -760,11 +602,6 @@ def main() -> int:
         "exact_once_cases": sum(row["exact_once"] for row in result_rows),
         "checksum_cases": sum(row["checksum_ok"] for row in result_rows),
         "failure_probes": failure_results,
-        "worker_filtering_glue_lines": len(
-            [line for line in inspect.getsource(group_rows_by_worker).splitlines() if line.strip()]
-        ),
-        "source_mapping_glue_lines": 1,
-        "source_list_friction": "not observed within bounded direct-process argv; shell limits not tested",
     }
     print(json.dumps(summary, sort_keys=True), flush=True)
     return 0 if all_true else 1
