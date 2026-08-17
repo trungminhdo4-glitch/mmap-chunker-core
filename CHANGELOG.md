@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-08-15
+
+### Added
+
+- Ordered multi-file logical dataset partitioning via `partition-files`.
+- Deterministic five-field TSV worker/source-local ranges with explicit source
+  ordering; duplicate paths are separate source entries.
+- Empty-source and all-empty dataset handling, raw single-byte delimiters,
+  record-aligned worker boundaries, and compact worker indices when requested
+  targets collapse.
+
+### Compatibility
+
+- The existing single-file `partition` contract remains unchanged.
+- No Rust API, C ABI, dependency, or MSRV changes.
+
 ## [0.2.3] — 2026-08-14
 
 ### Added
