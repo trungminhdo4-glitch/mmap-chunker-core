@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 
 DEFAULT_DELIMITER = 0x0A
+PLANNER_TIMEOUT = 120.0
 WORKER_TIMEOUT = 120.0
 
 
@@ -234,7 +235,16 @@ def invoke_planner(cli: Path, paths: tuple[Path, ...], parts: int, delimiter: in
         arguments.extend(["--delimiter-byte", str(delimiter)])
     arguments.extend(str(path) for path in paths)
     try:
-        completed = subprocess.run(arguments, capture_output=True, check=False)
+        completed = subprocess.run(
+            arguments,
+            capture_output=True,
+            check=False,
+            timeout=PLANNER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(
+            f"planner phase timed out after {PLANNER_TIMEOUT:.1f}s: {cli}"
+        ) from error
     except OSError as error:
         raise RuntimeError(f"planner phase could not execute {cli}: {error}") from error
     if completed.returncode != 0:

@@ -34,6 +34,7 @@ from jsonl_multi_file_workers import group_rows_by_worker, parse_plan
 
 MAX_SUPPORTED_WORKERS = 16
 DEFAULT_DELIMITER = 0x0A
+PLANNER_TIMEOUT = 120.0
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,16 @@ def invoke_planner(cli: Path, paths: tuple[Path, ...], parts: int, delimiter: in
     arguments.extend(str(path) for path in paths)
     started = time.perf_counter()
     try:
-        completed = subprocess.run(arguments, capture_output=True, check=False)
+        completed = subprocess.run(
+            arguments,
+            capture_output=True,
+            check=False,
+            timeout=PLANNER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(
+            f"planner timed out after {PLANNER_TIMEOUT:.1f}s: {cli}"
+        ) from error
     except OSError as error:
         raise RuntimeError(f"could not execute planner {cli}: {error}") from error
     planning_ms = (time.perf_counter() - started) * 1000.0
