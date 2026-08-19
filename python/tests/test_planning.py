@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,14 @@ except ImportError:
     _FROM_SOURCE = True
 
 from mmap_chunker import Plan, PlanningError, Range, plan_file  # noqa: E402
+
+
+def _cargo_version() -> str:
+    cargo = (_REPO / "Cargo.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version = "([^"]+)"', cargo, re.MULTILINE)
+    assert match is not None, "could not read Cargo.toml version"
+    return match.group(1)
+
 
 CLI = (
     _REPO
@@ -101,7 +110,7 @@ def _verify_plan(path: Path, plan: Plan, delimiter: int, parts: int) -> None:
 
 
 def test_version_and_abi() -> None:
-    assert mmap_chunker.__version__ == "0.2.4"
+    assert mmap_chunker.__version__ == _cargo_version()
     assert mmap_chunker.abi_version() == 0x0001_0003
     caps = mmap_chunker.capabilities()
     assert caps & (1 << 4)  # RECORD_PARTITIONING

@@ -1,12 +1,18 @@
 name: Python Wheel
 
-# Bounded wheel build + proof CI. Builds one py3-none-<platform> wheel per
-# supported target (matching the native release matrix), verifies the ABI
-# symbols, GLIBC ceiling on Linux, wheel contents, and runs clean-environment
-# install proofs. Wheels are uploaded as Actions artifacts only; nothing is
-# published to PyPI or GitHub Releases.
+# Bounded wheel + sdist build and proof CI. Builds one py3-none-<platform>
+# wheel per supported target (matching the native release matrix), verifies the
+# ABI symbols, GLIBC ceiling on Linux, wheel contents, and runs clean-environment
+# install proofs. Also builds and verifies the sdist. Wheels and the sdist are
+# uploaded as Actions artifacts only; nothing is published to PyPI or GitHub
+# Releases from this workflow.
+#
+# Reusable: the Release workflow calls this via `workflow_call` so the wheel
+# target matrix lives in exactly one place. PyPI Trusted Publishing never runs
+# inside a reusable workflow; release.yml performs the publish job itself.
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -185,3 +191,64 @@ jobs:
           "$VENV_PY" -m pip install --quiet "${WHEEL}[datatrove]"
           "$VENV_PY" -m pip install --quiet pytest
           "$VENV_PY" -m pytest python/tests/test_datatrove_integration.py -q
+
+  sdist:
+    # Source distribution: packaged from the release tree and verified. An sdist
+    # rebuilds the native library with Cargo (documented requirement) and must
+    # contain the Rust sources and packaging metadata but no build outputs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet build wheel setuptools
+
+      - name: Build and verify sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m build --sdist .
+          SDIST=$(ls dist/*.tar.gz | head -n 1)
+          test -n "$SDIST"
+          echo "sdist=$SDIST"
+
+          # Version provenance: sdist PKG-INFO must match Cargo.toml.
+          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          tar tzf "$SDIST" >/dev/null
+          PKG_INFO=$(tar xOf "$SDIST" --wildcards '*/PKG-INFO')
+          printf '%s\n' "$PKG_INFO" | grep -F "Version: $CARGO_VERSION"
+          printf '%s\n' "$PKG_INFO" | grep -F 'Name: mmap-chunker-core'
+
+          # Required sources/metadata present; build outputs absent.
+          for f in Cargo.toml mmap_chunker.h setup.py pyproject.toml \
+                    src/lib.rs python/mmap_chunker/__init__.py \
+                    python/mmap_chunker/_native.py python/mmap_chunker/planning.py \
+                    python/mmap_chunker/py.typed; do
+            if ! tar tzf "$SDIST" | grep -qE "(^|/)$f\$"; then
+              echo "ERROR: sdist is missing required file $f" >&2
+              exit 1
+            fi
+          done
+          if tar tzf "$SDIST" | grep -qE '(^|/)(target|\.worktrees|\.git)(/|$)' \
+             || tar tzf "$SDIST" | grep -qE '(\.crate|\.whl|\.so$|\.dll$|\.dylib$)' ; then
+            echo "ERROR: sdist contains build outputs or foreign artifacts" >&2
+            exit 1
+          fi
+          echo "PASS: sdist version, metadata, and content contract verified"
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7

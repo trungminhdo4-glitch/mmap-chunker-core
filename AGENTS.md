@@ -99,7 +99,7 @@ PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision re
 - **No harness imports** — this library has no dependency on any agent harness
 - **64-bit only**: `compile_error!` at the pointer-width gate; 32-bit glibc `off_t` is 4 bytes — Rust FFI declares `i64` (8 bytes), which is an ABI mismatch (calling-convention corruption, not just truncation). musl 32-bit has 64-bit `off_t` but is untested and unsupported.
 - **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
-- **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. crates.io publish remains separate manual step.
+- **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. Python wheels + sdist are built/verified by the reusable `python-wheel.yml` and published to PyPI via Trusted Publishing; the crate is published to crates.io via OIDC. Both registries use protected environments (`pypi`, `crates-io`); `workflow_dispatch` is a non-publishing dry run.
 
 ## Public C ABI (11 functions)
 
@@ -127,4 +127,6 @@ PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision re
 - Python native_io module requires `cargo build --release` before tests
 - **Integer arithmetic**: scanner targets use `saturating_add`, partition uses `u128`, file-size uses `usize::try_from` — do not revert to unchecked `as` casts or `+`
 - **Release workflow**: `release.yml` builds native artifacts per platform on tag push. Uses `cross-rs/cross` for Linux aarch64 cross-compilation. Artifact naming uses Rust target triples. Draft release must be published manually. Third-party actions pinned to commit SHA. Workflow fails closed — missing expected artifacts abort the job.
+- **Trusted Publishing**: publish jobs carry `id-token: write` at job scope only and run only on tag-push events; never add PyPI/crates.io API-token secrets, never use `pull_request_target`.
+- **Version single-source**: Python distribution version derives from `Cargo.toml`; `python/mmap_chunker.__version__` resolves from installed metadata (Cargo.toml fallback in source checkouts).
 - **DataTrove proof**: needs `datatrove`+`orjson` in an isolated venv (never global), the release CLI, and on Windows `PYTHONUTF8=1` (DataTrove's JsonlReader opens text files with the locale codec). `LocalPipelineExecutor` defaults to `start_method="forkserver"` which is invalid on Windows — the proof passes `"spawn"`. The range reader reproduces DataTrove `id = f"{path}/{line_index}"` using a **global** line index computed by a C-speed mmap count pass in the planner (measured separately from Rust planning). fsspec `read_block` is not used for exact ranges: its forward-only `seek_delimiter` skips the first record of a mid-file range.
