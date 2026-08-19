@@ -225,22 +225,24 @@ jobs:
           # Version provenance: sdist PKG-INFO must match Cargo.toml.
           CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           tar tzf "$SDIST" >/dev/null
-          PKG_INFO=$(tar xOf "$SDIST" --wildcards '*/PKG-INFO')
+          PKG_INFO=$(tar xOf "$SDIST" --wildcards "mmap_chunker_core-$CARGO_VERSION/PKG-INFO")
           printf '%s\n' "$PKG_INFO" | grep -F "Version: $CARGO_VERSION"
           printf '%s\n' "$PKG_INFO" | grep -F 'Name: mmap-chunker-core'
 
           # Required sources/metadata present; build outputs absent.
+          # NOTE: avoid `grep -q` on a `tar` pipe — early exit SIGPIPEs tar and
+          # pipefail turns it into a false failure.
           for f in Cargo.toml mmap_chunker.h setup.py pyproject.toml \
                     src/lib.rs python/mmap_chunker/__init__.py \
                     python/mmap_chunker/_native.py python/mmap_chunker/planning.py \
                     python/mmap_chunker/py.typed; do
-            if ! tar tzf "$SDIST" | grep -qE "(^|/)$f\$"; then
+            if ! tar tzf "$SDIST" | grep -E "(^|/)$f\$" >/dev/null; then
               echo "ERROR: sdist is missing required file $f" >&2
               exit 1
             fi
           done
-          if tar tzf "$SDIST" | grep -qE '(^|/)(target|\.worktrees|\.git)(/|$)' \
-             || tar tzf "$SDIST" | grep -qE '(\.crate|\.whl|\.so$|\.dll$|\.dylib$)' ; then
+          if tar tzf "$SDIST" | grep -E '(^|/)(target|\.worktrees|\.git)(/|$)' >/dev/null \
+             || tar tzf "$SDIST" | grep -E '(\.crate|\.whl|\.so$|\.dll$|\.dylib$)' >/dev/null; then
             echo "ERROR: sdist contains build outputs or foreign artifacts" >&2
             exit 1
           fi
