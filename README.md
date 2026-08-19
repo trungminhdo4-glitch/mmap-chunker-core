@@ -361,6 +361,28 @@ ordered path list, including duplicate paths. The larger
 [`jsonl_multi_file_worker_proof.py`](examples/jsonl_multi_file_worker_proof.py)
 keeps the independent oracle and bounded pathological-case matrix.
 
+### DataTrove single-file adoption proof
+
+[`examples/datatrove_jsonl_range_reader.py`](examples/datatrove_jsonl_range_reader.py)
+is a DataTrove reader that turns **one** immutable local JSONL file into
+parallel DataTrove work. The controller runs `mmap-chunker partition` exactly
+once, distributes the resulting immutable record-aligned byte ranges to
+DataTrove ranks, and each rank reads only its own range. Document semantics
+(text/id/media/metadata, `file_path`, global line-index IDs, malformed-line
+skip behaviour) match DataTrove's `JsonlReader` byte-for-byte.
+
+```sh
+python examples/datatrove_single_file_proof.py --mode correctness
+python examples/datatrove_single_file_proof.py --mode benchmark
+```
+
+Requires the `datatrove` package + `orjson` in an isolated environment, the
+release CLI (`cargo build --release`), and on Windows `PYTHONUTF8=1` (DataTrove
+opens JSONL in text mode with the locale codec). The decision-grade evidence —
+correctness matrix, benchmark methodology, fsspec comparison, and the adoption
+recommendation — is in
+[`DATATROVE_ADOPTION_REPORT.md`](DATATROVE_ADOPTION_REPORT.md).
+
 ### Installing the standalone CLI
 
 Rust users can install the CLI from source with Cargo:
