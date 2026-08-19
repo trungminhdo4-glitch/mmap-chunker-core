@@ -88,13 +88,22 @@ jobs:
         run: bash scripts/build-python-wheel.sh
 
       - name: Fresh venv install + installed-wheel proof
+        # The x86_64 runner cannot install an aarch64 wheel; aarch64 runtime
+        # conformance is skipped here exactly as in release.yml, and the
+        # aarch64 wheel is still built + ABI/GLIBC/content verified.
+        if: ${{ matrix.target != 'aarch64-unknown-linux-gnu' }}
         shell: bash
         run: |
           set -euo pipefail
           python -m venv /tmp/wheel-venv
-          /tmp/wheel-venv/bin/python -m pip install --quiet --upgrade pip
-          /tmp/wheel-venv/bin/python -m pip install --quiet dist/*.whl
-          /tmp/wheel-venv/bin/python python/scripts/wheel_proof.py
+          if [ -f /tmp/wheel-venv/Scripts/python.exe ]; then
+            VENV_PY=/tmp/wheel-venv/Scripts/python.exe
+          else
+            VENV_PY=/tmp/wheel-venv/bin/python
+          fi
+          "$VENV_PY" -m pip install --quiet --upgrade pip
+          "$VENV_PY" -m pip install --quiet dist/*.whl
+          "$VENV_PY" python/scripts/wheel_proof.py
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -133,9 +142,14 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv /tmp/wheel-venv
-          /tmp/wheel-venv/bin/python -m pip install --quiet --upgrade pip
-          /tmp/wheel-venv/bin/python -m pip install --quiet dist/*.whl
-          /tmp/wheel-venv/bin/python python/scripts/wheel_proof.py
+          if [ -f /tmp/wheel-venv/Scripts/python.exe ]; then
+            VENV_PY=/tmp/wheel-venv/Scripts/python.exe
+          else
+            VENV_PY=/tmp/wheel-venv/bin/python
+          fi
+          "$VENV_PY" -m pip install --quiet --upgrade pip
+          "$VENV_PY" -m pip install --quiet dist/*.whl
+          "$VENV_PY" python/scripts/wheel_proof.py
 
   datatrove-smoke:
     # Packaged DataTrove integration smoke on one mainstream Python version.
@@ -161,6 +175,11 @@ jobs:
         run: |
           set -euo pipefail
           python -m venv /tmp/dt-venv
-          /tmp/dt-venv/bin/python -m pip install --quiet --upgrade pip
-          /tmp/dt-venv/bin/python -m pip install --quiet "dist/*.whl[datatrove]"
-          /tmp/dt-venv/bin/python -m pytest python/tests/test_datatrove_integration.py -q
+          if [ -f /tmp/dt-venv/Scripts/python.exe ]; then
+            VENV_PY=/tmp/dt-venv/Scripts/python.exe
+          else
+            VENV_PY=/tmp/dt-venv/bin/python
+          fi
+          "$VENV_PY" -m pip install --quiet --upgrade pip
+          "$VENV_PY" -m pip install --quiet "dist/*.whl[datatrove]"
+          "$VENV_PY" -m pytest python/tests/test_datatrove_integration.py -q
