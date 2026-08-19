@@ -4,6 +4,13 @@ Cargo.lock
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+dist/
+build/
+python/mmap_chunker/_native/*.dll
+python/mmap_chunker/_native/*.so
+python/mmap_chunker/_native/*.dylib
+.venv/
 
 # IDE
 .vscode/

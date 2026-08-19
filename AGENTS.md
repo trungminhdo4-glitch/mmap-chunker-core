@@ -27,6 +27,14 @@ Python tests (requires release build first):
 python -m pytest tests/test_native_io.py -v
 ```
 
+Python wheel distribution (build + install proof):
+```sh
+cargo build --release
+python -m venv .venv && .venv/Scripts/python -m pip install build wheel
+.venv/Scripts/python -m build --wheel .   # produces dist/mmap_chunker_core-<ver>-py3-none-<plat>.whl
+.venv/Scripts/python -m pytest python/tests -q
+```
+
 ## Architecture
 
 ```
@@ -56,7 +64,29 @@ examples/
 native_io/        — Python ctypes consumer (standalone, no harness dependency)
 mmap_chunker.h    — Public C header with full API docs
 DATATROVE_ADOPTION_REPORT.md — decision report for the DataTrove single-file adoption proof
+python/          — Python wheel distribution (pyproject.toml/setup.py at repo root)
+  mmap_chunker/   — import namespace: plan_file, Plan, Range, abi_version, capabilities
+  integrations/datatrove.py — optional RangeJsonlReader (requires [datatrove] extra)
+  tests/          — pytest suite for the wheel distribution
+  scripts/        — installed-wheel proof harness + build helper
+scripts/         — build-python-wheel.sh — target matrix + ABI/GLIBC verification
+PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision record
 ```
+
+## Python Wheel Distribution
+
+- Import namespace: `mmap_chunker`; distribution name on PyPI: `mmap-chunker-core`.
+- Zero runtime dependencies: stdlib ctypes drives the bundled C-ABI shared
+  library (`_native/<platform lib>`). One `py3-none-<platform>` wheel per
+  target serves every CPython 3 version on that platform.
+- Wheel CI: `.github/workflows/python-wheel.yml` builds/test 5 platform wheels
+  (Linux x86_64/aarch64, macOS x86_64/arm64, Windows x86_64) and uploads them
+  as Actions artifacts only — no PyPI/tag publication.
+- sdist: `python -m build --sdist` produces a source distribution that rebuilds
+  the library with Cargo; documented requirement.
+- The base package must remain importable without DataTrove; the datatrove
+  integration imports lazily and raises a clear error without the extra.
+- Do not ship the CLI, static lib, C header, or test fixtures in the wheel.
 
 ## Key Invariants
 
