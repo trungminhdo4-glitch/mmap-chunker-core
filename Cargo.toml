@@ -1,6 +1,6 @@
 [package]
 name = "mmap-chunker-core"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.77"
 description = "Record-aligned byte-range planning for large immutable files with zero-copy mmap framing, CLI, and a stable C ABI."

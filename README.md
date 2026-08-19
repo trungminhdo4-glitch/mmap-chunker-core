@@ -255,7 +255,10 @@ for r in plan.ranges:
 
 The distribution name is `mmap-chunker-core` (available on PyPI); the import
 namespace is `mmap_chunker`. Wheels are tagged `py3-none-<platform>` and one
-wheel per platform serves every supported CPython 3 version.
+wheel per platform serves every supported CPython 3 version. The distribution
+version always matches the crate version (single source of truth in
+`Cargo.toml`). See `RELEASE.md` for the release process and Trusted Publishing
+setup.
 
 - Zero runtime Python dependencies (stdlib `ctypes` only).
 - `py3-none-<platform>` wheels: Linux x86_64/aarch64 (`manylinux_2_17_*`),

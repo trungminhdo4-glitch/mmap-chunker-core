@@ -31,6 +31,9 @@ Optional DataTrove integration (requires the ``[datatrove]`` extra)::
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from mmap_chunker import _native
 from mmap_chunker.planning import (
     DEFAULT_DELIMITER,
@@ -50,7 +53,34 @@ __all__ = [
     "capabilities",
 ]
 
-__version__ = "0.2.4"
+
+def _read_version() -> str:
+    """Resolve the distribution version from a single source of truth.
+
+    The canonical version lives in Cargo.toml; setup.py stamps it into the
+    installed package metadata. Prefer that installed metadata at runtime and
+    fall back to parsing Cargo.toml in source checkouts so every surface
+    (distribution, import, ``__version__``) resolves to the same version.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("mmap-chunker-core")
+    except PackageNotFoundError:
+        pass
+    cargo = Path(__file__).resolve().parents[2] / "Cargo.toml"
+    if cargo.is_file():
+        match = re.search(
+            r'^version = "([^"]+)"', cargo.read_text(encoding="utf-8"), re.MULTILINE
+        )
+        if match is not None:
+            return match.group(1)
+    raise RuntimeError(
+        "could not resolve mmap-chunker-core version from installed metadata or Cargo.toml"
+    )
+
+
+__version__ = _read_version()
 
 
 def abi_version() -> int:

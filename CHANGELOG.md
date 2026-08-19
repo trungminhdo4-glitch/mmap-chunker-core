@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-08-19
+
+### Added
+
+- Python distribution `mmap-chunker-core` on PyPI: `py3-none-<platform>`
+  wheels for Linux x86_64/aarch64 (`manylinux_2_17_*`), macOS x86_64/arm64,
+  and Windows x86_64 (`win_amd64`), plus an sdist that rebuilds the native
+  library with Cargo.
+- Trusted-publishing release automation (OIDC) for PyPI and crates.io behind
+  protected GitHub environments; a tag push builds, verifies, and publishes
+  the exact release artifact set, while `workflow_dispatch` remains a
+  non-publishing dry run.
+
+### Distribution / adoption
+
+- The distribution version `0.2.5` matches the crate version; the Python
+  distribution is additive and adoption-focused. Production Rust algorithms
+  and the C ABI are unchanged.
+
+### Compatibility
+
+- C ABI remains `0x0001_0003` (v1.3).
+- Capability bitmask remains `0x3f`.
+- Exported `mmap_engine_*` symbol contract unchanged.
+- Rust MSRV remains 1.77.
+- Existing CLI behavior unchanged.
+
 ## [0.2.4] — 2026-08-15
 
 ### Added
