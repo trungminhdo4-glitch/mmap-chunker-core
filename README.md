@@ -292,7 +292,7 @@ zero-based range at index `K`. This lets independently launched workers request
 their own byte range. If record-aligned boundaries collapse and no actual range
 exists at a valid index, the command succeeds with no output.
 
-### Ordered multi-file logical dataset proof
+### Ordered multi-file logical dataset and worker reference
 
 The CLI also contains a deliberately small composition proof for an ordered set
 of independent local files:
@@ -332,6 +332,34 @@ worker count can be lower than `--parts` when multiple ideal targets fall inside
 one record; `worker_index` is then compacted to the workers that received bytes.
 The result is deterministic. This is planning/framing only: record alignment can
 dominate the ideal byte targets, so no universal balance guarantee is implied.
+
+For a small real consumer, see
+[`examples/jsonl_multi_file_workers.py`](examples/jsonl_multi_file_workers.py):
+
+```sh
+python examples/jsonl_multi_file_workers.py --parts 4 \
+  shard-z.jsonl shard-a.jsonl shard-z.jsonl
+```
+
+```text
+ordered JSONL shards
+        ↓
+mmap-chunker partition-files
+        ↓
+group five-column plan by worker
+        ↓
+spawn independent workers
+        ↓
+seek/read assigned source-local ranges and parse JSON
+```
+
+This is a reference integration, not a universal speedup claim. The planner
+owns range selection; Python owns worker execution and JSON parsing. Process
+startup can dominate small workloads, and one worker may receive multiple
+ranges from multiple sources. `source_index` is resolved through the original
+ordered path list, including duplicate paths. The larger
+[`jsonl_multi_file_worker_proof.py`](examples/jsonl_multi_file_worker_proof.py)
+keeps the independent oracle and bounded pathological-case matrix.
 
 ### Installing the standalone CLI
 
