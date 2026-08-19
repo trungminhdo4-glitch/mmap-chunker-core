@@ -134,6 +134,15 @@ with zipfile.ZipFile(wheel) as z:
         parts = tag.split("-")
         assert len(parts) == 3 and parts[0] == "py3" and parts[1] == "none"
         print("tag structure ok:", tag)
+    def norm(n):
+        # Files may live under "<dist>-<ver>.data/<scheme>/" when the wheel is
+        # built with Root-Is-Purelib false; normalize to package-relative paths.
+        parts = n.split("/")
+        if len(parts) >= 2 and parts[0].endswith(".data"):
+            return "/".join(parts[2:])
+        return n
+
+    normalized = [norm(n) for n in names]
     required = {
         "mmap_chunker/__init__.py",
         "mmap_chunker/_native.py",
@@ -142,13 +151,13 @@ with zipfile.ZipFile(wheel) as z:
         "mmap_chunker/integrations/__init__.py",
         "mmap_chunker/integrations/datatrove.py",
     }
-    native = [n for n in names if n.startswith("mmap_chunker/_native/") and not n.endswith("/")]
+    native = [n for n in normalized if n.startswith("mmap_chunker/_native/") and not n.endswith("/")]
     assert native, "no native payload"
     for req in required:
-        assert req in names, f"missing {req}"
-    assert not any(n.startswith("mmap_chunker-") and n.endswith(".exe") for n in names), "CLI bundled"
-    assert not any(n.startswith("src/") for n in names), "Rust sources in wheel"
-    assert not any(n.startswith("target/") for n in names), "target/ in wheel"
+        assert req in normalized, f"missing {req}"
+    assert not any(n.startswith("mmap_chunker_core-") and n.endswith(".exe") for n in normalized), "CLI bundled"
+    assert not any(n.startswith("src/") for n in normalized), "Rust sources in wheel"
+    assert not any(n.startswith("target/") for n in normalized), "target/ in wheel"
     print("native payload:", native)
     print("wheel content contract OK")
 PY

@@ -1,2 +1,8 @@
 [target.x86_64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main-centos@sha256:e83bb2c28b1cee027d3a430154495e936d404fd977b36d924e032bf35b198260"
+
+# CentOS-7-based (glibc 2.17) image so the aarch64 artifact honors the same
+# GLIBC <= 2.17 contract as x86_64. Without this pin the default cross image
+# links against glibc 2.18+.
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main-centos@sha256:9a298dba2c8b8bc5749dce0a0ec1648cd1e39f2888c8b2dd93d7b89ee37ff0fc"
