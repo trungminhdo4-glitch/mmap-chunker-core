@@ -183,4 +183,5 @@ jobs:
           "$VENV_PY" -m pip install --quiet --upgrade pip
           WHEEL=$(ls dist/*.whl | head -n1)
           "$VENV_PY" -m pip install --quiet "${WHEEL}[datatrove]"
+          "$VENV_PY" -m pip install --quiet pytest
           "$VENV_PY" -m pytest python/tests/test_datatrove_integration.py -q
