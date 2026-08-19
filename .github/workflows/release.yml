@@ -584,12 +584,20 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Download verified Python distributions
+      # download-artifact `pattern` accepts a single glob; a newline-separated
+      # list is treated as one literal pattern and matches nothing. Download the
+      # wheel set and the sdist in separate steps into the shared `dist` dir.
+      - name: Download verified wheel artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          pattern: |
-            wheel-*
-            python-sdist
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download verified sdist artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: python-sdist
           path: dist
           merge-multiple: true
 
