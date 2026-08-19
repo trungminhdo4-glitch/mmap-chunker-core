@@ -43,9 +43,19 @@ tests/
   c_abi_test.rs        — Integration test: C ABI via extern "C" (Rust calling Rust)
   benchmark.rs         — Performance: mmap vs fs::read
   competitive_bench.rs — Competitive: SWAR vs memchr, pattern search, chunking, partitions (Lanes A-F)
+  test_datatrove_range_reader.py — Focused pytest for the DataTrove adoption proof (skips without datatrove/CLI)
+
+examples/
+  jsonl_multi_file_workers.py         — real consumer of `partition-files` (PR #22)
+  jsonl_multi_file_worker_proof.py    — multi-file oracle + failure matrix (PR #22)
+  jsonl_multiprocessing_proof.py      — C ABI ctypes consumer
+  datatrove_jsonl_range_reader.py     — RangeJsonlReader: one large JSONL file → parallel DataTrove
+  datatrove_fsspec_reader.py          — fsspec transport variant (benchmark only)
+  datatrove_single_file_proof.py      — correctness matrix + benchmark + fsspec demo
 
 native_io/        — Python ctypes consumer (standalone, no harness dependency)
 mmap_chunker.h    — Public C header with full API docs
+DATATROVE_ADOPTION_REPORT.md — decision report for the DataTrove single-file adoption proof
 ```
 
 ## Key Invariants
@@ -87,3 +97,4 @@ mmap_chunker.h    — Public C header with full API docs
 - Python native_io module requires `cargo build --release` before tests
 - **Integer arithmetic**: scanner targets use `saturating_add`, partition uses `u128`, file-size uses `usize::try_from` — do not revert to unchecked `as` casts or `+`
 - **Release workflow**: `release.yml` builds native artifacts per platform on tag push. Uses `cross-rs/cross` for Linux aarch64 cross-compilation. Artifact naming uses Rust target triples. Draft release must be published manually. Third-party actions pinned to commit SHA. Workflow fails closed — missing expected artifacts abort the job.
+- **DataTrove proof**: needs `datatrove`+`orjson` in an isolated venv (never global), the release CLI, and on Windows `PYTHONUTF8=1` (DataTrove's JsonlReader opens text files with the locale codec). `LocalPipelineExecutor` defaults to `start_method="forkserver"` which is invalid on Windows — the proof passes `"spawn"`. The range reader reproduces DataTrove `id = f"{path}/{line_index}"` using a **global** line index computed by a C-speed mmap count pass in the planner (measured separately from Rust planning). fsspec `read_block` is not used for exact ranges: its forward-only `seek_delimiter` skips the first record of a mid-file range.
