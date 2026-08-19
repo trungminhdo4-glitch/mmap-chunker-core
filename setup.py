@@ -90,7 +90,11 @@ class PlatformWheel(bdist_wheel):
             self.plat_name = plat
 
     def get_tag(self) -> tuple[str, str, str]:
-        _python, _abi, plat = super().get_tag()
+        # bdist_wheel ignores `plat_name` on macOS and auto-detects the tag via
+        # get_platform(bdist_dir), which emits `macosx_*_universal2` even for
+        # thin single-arch binaries. Return the explicitly requested platform
+        # tag directly so the wheel name and metadata always match the matrix.
+        plat = self.plat_name or self.get_platform()
         return ("py3", "none", plat)
 
 
