@@ -5,8 +5,10 @@
 #
 # Required env:
 #   TARGET        Rust target triple (e.g. x86_64-unknown-linux-gnu)
-#   WHEEL_PLAT_TAG  Wheel platform tag (e.g. manylinux_2_17_x86_64, win_amd64;
-#                    empty on macOS where bdist_wheel reads the binary's minos)
+#   WHEEL_PLAT_TAG  Wheel platform tag (e.g. manylinux_2_17_x86_64, win_amd64,
+#                    macosx_10_13_x86_64). Required for every target: macOS
+#                    bdist_wheel auto-detection emits `universal2` even for
+#                    thin single-arch binaries, so it is pinned explicitly.
 # Optional env:
 #   CROSS         Set to 1 to build via `cross` instead of `cargo`
 set -euo pipefail
