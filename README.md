@@ -234,6 +234,59 @@ for example `cc -I staging/include -L staging/lib -o app app.c
 
 See `mmap_chunker.h` for the complete C API reference with threading and safety contracts.
 
+## Python distribution (`mmap-chunker-core`)
+
+A pip-installable Python package wraps the stable C ABI through stdlib
+`ctypes`. The native shared library ships inside each platform wheel; no Rust
+toolchain, no separately downloaded CLI, no manual library placement, and no
+environment-variable loader hacks are needed at runtime.
+
+```sh
+pip install mmap-chunker-core
+```
+
+```python
+from mmap_chunker import plan_file
+
+plan = plan_file("records.jsonl", parts=8)
+for r in plan.ranges:
+    print(r.index, r.start, r.end, r.length)
+```
+
+The distribution name is `mmap-chunker-core` (available on PyPI); the import
+namespace is `mmap_chunker`. Wheels are tagged `py3-none-<platform>` and one
+wheel per platform serves every supported CPython 3 version.
+
+- Zero runtime Python dependencies (stdlib `ctypes` only).
+- `py3-none-<platform>` wheels: Linux x86_64/aarch64 (`manylinux_2_17_*`),
+  macOS x86_64/arm64, Windows x86_64 (`win_amd64`).
+- Public API: `plan_file(path, parts, delimiter=b"\n")` returns an immutable
+  `Plan` of record-aligned `Range` objects. Native handles are opened and
+  released inside the call; no returned object references the memory map.
+- Diagnostics: `mmap_chunker.__version__`, `mmap_chunker.abi_version()`,
+  `mmap_chunker.capabilities()`.
+- Optional DataTrove integration (lazy import, base package unaffected):
+
+  ```sh
+  pip install "mmap-chunker-core[datatrove]"
+  ```
+
+  ```python
+  from mmap_chunker import plan_file
+  from mmap_chunker.integrations.datatrove import RangeJsonlReader
+
+  plan = plan_file(path, parts=4)
+  reader = RangeJsonlReader(path, plan)
+  ```
+
+- Source distributions (`python -m build --sdist`) rebuild the native library
+  with Cargo and therefore require a Rust toolchain; wheels do not.
+- Unsupported: multi-byte partition delimiters (the current partition ABI is a
+  single raw byte), compressed/remote/CSV-semantics input, 32-bit platforms.
+
+See `PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md` for the packaging decision and
+`python/` for the package sources, tests, and proof harnesses.
+
 ## Example: parallel JSONL worker ranges
 
 [`examples/jsonl_multiprocessing_proof.py`](examples/jsonl_multiprocessing_proof.py)

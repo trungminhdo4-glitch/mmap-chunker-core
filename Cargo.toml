@@ -11,7 +11,7 @@ documentation = "https://docs.rs/mmap-chunker-core"
 readme = "README.md"
 keywords = ["mmap", "jsonl", "ndjson", "byte-ranges", "ffi"]
 categories = ["filesystem", "memory-management", "development-tools::ffi", "command-line-utilities"]
-exclude = ["/native_io/", "/tests/test_native_io.py", "/tests/python_parity.py", "/AGENTS.md", "/AGENT_LOG.md"]
+exclude = ["/native_io/", "/tests/test_native_io.py", "/tests/python_parity.py", "/AGENTS.md", "/AGENT_LOG.md", "/python/", "/pyproject.toml", "/setup.py", "/MANIFEST.in", "/scripts/", "/PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/mmap-chunker-{ version }-{ target }.tar.gz"

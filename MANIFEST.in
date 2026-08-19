@@ -1,0 +1,42 @@
+# Source distribution content for mmap-chunker-core.
+# The sdist must be able to rebuild the native library with Cargo and install
+# the Python package. It must never include build outputs, worktrees, bundles,
+# private artifacts, or generated datasets.
+
+include Cargo.toml
+include mmap_chunker.h
+include README.md
+include LICENSE-MIT
+include LICENSE-APACHE
+include PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md
+recursive-include src *.rs
+recursive-include python/mmap_chunker *.py
+include python/mmap_chunker/py.typed
+
+# Prebuilt native binaries must never ship in the sdist; a source install
+# builds them with Cargo.
+recursive-exclude python/mmap_chunker/_native *
+
+prune target
+prune .worktrees
+prune .github
+prune tests
+prune examples
+prune abi
+prune fuzz
+prune asan-memory-safety
+prune .glibc-floor-audit
+prune .cli-worker-selection
+prune .pytest_cache
+prune .ruff_cache
+
+exclude AGENTS.md
+exclude AGENT_LOG.md
+exclude DATATROVE_ADOPTION_REPORT.md
+exclude PERFORMANCE_BASELINE_2026-08-14.md
+exclude CHANGELOG.md
+exclude RELEASE.md
+exclude SECURITY.md
+exclude Cross.toml
+exclude Cargo.lock
+exclude setup.cfg
