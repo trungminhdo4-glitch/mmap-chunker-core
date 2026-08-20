@@ -10,7 +10,7 @@ set -euo pipefail
 
 DIST_DIR="${1:?dist dir is required}"
 VERSION="${2:?version is required}"
-V="${VERSION//./\\.}"
+V="${VERSION}"
 
 mapfile -t FILES < <(find "$DIST_DIR" -maxdepth 1 -type f -printf '%f\n' | sort)
 if [ "${#FILES[@]}" -ne 6 ]; then
