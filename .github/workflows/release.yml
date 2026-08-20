@@ -571,7 +571,22 @@ jobs:
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish
+        run: |
+          set -euo pipefail
+          # Idempotent publish: a re-run (e.g. after an unrelated fix) must not
+          # fail when the exact version already exists on crates.io; the
+          # already-published artifact is the authoritative one. publish-release
+          # depends on this job succeeding, so skipping the actual upload keeps
+          # the GitHub Release step reachable on re-runs.
+          CURRENT=$(curl -fsS --retry 3 --retry-delay 2 \
+            -H 'User-Agent: mmap-chunker-core-release' \
+            https://crates.io/api/v1/crates/mmap-chunker-core \
+            | jq -r '.crate.max_version // "0.0.0"')
+          if [ "$CURRENT" = "${{ needs.prepare.outputs.version }}" ]; then
+            echo "SKIP: mmap-chunker-core v${{ needs.prepare.outputs.version }} is already published on crates.io"
+          else
+            cargo publish
+          fi
 
   publish-pypi:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
