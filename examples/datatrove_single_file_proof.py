@@ -10,8 +10,11 @@ Modes:
   correctness  deterministic synthetic fixture matrix: single-task DataTrove
                JsonlReader oracle vs mmap-chunker range-backed reading.
   benchmark    bounded adoption benchmark (smoke/standard, opt-in 1 GiB):
-               DataTrove baseline vs range-backed, medians over repeated runs.
+               DataTrove baseline vs range-backed, medians over repeated runs;
+               ``--profile skewed`` adds a variable-record workload.
   fsspec       boundary-semantics comparison vs fsspec read_block tiling.
+  parallelism  real LocalPipelineExecutor A/B/C structural proof with per-rank
+               document counts.
   all          run correctness + fsspec + benchmark (default).
 
 Run from the repository root with the DataTrove environment active and the
@@ -383,17 +386,22 @@ def run_correctness_matrix(cli: Path, seed: int = 1234) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def generate_benchmark_fixture(path: Path, size_mib: int, seed: int) -> int:
+def generate_benchmark_fixture(
+    path: Path, size_mib: int, seed: int, profile: str = "uniform"
+) -> int:
     rng = random.Random(seed)
     target = size_mib * 1024 * 1024
     total = 0
     count = 0
     with open(path, "wb") as fh:
         while total < target:
-            record = {
-                "text": _random_text(rng, 200, 400),
-                "value": count,
-            }
+            if profile == "uniform":
+                text = _random_text(rng, 200, 400)
+            elif profile == "skewed":
+                text = _random_text(rng, 8000, 12000) if count % 20 == 0 else _random_text(rng, 20, 80)
+            else:
+                raise ValueError(f"unknown benchmark profile: {profile}")
+            record = {"text": text, "value": count}
             payload = orjson.dumps(record) + b"\n"
             fh.write(payload)
             total += len(payload)
@@ -431,6 +439,22 @@ def _documents_from_stats(logging_dir: str) -> int:
     return int(total)
 
 
+def _documents_per_rank(logging_dir: str) -> list[int]:
+    """Read per-task document totals, keeping empty DataTrove tasks as zero."""
+    counts: list[int] = []
+    for stats_path in sorted((Path(logging_dir) / "stats").glob("*.json")):
+        with open(stats_path, "r", encoding="utf-8") as fh:
+            steps = json.load(fh)
+        total = 0
+        for step in steps:
+            documents = step.get("stats", {}).get("documents", 0)
+            if isinstance(documents, dict):
+                documents = documents.get("total", 0)
+            total += int(documents)
+        counts.append(total)
+    return counts
+
+
 def run_benchmark(
     cli: Path,
     size_mib: int,
@@ -439,13 +463,14 @@ def run_benchmark(
     seed: int,
     logging_root: Path,
     fsspec: bool,
+    profile: str = "uniform",
 ) -> dict[str, Any]:
     tmp = Path(tempfile.mkdtemp(prefix="dtrovebench"))
     fixture_dir = tmp / "data"
     fixture_dir.mkdir()
     name = "bench.jsonl"
     path = fixture_dir / name
-    record_count = generate_benchmark_fixture(path, size_mib, seed)
+    record_count = generate_benchmark_fixture(path, size_mib, seed, profile)
     file_size = os.path.getsize(path)
     file_mib = file_size / (1024 * 1024)
 
@@ -455,15 +480,15 @@ def run_benchmark(
     manifest_s = time.perf_counter() - plan_started
     actual_partitions = sum(1 for a in plan.assignments if a.length > 0)
 
-    def baseline_sample() -> tuple[float, int]:
+    def baseline_sample() -> tuple[float, int, list[int]]:
         run_dir = logging_root / f"base_{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=True)
         pipeline = [JsonlReader(str(fixture_dir), glob_pattern=name)]
         elapsed = _executor_e2e(pipeline, tasks=1, workers=1, logging_dir=str(run_dir))
         docs = _documents_from_stats(str(run_dir))
-        return elapsed, docs
+        return elapsed, docs, _documents_per_rank(str(run_dir))
 
-    def range_sample(workers: int, plan) -> tuple[float, int]:
+    def range_sample(workers: int, plan) -> tuple[float, int, list[int]]:
         run_dir = logging_root / f"range_{workers}_{int(time.time() * 1000)}"
         run_dir.mkdir(parents=True, exist_ok=True)
         pipeline = build_range_reader_pipeline(str(fixture_dir), name, plan)
@@ -471,9 +496,9 @@ def run_benchmark(
             pipeline, tasks=workers, workers=workers, logging_dir=str(run_dir)
         )
         docs = _documents_from_stats(str(run_dir))
-        return elapsed, docs
+        return elapsed, docs, _documents_per_rank(str(run_dir))
 
-    def fsspec_sample(workers: int, plan) -> tuple[float, int]:
+    def fsspec_sample(workers: int, plan) -> tuple[float, int, list[int]]:
         from datatrove_fsspec_reader import FsBlockRangeReader
 
         run_dir = logging_root / f"fsspec_{workers}_{int(time.time() * 1000)}"
@@ -491,7 +516,7 @@ def run_benchmark(
         executor.run()
         elapsed = time.perf_counter() - started
         docs = _documents_from_stats(str(run_dir))
-        return elapsed, docs
+        return elapsed, docs, _documents_per_rank(str(run_dir))
 
     # Pre-plan once per worker count (each rank owns exactly one range).
     plans: dict[int, tuple] = {}
@@ -500,7 +525,7 @@ def run_benchmark(
         plan = plan_single_file(cli, path, workers)
         plans[workers] = (plan, plan.planner_wall_s, time.perf_counter() - plan_started)
 
-    def run_config(kind: str, workers: int) -> tuple[float, int]:
+    def run_config(kind: str, workers: int) -> tuple[float, int, list[int]]:
         if kind == "baseline":
             return baseline_sample()
         if kind == "range":
@@ -512,7 +537,7 @@ def run_benchmark(
         configs += [("fsspec", w) for w in workers_list]
 
     results: dict[tuple[str, int], dict] = {
-        c: {"times": [], "docs": []} for c in configs
+        c: {"times": [], "docs": [], "ranks": []} for c in configs
     }
     # One discarded warm-up per config (absorbs one-time spawn/import costs).
     for kind, workers in configs:
@@ -520,12 +545,14 @@ def run_benchmark(
     # Round-robin interleaving across configs cancels slow machine drift.
     for _ in range(samples):
         for kind, workers in configs:
-            elapsed, doc_count = run_config(kind, workers)
+            elapsed, doc_count, rank_counts = run_config(kind, workers)
             results[(kind, workers)]["times"].append(elapsed)
             results[(kind, workers)]["docs"].append(doc_count)
+            results[(kind, workers)]["ranks"].append(rank_counts)
 
     baseline_times = results[("baseline", 1)]["times"]
     baseline_docs = results[("baseline", 1)]["docs"]
+    baseline_ranks = results[("baseline", 1)]["ranks"][0]
     baseline_median = sorted(baseline_times)[len(baseline_times) // 2]
 
     range_rows = []
@@ -534,6 +561,7 @@ def run_benchmark(
         actual_partitions = sum(1 for a in plan.assignments if a.length > 0)
         times = sorted(results[("range", workers)]["times"])
         doc_counts = results[("range", workers)]["docs"]
+        rank_counts = results[("range", workers)]["ranks"][0]
         median = times[len(times) // 2]
         speedup = baseline_median / median if median > 0 else float("inf")
         range_rows.append(
@@ -549,6 +577,7 @@ def run_benchmark(
                 "docs_processed": doc_counts[0],
                 "expected_docs": record_count,
                 "docs_ok": all(c == record_count for c in doc_counts),
+                "docs_per_rank": rank_counts,
                 "speedup_vs_baseline": speedup,
             }
         )
@@ -560,6 +589,7 @@ def run_benchmark(
             actual_partitions = sum(1 for a in plan.assignments if a.length > 0)
             times = sorted(results[("fsspec", workers)]["times"])
             doc_counts = results[("fsspec", workers)]["docs"]
+            rank_counts = results[("fsspec", workers)]["ranks"][0]
             median = times[len(times) // 2]
             fsspec_rows.append(
                 {
@@ -572,6 +602,7 @@ def run_benchmark(
                     "docs_processed": doc_counts[0],
                     "expected_docs": record_count,
                     "docs_ok": all(c == record_count for c in doc_counts),
+                    "docs_per_rank": rank_counts,
                     "speedup_vs_baseline": baseline_median / median
                     if median > 0
                     else float("inf"),
@@ -581,6 +612,7 @@ def run_benchmark(
     shutil.rmtree(tmp, ignore_errors=True)
     return {
         "size_mib": size_mib,
+        "profile": profile,
         "file_size": file_size,
         "file_mib": file_mib,
         "record_count": record_count,
@@ -591,12 +623,90 @@ def run_benchmark(
             "docs_processed": baseline_docs[0],
             "expected_docs": record_count,
             "docs_ok": all(c == record_count for c in baseline_docs),
+            "docs_per_rank": baseline_ranks,
             "records_sec": record_count / baseline_median if baseline_median > 0 else 0,
             "mib_sec": file_mib / baseline_median if baseline_median > 0 else 0,
         },
         "range_backed": range_rows,
         "fsspec_transport": fsspec_rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Real LocalPipelineExecutor parallelism proof
+# ---------------------------------------------------------------------------
+
+
+def run_parallelism_proof(
+    cli: Path, workers: int, size_mib: int, seed: int
+) -> dict[str, Any]:
+    """Compare native file sharding and range sharding with real tasks."""
+    tmp = Path(tempfile.mkdtemp(prefix="dtroveparallel"))
+    try:
+        fixture_dir = tmp / "data"
+        fixture_dir.mkdir()
+        path = fixture_dir / "parallel.jsonl"
+        record_count = generate_benchmark_fixture(path, size_mib, seed, "uniform")
+        file_size = path.stat().st_size
+
+        def run(pipeline, tasks: int, logging_dir: Path) -> list[int]:
+            _executor_e2e(
+                pipeline,
+                tasks=tasks,
+                workers=tasks,
+                logging_dir=str(logging_dir),
+            )
+            return _documents_per_rank(str(logging_dir))
+
+        native_one = run(
+            [JsonlReader(str(fixture_dir), glob_pattern=path.name)],
+            tasks=1,
+            logging_dir=tmp / "native-one",
+        )
+        native_tasks = run(
+            [JsonlReader(str(fixture_dir), glob_pattern=path.name)],
+            tasks=workers,
+            logging_dir=tmp / "native-tasks",
+        )
+        plan = plan_single_file(cli, path, workers)
+        range_tasks = run(
+            build_range_reader_pipeline(str(fixture_dir), path.name, plan),
+            tasks=workers,
+            logging_dir=tmp / "range-tasks",
+        )
+        return {
+            "size_mib": file_size / (1024 * 1024),
+            "file_size": file_size,
+            "record_count": record_count,
+            "workers": workers,
+            "native_one_task": {
+                "tasks": 1,
+                "workers": 1,
+                "documents_per_rank": native_one,
+                "nonzero_ranks": sum(count > 0 for count in native_one),
+            },
+            "native_n_tasks": {
+                "tasks": workers,
+                "workers": workers,
+                "documents_per_rank": native_tasks,
+                "nonzero_ranks": sum(count > 0 for count in native_tasks),
+                "total_documents": sum(native_tasks),
+            },
+            "range_n_tasks": {
+                "tasks": workers,
+                "workers": workers,
+                "documents_per_rank": range_tasks,
+                "bytes_per_rank": [a.length for a in plan.assignments]
+                + [0] * (workers - len(plan.assignments)),
+                "nonzero_ranks": sum(count > 0 for count in range_tasks),
+                "total_documents": sum(range_tasks),
+                "actual_partitions": len(plan.assignments),
+                "correct": sum(range_tasks) == record_count
+                and sum(count > 0 for count in range_tasks) >= 2,
+            },
+        }
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=["correctness", "benchmark", "fsspec", "all"],
+        choices=["correctness", "benchmark", "fsspec", "parallelism", "all"],
         default="all",
     )
     parser.add_argument(
@@ -760,6 +870,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--profile",
+        choices=["uniform", "skewed"],
+        default="uniform",
+        help="benchmark record-size profile",
+    )
     parser.add_argument("--out", type=Path, default=None, help="write JSON report here")
     return parser
 
@@ -818,6 +934,7 @@ def main() -> int:
                 args.seed,
                 logging_root,
                 fsspec=args.mode in ("all", "benchmark"),
+                profile=args.profile,
             )
             bench["label"] = label
             benchmarks.append(bench)
@@ -836,6 +953,17 @@ def main() -> int:
                     f"speedup={row['speedup_vs_baseline']:.2f}x docs_ok={row['docs_ok']}"
                 )
         report["benchmarks"] = benchmarks
+
+    if args.mode in ("parallelism", "all"):
+        parallel = run_parallelism_proof(
+            cli, workers=max(workers), size_mib=args.smoke_mib, seed=args.seed
+        )
+        report["parallelism"] = parallel
+        print(
+            "parallelism: native tasks nonzero ranks="
+            f"{parallel['native_n_tasks']['nonzero_ranks']}, range tasks nonzero "
+            f"ranks={parallel['range_n_tasks']['nonzero_ranks']}"
+        )
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
