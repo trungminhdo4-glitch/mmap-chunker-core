@@ -1,226 +1,248 @@
-# DataTrove single-file adoption proof — decision report
+# DataTrove streaming parity and real parallelism proof
 
-**Date:** 2026-08-19
-**Branch:** `feat/datatrove-single-file-adoption-proof`
-**Starting `origin/main`:** `e9fa1839847bec907aff5c03ac5b3c3205720f01` (after PR #22)
-**DataTrove tested:** `0.10.0` at commit `a649de79c14a550dc90f48a15c025f2dd3fd3b57` (editable install)
-**mmap-chunker:** `v0.2.4` CLI (`target/release/mmap-chunker`, Rust `cargo build --release`)
-**Host:** Windows 11, Python 3.12.6, Intel i7-8700 (6 cores / 12 threads), isolated venv
+**Date:** 2026-08-20
+**Classification:** `OWN_ADAPTER_FIX_REQUIRED_BEFORE_UPSTREAM`
+**Scope:** local, immutable, uncompressed UTF-8 JSONL/NDJSON only
 
-## Question
+This wave confirms that current DataTrove still shards one local file at file
+boundaries, reproduces defects in the published `mmap-chunker-core==0.2.5`
+adapter, repairs those defects on a feature branch, and proves real
+multi-worker execution with `LocalPipelineExecutor`. No release, tag, publish,
+DataTrove PR, or DataTrove issue comment was made.
 
-Can mmap-chunker-core turn one large immutable local JSONL file into useful
-parallel DataTrove work more correctly or efficiently than DataTrove's current
-file-level sharding, with low enough integration friction to justify the next
-adoption investment?
+## 1. Starting state
 
-## Confirmed upstream sharding limitation
+The isolated worktree used for this wave is
+`feat/datatrove-streaming-parity`, based on `origin/main` at
+`b8cdfa58061183bd3c57f13a70023f1889ec894d`. `origin/main` is the published
+`mmap-chunker-core v0.2.5` state; tag `v0.2.5` peels to the same commit. The
+root checkout was dirty on an unrelated branch, so it was not touched.
 
-DataTrove shards strictly **per file**:
+Live GitHub reconciliation found no open PRs or issues in the own
+`mmap-chunker-core` repository. The published `v0.2.5` release is present with
+platform archives and SHA-256 sidecars; no artifact was downloaded.
 
-* `DataFolder.get_shard` returns `all_files[rank::world_size]`
-  (`src/datatrove/io.py:180`) and `get_shard_from_paths_file` filters
-  `(pathi - rank) % world_size == 0` (`src/datatrove/io.py:411`).
-* `BaseDiskReader.run` owns one file per task; `read_file` is invoked once per
-  file (`src/datatrove/pipeline/readers/base.py:184-222, 224-252`). No reader
-  accepts byte offsets; nothing in `readers/` splits a file across ranks.
-* `LocalPipelineExecutor.world_size == tasks` (`src/datatrove/executor/local.py:169`);
-  with one input file and `tasks > 1`, extra ranks get an empty shard
-  (warning only) — the file is **not** split.
+The published package exposes `plan_file()` and
+`mmap_chunker.integrations.datatrove.RangeJsonlReader`. The release contains
+the existing Rust/C ABI and Python distribution; this wave did not change the
+ABI, version, dependencies, tag, or release artifacts.
 
-One input file therefore never becomes multiple normal reader tasks. This
-limitation is what the range-backed reader addresses.
+## 2. Live DataTrove reconciliation
 
-## Architecture candidates
+Tested DataTrove source SHA:
+`a649de79c14a550dc90f48a15c025f2dd3fd3b57`.
 
-| Approach | Description | Verdict |
-|---|---|---|
-| **A** | Every rank invokes `mmap-chunker partition --worker K` | Rejected: repeated full planning/scanning by every rank |
-| **B** | Controller pre-plans once; workers receive immutable ranges | **Chosen** |
-| **C** | Direct Python ctypes/native ABI reader | Deferred: library discovery + packaging story belongs to a future Python package wave |
-| **D** | Modify DataTrove upstream reader internals | Not needed; a custom reader is the idiomatic DataTrove extension point |
+The tested package was `datatrove==0.10.0`; the live `main` SHA above was
+checked separately. The [0.10.0 documentation](https://pypi.org/project/datatrove/0.10.0/)
+still recommends multiple medium-sized files: one task processes one file,
+and a one-file input does not become N file shards automatically. The relevant
+implementation is in [DataTrove `BaseDiskReader`](https://github.com/huggingface/datatrove/blob/a649de79c14a550dc90f48a15c025f2dd3fd3b57/src/datatrove/pipeline/readers/base.py),
+[JSONL reader](https://github.com/huggingface/datatrove/blob/a649de79c14a550dc90f48a15c025f2dd3fd3b57/src/datatrove/pipeline/readers/jsonl.py),
+[file sharding](https://github.com/huggingface/datatrove/blob/a649de79c14a550dc90f48a15c025f2dd3fd3b57/src/datatrove/io.py), and
+[LocalPipelineExecutor](https://github.com/huggingface/datatrove/blob/a649de79c14a550dc90f48a15c025f2dd3fd3b57/src/datatrove/executor/local.py).
 
-**Selected architecture (B):** the controller runs the existing
-`mmap-chunker partition FILE --parts N` CLI exactly once, parses the
-four-column TSV into a deterministic, pickle-safe manifest of immutable
-record-aligned ranges `[start, end_exclusive)`, and a custom
-`RangeJsonlReader(BaseDiskReader)` gives each rank its range via DataTrove's
-own `(rank, world_size)` interface. No new Rust API was added; the existing
-`partition` contract is used unchanged.
+Issue [#74, “In-file parallelism”](https://github.com/huggingface/datatrove/issues/74)
+remains open and relevant. Issue [#206, the large single-file/megawarc case](https://github.com/huggingface/datatrove/issues/206)
+also remains open. The current open PR list was checked; no native in-file
+parallelism implementation or duplicate merged/open PR was found. The
+de-facto workaround remains physically splitting the input into files. The
+DataTrove [contribution rules](https://github.com/huggingface/datatrove/blob/main/AGENTS.md)
+also require maintainer coordination before adding a dependency, so no
+DataTrove dependency change was attempted.
 
-## Contract
+## 3. Published `0.2.5` ground truth
 
-Supported (the only contract mmap-chunker can safely guarantee):
+An isolated venv installed from real PyPI:
 
-* local, regular, immutable files only (no remote / object-store)
-* uncompressed JSONL/NDJSON, newline-delimited records, UTF-8 content
-* byte ranges `[start, end_exclusive)`; no record crosses task ownership
-* each source record belongs to exactly one rank
-* missing final newline; empty files; very long records; malformed-JSON
-  skip behaviour identical to DataTrove
-
-Explicitly unsupported / declined (no silent fallback):
-
-* compressed files (gzip/zstd), remote/object-store paths
-* CSV semantics; non-UTF-8 payloads; lone-`\r` line terminators (old-Mac)
-* Windows note: DataTrove's `JsonlReader` opens text files with the **locale
-  codec**; UTF-8 content therefore requires `PYTHONUTF8=1` on Windows (or a
-  UTF-8 locale) for the baseline to read the file at all.
-
-## Correctness matrix (44/44 pass)
-
-Deterministic synthetic fixtures (seeded, no private data). For every case the
-single-task `JsonlReader` oracle and the range-backed reader were compared on:
-
-* logical record count
-* exact IDs (default `path/line-index` with **global** line index) and explicit ids
-* canonical content keys (sha256 of sorted `{text, metadata}`)
-* ordered text equality, numeric aggregate, combined content checksum
-* no duplicates / no missing records
-* range invariants: in-bounds, contiguous/no-overlap, full coverage, record-aligned
-  boundaries (each start follows a newline; each non-final range ends on a newline)
-* deterministic repeated plans (byte-identical TSV + equal manifest)
-
-| Fixture | Sizes (bytes) | Workers | Result |
-|---|---|---|---|
-| empty file | 0 | 1/2/4/8 | PASS |
-| one record (+/– final newline) | 33 | 1/2/4 | PASS |
-| many records LF | 147,889 | 1/2/4/8 | PASS |
-| many records, missing final newline | 147,889 | 1/2/4/8 | PASS |
-| Unicode (CJK/Greek/accents/emoji) | 32,899 | 1/2/4/8 | PASS |
-| varied record sizes (1 B – 5 KiB) | 1,208,563 | 1/2/4/8 | PASS |
-| one 1 MiB record spanning several ideal targets | 1,048,766 | 1/2/4/8 | PASS (partitions collapse to 2) |
-| highly skewed sizes | 648,480 | 1/2/4/8 | PASS (4 actual partitions at 8) |
-| requested tasks > actual partitions (2 records, 8 tasks) | 46 | 8 | PASS |
-| explicit ids | 21,714 | 1/2/4 | PASS |
-| malformed JSON line (skip parity) | 583 | 1/2/4 | PASS |
-| CRLF separators (universal-newline parity) | 42,285 | 1/2/4 | PASS |
-
-The range reader reproduces DataTrove document semantics exactly (default
-adapter, `file_path` metadata, per-line orjson with warning-and-skip,
-base64 `media_bytes`, empty-text skip).
-
-## Benchmark methodology
-
-* Fixtures generated deterministically (`orjson` JSONL, 200–400 char text).
-* Each config: one discarded warm-up, then N timed samples, **round-robin
-  interleaved** across configs to cancel machine drift; **medians** reported.
-* `e2e_median_s` = full `LocalPipelineExecutor` wall time (includes spawn /
-  Manager / pickling overhead — the real integration cost), `start_method="spawn"`.
-* Baseline = DataTrove `JsonlReader` on the same single file (tasks=1, workers=1).
-* Range-backed = `RangeJsonlReader` (tasks=workers=W, each rank one range).
-* fsspec transport = same manifest ranges read through `fsspec` open/seek/read.
-* Planning wall time (Rust `partition` subprocess) and manifest construction
-  (offsets pass) are measured separately per worker count.
-
-## Results (medians, 5 samples)
-
-### Smoke 16 MiB (51,633 records)
-
-| Config | e2e median (s) | speedup vs baseline | docs exact |
-|---|---|---|---|
-| DataTrove baseline | 1.252 | 1.00 | ✓ |
-| range 1w | 1.355 | 0.92× | ✓ |
-| range 2w | 1.770 | 0.71× | ✓ |
-| range 4w | 1.611 | 0.78× | ✓ |
-| range 8w | 1.843 | 0.68× | ✓ |
-| fsspec 1w / 2w / 4w / 8w | 1.29 / 1.67 / 1.56 / 1.85 | 0.97 / 0.75 / 0.81 / 0.68 | ✓ |
-
-### Standard 256 MiB (821,729 records)
-
-| Config | e2e median (s) | records/s | MiB/s | speedup | plan s | manifest s | docs exact |
-|---|---|---|---|---|---|---|---|
-| DataTrove baseline | 10.211 | 80.5k | 25.1 | 1.00 | – | – | ✓ |
-| range 1w | 12.303 | 66.8k | 20.8 | 0.83× | 0.007 | 0.40 | ✓ |
-| range 2w | 7.821 | 105.1k | 32.7 | **1.31×** | 0.007 | 0.76 | ✓ |
-| range 4w | 4.745 | 173.2k | 53.9 | **2.15×** | 0.007 | 0.82 | ✓ |
-| range 8w | 4.400 | 186.8k | 58.2 | **2.32×** | 0.006 | 0.40 | ✓ |
-| fsspec 1w / 2w / 4w / 8w | 12.14 / 7.38 / 4.95 / 4.18 | — | — | 0.84 / 1.38 / 2.06 / 2.45 | – | – | ✓ |
-
-### Interpretation
-
-* **16 MiB:** parallelism loses — spawn/Manager overhead (~0.4–0.6 s) exceeds
-  any parallel gain on a sub-second-to-2-second workload (0.68–0.92×). The
-  range-backed path is only useful at larger sizes on this machine.
-* **256 MiB:** 2w = 1.31× (useful signal), 4w = 2.15×, 8w = 2.32× (strong local
-  signal). Scaling is sub-linear (8 workers ≈ 4 workers) on this 6-core host.
-* **Single-worker range ≈ baseline** (0.83–0.92×): the reader-path difference
-  is real but small; the win is parallelism, not the transport.
-* **fsspec transport ≈ plain transport** (2.06–2.45× vs 2.15–2.32×): given the
-  same manifest, fsspec adds no meaningful cost. The differentiation is not the
-  byte-read transport — it is the planning/manifest.
-
-No numbers were cherry-picked; a slower/losing configuration (small files) is
-reported rather than hidden.
-
-## fsspec / Dask comparison
-
-fsspec already supports delimiter-aligned block reads (`read_block`), so
-**delimiter-aligned byte splitting is not novel** and this report does not
-claim it. However, the boundary semantics differ materially:
-
-* `read_block` aligns both ends **forward** (`seek_delimiter` seeks to the
-  first delimiter at/after the requested offset). Demonstrated: requesting a
-  block at the start of record 5 returns records `[6, 7, 8, 9]` — it **skips
-  the first record** of any mid-file range, so it cannot reproduce an exact
-  `[start, end)` range from a manifest.
-* Naive arithmetic tiling with `read_block` is not coverage-exact: fuzzing 300
-  random layouts (seed 7) found a duplicate case, reproduced deterministically
-  in the proof (24 records, 4 workers → record 11 read by workers 1 and 2).
-
-What mmap-chunker adds over plain fsspec tiling is exactly the product
-differentiation: a **deterministic, complete, non-overlapping range manifest
-with explicit worker ownership** for immutable local files — plus local
-mmap-backed planning, cross-language reuse, the C ABI, and multi-file logical
-planning (`partition-files`). If a user only needs one file read by one process,
-fsspec/DataTrove is simpler and equally good; the value appears when a single
-large file must be split across workers with exact ownership.
-
-## Unsupported cases (explicit)
-
-* compressed / remote / object-store inputs (declined, no fallback)
-* CSV or quoting semantics (raw LF byte framing only)
-* non-UTF-8 payloads; lone-`\r` terminators
-* Windows without `PYTHONUTF8=1` for UTF-8 baselines (DataTrove text-mode
-  locale codec)
-
-## Production Rust / C ABI impact
-
-**None.** No Rust source, C ABI, capability bits, ABI version, dependency,
-release workflow, or package contract changed. The proof uses only the existing
-`partition` CLI contract and pure-Python glue.
-
-## Recommendation
-
-**A — PYTHON_PACKAGE_NEXT.**
-
-Evidence: correctness is strong (44/44), the benchmark signal is credible
-(2.15–2.32× at 256 MiB, 4–8 workers), the integration is small and idiomatic
-(a custom reader is a natural DataTrove extension point), and the primary
-remaining friction is **installation**: the proof needs the standalone CLI
-built from source plus a DataTrove environment, and the reader is glued
-together by a plain Python module.
-
-The next wave should deliver a dedicated Python distribution/wheel that
-bundles the native library/CLI (ctypes-based, mirroring the existing
-`examples/jsonl_multiprocessing_proof.py` C ABI consumer), exposing the planner
-as an installable API so `RangeJsonlReader` becomes a `pip install` dependency
-rather than a hand-rolled subprocess. Once that packaging exists, a
-**DATATROVE_UPSTREAM_CANDIDATE** (option B) contribution becomes feasible and
-is the natural follow-on: the reader design fits DataTrove's extension model
-without invasive internals, but it cannot be a dependency-free upstream reader
-until the native library ships as a wheel.
-
-Not chosen: **C** (mmap/address-space was not the blocker), **D** (upstream
-modification unnecessary), **E** (correctness is robust with the existing
-manifest contract).
-
-## How to reproduce
-
-```sh
-cargo build --release
-python -m venv .dtvenv && .dtvenv/Scripts/python -m pip install -e <datatrove clone> orjson
-# Windows: set PYTHONUTF8=1 (UTF-8 baseline); start_method=spawn is used
-python examples/datatrove_single_file_proof.py --mode all --out report.json
-pytest tests/test_datatrove_range_reader.py -v   # skipped without datatrove/CLI
+```text
+mmap-chunker-core==0.2.5
+datatrove[io]==0.10.0
+orjson
 ```
+
+On a ten-record fixture with a four-part plan, the published wheel produced:
+
+| Case | Published result |
+|---|---:|
+| normal | 10 documents |
+| `skip=2` | 0 documents; loop never advances its skip counter |
+| `limit=1` | 10 documents; limit is ignored |
+| `limit=5` | 10 documents |
+| `skip=2, limit=5` | 0 documents |
+
+The published adapter also reads `fh.read(assignment.length)` and constructs
+`segment = mapping[r.start:r.end]` for offset counting. A 4+ MiB range showed
+`tracemalloc` peak of approximately 16.94 MiB in the published reader. This is
+range-size-dependent user-space materialization, not a production-safe
+streaming contract.
+
+## 4. Hypothesis audit
+
+| Hypothesis | Result | Evidence / disposition |
+|---|---|---|
+| H1: `skip` permanently continues | **Confirmed** | Published `0.2.5` never increments the relevant counter. Fixed and regression-tested. |
+| H2: `limit` parity gap | **Confirmed** | Published `0.2.5` has no effective limit check. Fixed for DataTrove's per-task semantics; `limit=0/1/5`, `skip`, and `skip+limit` are tested against a one-task oracle. |
+| H3: whole-range RAM copy | **Confirmed** | `fh.read(assignment.length)` removed. Reader now seeks and uses binary `readline()`. |
+| H4: offset slices copy ranges | **Confirmed** | `mapping[r.start:r.end]` removed. Offset construction now uses 1 MiB bounded reads. |
+| H5: benchmark is serial | **Confirmed** | The old `_range_docs()` helper directly called ranks serially and was not speed evidence. A real executor proof now uses `LocalPipelineExecutor(tasks=N, workers=N)`. |
+| H6: plan/world-size mismatch | **Confirmed** | Published behavior was implicit and could silently leave ownership gaps. The adapter now requires `world_size == plan.requested_parts`; extra collapsed ranges remain explicit empty assignments. |
+| H7: stats/document parity | **Partially confirmed, repaired** | Default/custom adapter options, IDs, metadata, document counts, `doc_len`, logical `input_files`, warnings, and malformed-line behavior are covered. `skip`/`limit` remain per-task as in `BaseDiskReader`; use a one-part plan for a whole-file global skip or limit. |
+
+`input_files` is counted once for the logical source file in aggregate range
+stats; `documents` and `doc_len` are additive across ranges. Runtime tracking
+was restored with `track_time()`.
+
+## 5. Differential parity matrix
+
+Oracle: current DataTrove `JsonlReader`, one task. Candidate: the range reader
+over all associated ranks. The post-fix matrix passed **44/44** cases, including
+ordered IDs/text, metadata, warnings where meaningful, exact no-loss/no-dup
+sets, and byte-range coverage:
+
+| Fixture family | Result |
+|---|---|
+| normal LF, trailing newline, missing final newline | PASS |
+| empty file, one record, fewer records than requested parts | PASS |
+| CRLF and UTF-8 Unicode content | PASS with UTF-8 DataTrove process mode |
+| strongly variable/skewed sizes and a 1 MiB record | PASS; collapsed partitions explicit |
+| malformed JSON line | PASS; warning-and-skip parity |
+| explicit and implicit IDs | PASS; global physical line IDs |
+| metadata, `default_metadata`, `text_key`, `id_key`, `add_file_path` | PASS |
+| custom adapter | PASS where the DataTrove adapter contract is deterministic |
+| `limit=0/1/5`, `skip`, `skip+limit` | PASS with a one-part plan, matching `BaseDiskReader` |
+
+The source integration suite passed **17 tests** after the fix. The original
+Windows run without UTF-8 mode exposed DataTrove's locale-codec behavior on the
+Unicode fixture; rerunning with `-X utf8` produced the stated 44/44 result.
+
+## 6. Real `LocalPipelineExecutor` proof
+
+Fixture: deterministic 32 MiB uniform JSONL, 103,150 documents, four tasks and
+four workers.
+
+| Run | Documents per rank | Non-zero ranks | Total |
+|---|---:|---:|---:|
+| Native `JsonlReader`, 1 task | `[103150]` | 1 | 103150 |
+| Native `JsonlReader`, 4 tasks | `[103150, 0, 0, 0]` | 1 | 103150 |
+| `RangeJsonlReader`, 4 tasks | `[25827, 25807, 25773, 25743]` | 4 | 103150 |
+
+Range byte counts were `[8388692, 8388940, 8388438, 8388661]`; they are
+contiguous, non-overlapping, and cover the complete file. The independent
+oracle count, ordered IDs/text, checksum, and parsed-document equality all
+matched. This proves actual task parallelism; it is not the previous serial
+helper loop.
+
+## 7. Benchmark evidence
+
+Runs used deterministic fixtures, one warm-up, repeated samples, median wall
+time, real `LocalPipelineExecutor`, and workers 1/2/4. Planning and manifest
+construction were recorded separately. Peak-RSS was not claimed because no
+new heavy measurement dependency was introduced; `tracemalloc` regression
+checks cover user-space allocation behavior.
+
+| Profile / size | Native baseline | Range 1 worker | Range 2 workers | Range 4 workers |
+|---|---:|---:|---:|---:|
+| uniform / 32 MiB | 1.656 s | 1.416 s / 1.17x | 1.694 s / 0.98x | 1.546 s / 1.07x |
+| uniform / 256 MiB | 8.990 s | 7.055 s / 1.27x | 4.760 s / 1.89x | 3.243 s / 2.77x |
+| skewed / 32 MiB | 1.332 s | 1.255 s / 1.06x | 1.574 s / 0.85x | 1.491 s / 0.89x |
+| skewed / 64 MiB | 1.924 s | 1.936 s / 0.99x | 1.940 s / 0.99x | 1.688 s / 1.14x |
+
+Uniform 256 MiB throughput was 28.5 MiB/s for the native baseline versus
+36.3/53.8/78.9 MiB/s for range workers 1/2/4. The 32 MiB results show the
+startup and executor overhead clearly; skewed records reduce the advantage.
+These are local cache/storage observations, not universal performance claims.
+
+The benchmark also ran the fsspec transport variant. It preserved correctness
+and was close to the binary local reader, so the result is about exact planning
+and ownership plus parallel enablement, not a claim that mmap is the only
+possible transport.
+
+## 8. Memory-scaling result
+
+The post-fix reader uses `seek(start)` plus bounded binary `readline()` and
+parses one record at a time. Offset manifests scan 1 MiB blocks and retain only
+integer offsets. Regression fixtures were larger than 4 MiB for record reading
+and larger than 12 MiB for offset construction; both stayed below their
+bounded-allocation assertions (`<2 MiB` and `<8 MiB`, respectively). The design
+is O(max-record-size + bounded buffer + manifest), not O(worker-range-size).
+
+The published 0.2.5 behavior is kept separate above: its whole-range read
+peaked at approximately 16.94 MiB on the 4+ MiB fixture.
+
+## 9. Files changed
+
+Only focused Python integration, proof, test, and report files changed:
+
+* `python/mmap_chunker/integrations/datatrove.py`
+* `python/tests/test_datatrove_integration.py`
+* `examples/datatrove_jsonl_range_reader.py`
+* `examples/datatrove_fsspec_reader.py`
+* `examples/datatrove_single_file_proof.py`
+* `DATATROVE_ADOPTION_REPORT.md`
+
+No Rust source, C header, ABI, dependency manifest, version, tag, release
+workflow, `.env`, credential, or private configuration file was touched.
+
+## 10. Validation
+
+Completed before handoff:
+
+* published PyPI baseline: reproduced H1/H2/H3/H4;
+* post-fix parity: 44/44;
+* source DataTrove integration tests: 17 passed;
+* real LocalPipelineExecutor proof: native one-file sharding versus four
+  range-owning ranks;
+* uniform and skewed benchmark reports under `.audit-results/`;
+* `python -m py_compile` for changed Python files;
+* Rust `cargo fmt --check`, `cargo check`, `cargo clippy --all-targets -- -D warnings`,
+  and `cargo test` are required final checks even though Rust code is unchanged;
+* the final staged diff check and full staged diff review are performed below,
+  immediately before commit.
+
+## 11. Conditional Issue #74 proposal (prepared, not posted)
+
+> DataTrove `0.10.0` at main SHA `a649de79c14a550dc90f48a15c025f2dd3fd3b57`
+> still assigns one local file to one task; with four tasks, three ranks are
+> empty. We tested a small external `mmap-chunker-core` adapter for immutable,
+> uncompressed local JSONL/NDJSON. It plans record-aligned ranges once and
+> streams each worker range without materializing it. On a 32 MiB fixture,
+> native 4-task execution processed `[103150,0,0,0]`, while the adapter
+> processed `[25827,25807,25773,25743]`, exactly once each. On a 256 MiB
+> uniform fixture, four workers measured 3.243 s versus 8.990 s for the native
+> one-task baseline on this machine; smaller/skewed files were often neutral.
+> Usage is approximately:
+>
+> ```python
+> from mmap_chunker import plan_file
+> from mmap_chunker.integrations.datatrove import RangeJsonlReader
+> plan = plan_file("records.jsonl", parts=4)
+> reader = RangeJsonlReader("records.jsonl", plan)
+> ```
+>
+> The current PyPI `0.2.5` adapter has known `skip`/`limit` and whole-range
+> memory defects; the repaired source is not released in this wave. Would
+> maintainers prefer an optional adapter, external documentation, or a native
+> DataTrove implementation? The supported scope is local/immutable/
+> uncompressed/newline-delimited JSONL only.
+
+This text is deliberately held for owner review. No upstream issue comment or
+PR was opened.
+
+## 12. Git deliverable and decision
+
+The feature branch, commit SHA, draft PR URL, bundle path, bundle SHA-256, and
+`git bundle verify` result are recorded in the final handoff after validation.
+No force-push, main push, release, publish, or upstream action is permitted by
+this wave.
+
+**Final readiness:** the DataTrove adoption gap is real and the repaired source
+is production-shaped, but the published package is not yet fixed. Therefore
+the correct classification is
+`OWN_ADAPTER_FIX_REQUIRED_BEFORE_UPSTREAM`, with the next gate being an owner
+decision on releasing the focused adapter fix and then re-running the same
+published-package proof.
+
+**Single recommended next action:** owner-review the focused feature branch
+and decide whether to authorize a small `0.2.6` release wave; do not contact
+DataTrove until the repaired adapter is published and the evidence is rerun
+against that release.

@@ -27,7 +27,9 @@ document semantics exactly: the default adapter (``text``/``id``/``media``/
 ``metadata``), ``file_path`` metadata, per-line ``orjson`` parsing with
 warning-and-skip on malformed JSON, base64 ``media_bytes`` handling, and the
 default ``id = f"{filepath}/{line_index}"`` scheme using the *global* line
-index so IDs are byte-for-byte identical to a single-task reader.
+index so IDs are byte-for-byte identical to a single-task reader. ``skip`` and
+``limit`` retain DataTrove's per-task semantics; use one requested part for a
+whole-file global skip or limit.
 
 Requires the ``datatrove`` package and ``orjson`` (normally installed via
 ``datatrove[io]``). The planner additionally requires the standalone
@@ -39,7 +41,6 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 import hashlib
-import mmap
 import os
 from pathlib import Path
 import subprocess
@@ -54,6 +55,7 @@ from datatrove.utils.logging import logger
 
 DEFAULT_DELIMITER = 0x0A
 PLANNER_TIMEOUT = 120.0
+OFFSET_SCAN_BLOCK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class SingleFilePlan:
 
     file_path: str
     file_size: int
+    requested_parts: int
     assignments: tuple[RangeAssignment, ...]
     delimiter: int
     planner_cmd: tuple[str, ...]
@@ -165,7 +168,7 @@ def _compute_record_offsets(
     Partitions are contiguous and each non-final range ends immediately
     after a newline, so the number of complete lines in a range equals its
     newline count, plus one for a final range that does not end in a newline.
-    This single C-speed pass is part of manifest construction and is reported
+    This bounded scan is part of manifest construction and is reported
     separately from Rust planning wall time.
     """
     if not rows:
@@ -173,18 +176,27 @@ def _compute_record_offsets(
     offsets: list[int] = []
     running = 0
     with open(path, "rb") as fh:
-        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
-            for i, (_index, start, end, _length) in enumerate(rows):
-                offsets.append(running)
-                if start >= end:
-                    continue
-                segment = mapping[start:end]
-                newlines = segment.count(b"\n")
-                is_final = i == len(rows) - 1
-                if is_final and segment and segment[-1:] != b"\n":
-                    running += newlines + 1
-                else:
-                    running += newlines
+        for i, (_index, start, end, length) in enumerate(rows):
+            offsets.append(running)
+            fh.seek(start)
+            remaining = length
+            newlines = 0
+            last_byte = b""
+            while remaining:
+                block = fh.read(min(remaining, OFFSET_SCAN_BLOCK_SIZE))
+                if not block:
+                    raise OSError(
+                        f"short read while counting record offsets for range "
+                        f"[{start}, {end})"
+                    )
+                newlines += block.count(b"\n")
+                last_byte = block[-1:]
+                remaining -= len(block)
+            is_final = i == len(rows) - 1
+            if is_final and length and last_byte != b"\n":
+                running += newlines + 1
+            else:
+                running += newlines
     return offsets
 
 
@@ -218,6 +230,7 @@ def plan_single_file(
     return SingleFilePlan(
         file_path=str(path),
         file_size=file_size,
+        requested_parts=parts,
         assignments=assignments,
         delimiter=delimiter,
         planner_cmd=tuple(cli.parts),
@@ -299,16 +312,34 @@ class RangeJsonlReader(BaseDiskReader):
             )
 
     def run(self, data=None, rank: int = 0, world_size: int = 1):
+        if world_size != self.plan.requested_parts:
+            raise ValueError(
+                "world_size must equal plan.requested_parts for deterministic "
+                f"range ownership, got world_size={world_size}, "
+                f"plan.requested_parts={self.plan.requested_parts}"
+            )
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank must be in [0, world_size), got {rank}")
         if data:
             yield from data
         assignment = self.plan.assignment_for_rank(rank)
         if assignment is None or assignment.length <= 0:
+            if not self.plan.assignments and rank == 0:
+                self.stat_update("input_files")
+                self.stat_update("documents", value=0, unit="input_file")
             return
-        self.stat_update("input_files")
+        # The N ranges are views of one logical input file. Count that source
+        # once in aggregate stats, like BaseDiskReader does for one file.
+        if rank == 0:
+            self.stat_update("input_files")
+        skipped = 0
         ndocs = 0
         for document in self._read_range(assignment):
-            if self.skip and ndocs < self.skip:
+            if skipped < self.skip:
+                skipped += 1
                 continue
+            if self.limit != -1 and ndocs >= self.limit:
+                break
             ndocs += 1
             self.update_doc_stats(document)
             yield document
@@ -324,46 +355,52 @@ class RangeJsonlReader(BaseDiskReader):
     def _read_range(self, assignment: RangeAssignment) -> Iterable:
         with open(self.plan.file_path, "rb") as fh:
             fh.seek(assignment.start)
-            data = fh.read(assignment.length)
-        if len(data) != assignment.length:
-            raise OSError(
-                f"short read: expected {assignment.length} bytes, got {len(data)}"
-            )
-        yield from self._documents_from_bytes(data, assignment)
+            offset = assignment.start
+            local_li = 0
+            while offset < assignment.end_exclusive:
+                line = fh.readline()
+                if not line:
+                    raise OSError(
+                        f"short read: expected range [{assignment.start}, "
+                        f"{assignment.end_exclusive}), stopped at {offset}"
+                    )
+                offset += len(line)
+                if offset > assignment.end_exclusive:
+                    raise OSError(
+                        f"range [{assignment.start}, {assignment.end_exclusive}) "
+                        "splits a record"
+                    )
+                yield from self._documents_from_line(line, assignment, local_li)
+                local_li += 1
 
-    def _documents_from_bytes(
-        self, data: bytes, assignment: RangeAssignment
+    def _documents_from_line(
+        self, line: bytes, assignment: RangeAssignment, local_li: int
     ) -> Iterable:
-        """Parse range bytes into DataTrove documents (shared by transports)."""
+        """Parse one bounded line into DataTrove documents."""
         try:
-            text = data.decode("utf-8")
+            with self.track_time():
+                text = line.decode("utf-8")
+                parsed = orjson.loads(text)
+                for media in parsed.get("media", []):
+                    if media["media_bytes"] is not None:
+                        media["media_bytes"] = base64.decodebytes(
+                            media["media_bytes"].encode("ascii")
+                        )
+                global_li = assignment.record_offset + local_li
+                document = self.get_document_from_dict(
+                    parsed, self.source_file, global_li
+                )
+                if document:
+                    yield document
         except UnicodeDecodeError as error:
             logger.warning(
                 f"File `{self.plan.file_path}` may be corrupted: "
                 f"raised UnicodeDecodeError ({error})"
             )
             return
-        for local_li, line in enumerate(_split_lines(text)):
-            with self.track_time():
-                try:
-                    parsed = orjson.loads(line)
-                    for media in parsed.get("media", []):
-                        if media["media_bytes"] is not None:
-                            media["media_bytes"] = base64.decodebytes(
-                                media["media_bytes"].encode("ascii")
-                            )
-                    global_li = assignment.record_offset + local_li
-                    document = self.get_document_from_dict(
-                        parsed, self.source_file, global_li
-                    )
-                    if not document:
-                        continue
-                except (EOFError, JSONDecodeError) as error:
-                    logger.warning(
-                        f"Error when reading `{self.plan.file_path}`: {error}"
-                    )
-                    continue
-            yield document
+        except (EOFError, JSONDecodeError) as error:
+            logger.warning(f"Error when reading `{self.plan.file_path}`: {error}")
+            return
 
 
 def build_range_reader_pipeline(

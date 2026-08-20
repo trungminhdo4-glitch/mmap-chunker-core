@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 import tempfile
 import time
+import tracemalloc
 
 import pytest
 
@@ -77,6 +78,31 @@ def _range_docs(reader, parts: int) -> list:
     return docs
 
 
+def _rank_document_counts(logging_dir: Path) -> list[int]:
+    counts = []
+    for stats_path in sorted((logging_dir / "stats").glob("*.json")):
+        payload = json.loads(stats_path.read_text(encoding="utf-8"))
+        reader_stats = next(
+            (step["stats"] for step in payload if "documents" in step["stats"]),
+            {},
+        )
+        documents = reader_stats.get("documents", 0)
+        counts.append(documents["total"] if isinstance(documents, dict) else documents)
+    return counts
+
+
+def _aggregate_reader_stats(logging_dir: Path) -> dict[str, int]:
+    totals = {"input_files": 0, "documents": 0, "doc_len": 0}
+    for stats_path in sorted((logging_dir / "stats").glob("*.json")):
+        payload = json.loads(stats_path.read_text(encoding="utf-8"))
+        for step in payload:
+            stats = step.get("stats", {})
+            for key in totals:
+                value = stats.get(key, 0)
+                totals[key] += value.get("total", 0) if isinstance(value, dict) else value
+    return totals
+
+
 def test_core_package_imports_without_datatrove() -> None:
     # The base package must be importable without datatrove installed.
     import mmap_chunker
@@ -117,6 +143,175 @@ def test_records_match_across_workers(tmp_path: Path) -> None:
     reader = RangeJsonlReader(path, plan)
     seen = [d.metadata["value"] for d in _range_docs(reader, 8)]
     assert sorted(seen) == list(range(100))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_ids"),
+    [
+        ({"limit": 0}, []),
+        ({"limit": 1}, ["f.jsonl/0"]),
+        ({"limit": 5}, [f"f.jsonl/{i}" for i in range(5)]),
+        ({"skip": 2}, [f"f.jsonl/{i}" for i in range(2, 10)]),
+        (
+            {"skip": 2, "limit": 5},
+            [f"f.jsonl/{i}" for i in range(2, 7)],
+        ),
+    ],
+)
+def test_limit_and_skip_match_datatrove_single_task(
+    tmp_path: Path, kwargs: dict, expected_ids: list[str]
+) -> None:
+    records = [{"text": f"record-{i}", "value": i} for i in range(10)]
+    path = tmp_path / "f.jsonl"
+    _write_jsonl(path, records)
+
+    oracle = list(
+        JsonlReader(str(tmp_path), glob_pattern="f.jsonl", **kwargs).run(
+            data=None, rank=0, world_size=1
+        )
+    )
+    plan = plan_file(path, parts=1)
+    candidate = list(RangeJsonlReader(path, plan, **kwargs).run(data=None, rank=0, world_size=1))
+
+    assert [document.id for document in oracle] == expected_ids
+    assert [document.id for document in candidate] == expected_ids
+
+
+def test_plan_world_size_mismatch_is_explicit(tmp_path: Path) -> None:
+    path = tmp_path / "f.jsonl"
+    _write_jsonl(path, [{"text": f"record-{i}"} for i in range(10)])
+    plan = plan_file(path, parts=4)
+    reader = RangeJsonlReader(path, plan)
+
+    with pytest.raises(ValueError, match="world_size must equal plan.requested_parts"):
+        list(reader.run(data=None, rank=0, world_size=2))
+
+
+def test_adapter_metadata_keys_and_custom_adapter_match_oracle(tmp_path: Path) -> None:
+    records = [
+        {
+            "body": f"body-{i}",
+            "custom_id": f"custom-{i}",
+            "metadata": {"source": "fixture", "row": i},
+            "value": i,
+        }
+        for i in range(4)
+    ]
+    path = tmp_path / "options.jsonl"
+    _write_jsonl(path, records)
+    kwargs = {
+        "text_key": "body",
+        "id_key": "custom_id",
+        "default_metadata": {"batch": "parity"},
+        "add_file_path": False,
+    }
+    oracle = list(
+        JsonlReader(str(tmp_path), glob_pattern="options.jsonl", **kwargs).run(
+            data=None, rank=0, world_size=1
+        )
+    )
+    plan = plan_file(path, parts=1)
+    candidate = list(
+        RangeJsonlReader(path, plan, **kwargs).run(data=None, rank=0, world_size=1)
+    )
+
+    assert [(d.id, d.text, d.metadata) for d in candidate] == [
+        (d.id, d.text, d.metadata) for d in oracle
+    ]
+    assert all("file_path" not in d.metadata for d in candidate)
+
+    def adapter(self, data, path, id_in_file):
+        return {
+            "text": data["body"].upper(),
+            "id": f"adapted-{id_in_file}",
+            "metadata": {"adapter_path": path},
+        }
+
+    oracle_custom = list(
+        JsonlReader(
+            str(tmp_path), glob_pattern="options.jsonl", adapter=adapter
+        ).run(data=None, rank=0, world_size=1)
+    )
+    candidate_custom = list(
+        RangeJsonlReader(path, plan, adapter=adapter).run(
+            data=None, rank=0, world_size=1
+        )
+    )
+    assert [(d.id, d.text, d.metadata) for d in candidate_custom] == [
+        (d.id, d.text, d.metadata) for d in oracle_custom
+    ]
+
+
+def test_range_reader_does_not_materialize_the_whole_range(tmp_path: Path) -> None:
+    path = tmp_path / "large.jsonl"
+    record = {"text": "x" * 100, "value": 0}
+    _write_jsonl(path, [record] * 40_000)
+    plan = plan_file(path, parts=1)
+    reader = RangeJsonlReader(path, plan)
+
+    tracemalloc.start()
+    first = next(reader._read_range(plan.ranges[0]))
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert first.text == record["text"]
+    assert path.stat().st_size > 4 * 1024 * 1024
+    assert peak < 2 * 1024 * 1024
+
+
+def test_record_offset_manifest_uses_bounded_reads(tmp_path: Path) -> None:
+    path = tmp_path / "offsets.jsonl"
+    record = {"text": "y" * 100, "value": 0}
+    _write_jsonl(path, [record] * 120_000)
+    plan = plan_file(path, parts=4)
+
+    tracemalloc.start()
+    reader = RangeJsonlReader(path, plan)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert reader._offsets[0] == 0
+    assert len(reader._offsets) == 4
+    assert all(a < b for a, b in zip(reader._offsets, reader._offsets[1:]))
+    assert path.stat().st_size > 12 * 1024 * 1024
+    assert peak < 8 * 1024 * 1024
+
+
+def test_local_executor_really_spreads_one_file_across_ranks(tmp_path: Path) -> None:
+    records = [{"text": f"record-{i}", "value": i} for i in range(100)]
+    path = tmp_path / "f.jsonl"
+    _write_jsonl(path, records)
+
+    baseline_log = tmp_path / "baseline-log"
+    LocalPipelineExecutor(
+        pipeline=[JsonlReader(str(tmp_path), glob_pattern="f.jsonl")],
+        tasks=4,
+        workers=4,
+        start_method="spawn",
+        logging_dir=str(baseline_log),
+        skip_completed=False,
+    ).run()
+    baseline_counts = _rank_document_counts(baseline_log)
+
+    plan = plan_file(path, parts=4)
+    range_log = tmp_path / "range-log"
+    LocalPipelineExecutor(
+        pipeline=[RangeJsonlReader(path, plan)],
+        tasks=4,
+        workers=4,
+        start_method="spawn",
+        logging_dir=str(range_log),
+        skip_completed=False,
+    ).run()
+    range_counts = _rank_document_counts(range_log)
+    baseline_stats = _aggregate_reader_stats(baseline_log)
+    range_stats = _aggregate_reader_stats(range_log)
+
+    assert sum(baseline_counts) == len(records)
+    assert sum(count > 0 for count in baseline_counts) == 1
+    assert sum(range_counts) == len(records)
+    assert sum(count > 0 for count in range_counts) >= 2
+    assert range_stats == baseline_stats
 
 
 def test_empty_file_no_assignments(tmp_path: Path) -> None:

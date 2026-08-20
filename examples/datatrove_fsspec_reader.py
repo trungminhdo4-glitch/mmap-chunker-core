@@ -28,11 +28,20 @@ class FsBlockRangeReader(RangeJsonlReader):
         fs = fsspec.filesystem("file")
         with fs.open(self.plan.file_path, "rb") as fh:
             fh.seek(assignment.start)
-            data = fh.read(assignment.length)
-        if len(data) != assignment.length:
-            raise OSError(
-                f"fsspec read returned {len(data)} bytes, expected "
-                f"{assignment.length} for range "
-                f"[{assignment.start}, {assignment.end_exclusive})"
-            )
-        yield from self._documents_from_bytes(data, assignment)
+            offset = assignment.start
+            local_li = 0
+            while offset < assignment.end_exclusive:
+                line = fh.readline()
+                if not line:
+                    raise OSError(
+                        f"short fsspec read for range [{assignment.start}, "
+                        f"{assignment.end_exclusive}), stopped at {offset}"
+                    )
+                offset += len(line)
+                if offset > assignment.end_exclusive:
+                    raise OSError(
+                        f"range [{assignment.start}, {assignment.end_exclusive}) "
+                        "splits a record"
+                    )
+                yield from self._documents_from_line(line, assignment, local_li)
+                local_li += 1
