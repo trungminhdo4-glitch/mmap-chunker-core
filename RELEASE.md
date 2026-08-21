@@ -6,7 +6,7 @@ Three independent version domains:
 
 | Domain        | Current  | Controls                                  |
 |---------------|----------|-------------------------------------------|
-| Crate SemVer  | 0.2.5    | crates.io package, PyPI distribution, GitHub tag, Release |
+| Crate SemVer  | 0.2.6    | crates.io package, PyPI distribution, GitHub tag, Release |
 | C ABI         | 1.3      | Additive C API capability evolution       |
 | Rust MSRV     | 1.77     | Minimum Supported Rust Version            |
 
@@ -16,7 +16,7 @@ package version is derived from `Cargo.toml` (`setup.py` reads it directly).
 inherits the same Cargo-derived version. Crate SemVer, C ABI version, and Rust
 MSRV evolve independently.
 
-## Release Artifact Inventory (v0.2.5)
+## Release Artifact Inventory (v0.2.6)
 
 The release produces one verified artifact set from the release commit:
 
@@ -26,13 +26,13 @@ The release produces one verified artifact set from the release commit:
   sidecar. Python wheels are **not** duplicated on GitHub Releases; PyPI is
   their distribution channel.
 - **PyPI**: 5 platform wheels + 1 sdist:
-  - `mmap_chunker_core-0.2.5-py3-none-manylinux_2_17_x86_64.whl`
-  - `mmap_chunker_core-0.2.5-py3-none-manylinux_2_17_aarch64.whl`
-  - `mmap_chunker_core-0.2.5-py3-none-macosx_*_x86_64.whl`
-  - `mmap_chunker_core-0.2.5-py3-none-macosx_*_arm64.whl`
-  - `mmap_chunker_core-0.2.5-py3-none-win_amd64.whl`
-  - `mmap_chunker_core-0.2.5.tar.gz`
-- **crates.io**: `mmap-chunker-core-0.2.5` crate (from `cargo package`).
+  - `mmap_chunker_core-0.2.6-py3-none-manylinux_2_17_x86_64.whl`
+  - `mmap_chunker_core-0.2.6-py3-none-manylinux_2_17_aarch64.whl`
+  - `mmap_chunker_core-0.2.6-py3-none-macosx_*_x86_64.whl`
+  - `mmap_chunker_core-0.2.6-py3-none-macosx_*_arm64.whl`
+  - `mmap_chunker_core-0.2.6-py3-none-win_amd64.whl`
+  - `mmap_chunker_core-0.2.6.tar.gz`
+- **crates.io**: `mmap-chunker-core-0.2.6` crate (from `cargo package`).
 
 ## Trusted Publishing (OIDC) Architecture
 

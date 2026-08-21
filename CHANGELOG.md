@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-08-20
+
+### Fixed
+
+- DataTrove `RangeJsonlReader` now honors `skip` and `limit`.
+- Range processing no longer materializes an entire worker partition in
+  Python memory.
+- Global line-offset construction now scans in bounded chunks instead of
+  copying large mmap slices.
+- Plan/executor world-size mismatches now fail explicitly.
+
+### Validation
+
+- Differential parity against DataTrove 0.10.0.
+- Real `LocalPipelineExecutor` single-file multi-rank proof.
+- No-loss/no-duplicate range coverage.
+
 ## [0.2.5] — 2026-08-19
 
 ### Added
