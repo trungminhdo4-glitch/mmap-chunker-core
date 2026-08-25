@@ -9,6 +9,7 @@ partition`` output on the same fixtures.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import random
@@ -34,6 +35,27 @@ except ImportError:
     _FROM_SOURCE = True
 
 from mmap_chunker import Plan, PlanningError, Range, plan_file  # noqa: E402
+from mmap_chunker import planning  # noqa: E402
+
+
+SIZE_T_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
+
+
+class _ComparisonBypassInt(int):
+    def __lt__(self, other) -> bool:
+        return False
+
+    def __le__(self, other) -> bool:
+        return True
+
+    def __gt__(self, other) -> bool:
+        return False
+
+    def __ge__(self, other) -> bool:
+        return True
+
+    def __int__(self) -> int:
+        return 1
 
 
 def _cargo_version() -> str:
@@ -142,6 +164,19 @@ def test_delimiter_representations(delimiter) -> None:
     _write_fixture(p, [{"text": "x"}] * 20)
     plan = plan_file(p, parts=4, delimiter=delimiter)
     _verify_plan(p, plan, 10, 4)
+
+
+def test_int_subclasses_are_canonicalized(tmp_path: Path) -> None:
+    p = tmp_path / "f.jsonl"
+    _write_fixture(p, [{"text": "x"}] * 20)
+
+    plan = plan_file(
+        p, parts=_ComparisonBypassInt(4), delimiter=_ComparisonBypassInt(10)
+    )
+
+    _verify_plan(p, plan, 10, 4)
+    assert type(plan.requested_parts) is int
+    assert type(plan.delimiter) is int
 
 
 @pytest.mark.parametrize("parts", [1, 2, 4, 8])
@@ -281,6 +316,8 @@ def test_reject_invalid_inputs(tmp_path: Path) -> None:
         plan_file(p, parts=-1)
     with pytest.raises(TypeError):
         plan_file(p, parts="8")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        plan_file(p, parts=True)
     with pytest.raises(ValueError):
         plan_file(p, parts=4, delimiter=b"\r\n")  # multi-byte delimiter
     with pytest.raises(TypeError):
@@ -299,6 +336,39 @@ def test_reject_invalid_inputs(tmp_path: Path) -> None:
         plan_file(tmp_path / "nul\x00path.jsonl", parts=4)
     with pytest.raises(TypeError):
         plan_file(12345, parts=4)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "parts", [SIZE_T_MAX + 1, SIZE_T_MAX + 2, _ComparisonBypassInt(SIZE_T_MAX + 1)]
+)
+def test_reject_parts_above_size_t_before_native_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parts: int
+) -> None:
+    p = tmp_path / "f.jsonl"
+    _write_fixture(p, [{"text": "x"}])
+
+    def unexpected_native_load():
+        pytest.fail("native library must not be loaded for invalid parts")
+
+    monkeypatch.setattr(planning._native, "get_library", unexpected_native_load)
+
+    with pytest.raises(OverflowError, match="platform size_t maximum"):
+        plan_file(p, parts=parts)
+
+
+def test_reject_malicious_delimiter_before_native_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p = tmp_path / "f.jsonl"
+    _write_fixture(p, [{"text": "x"}])
+
+    def unexpected_native_load():
+        pytest.fail("native library must not be loaded for an invalid delimiter")
+
+    monkeypatch.setattr(planning._native, "get_library", unexpected_native_load)
+
+    with pytest.raises(ValueError, match="byte value 0..255"):
+        plan_file(p, parts=4, delimiter=_ComparisonBypassInt(256))
 
 
 def test_fixture_reconstruction_matches_oracle(tmp_path: Path) -> None:
