@@ -191,6 +191,27 @@ fn partitions_cover_representative_record_layouts() {
 }
 
 #[test]
+fn exact_record_boundaries_produce_four_cli_ranges() {
+    let (directory, path) = write_fixture(
+        "exact_boundaries",
+        OsString::from("four-records.jsonl"),
+        b"a\nb\nc\nd\n",
+    );
+    let output = run_partition(&path, "4", None, None);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        parse_ranges(&output.stdout),
+        vec![(0, 0, 2, 2), (1, 2, 4, 2), (2, 4, 6, 2), (3, 6, 8, 2)]
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn configurable_delimiter_covers_required_bytes_and_default_equivalence() {
     let cases: &[(&str, &[u8], u8, &str)] = &[
         ("lf", b"one\ntwo\nthree\n", b'\n', "records.txt"),

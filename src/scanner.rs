@@ -191,21 +191,25 @@ mod differential_tests {
         let mut cut_points = Vec::new();
         let mut last_cut = 0;
 
-        for partition in 1..num_partitions {
-            let target = data.len() * partition / num_partitions;
+        let n = num_partitions.min(data.len());
+        for partition in 1..n {
+            let target = ((data.len() as u128) * (partition as u128) / (n as u128)) as usize;
             if target <= last_cut {
                 continue;
             }
 
-            let mut position = target;
-            while position < data.len() && data[position] != delimiter {
-                position += 1;
-            }
-
-            let cut = if position < data.len() {
-                position + 1
+            let cut = if data[target - 1] == delimiter {
+                target
             } else {
-                data.len()
+                let mut position = target;
+                while position < data.len() && data[position] != delimiter {
+                    position += 1;
+                }
+                if position < data.len() {
+                    position + 1
+                } else {
+                    data.len()
+                }
             };
             cut_points.push(cut);
             last_cut = cut;
@@ -1057,10 +1061,11 @@ pub fn fixed_chunk_bounds(
 /// Compute N record-aligned partition boundaries covering `data`.
 ///
 /// For each partition boundary `i = 1..N-1`, computes an ideal absolute
-/// target position at `floor(data.len() * i / N)`, then searches forward
-/// to the next occurrence of `delimiter`. Each boundary is placed
-/// immediately after the delimiter byte (delimiter included in the
-/// preceding partition).
+/// target position at `floor(data.len() * i / N)`. If the target already
+/// follows `delimiter`, it is accepted exactly; otherwise the search proceeds
+/// forward from the target to the next delimiter. Each boundary is placed
+/// immediately after the delimiter byte (delimiter included in the preceding
+/// partition).
 ///
 /// If a single record spans multiple ideal target positions, those
 /// boundaries collapse to the end of that record (deduplication). The
@@ -1118,6 +1123,12 @@ pub fn find_partition_boundaries(
         // Overflow-safe: use u128 intermediate for multiplication.
         let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
         if target <= last_boundary {
+            continue;
+        }
+
+        if data[target - 1] == delimiter {
+            boundaries.push(target);
+            last_boundary = target;
             continue;
         }
 
@@ -2576,6 +2587,34 @@ mod tests {
         assert_eq!(
             find_partition_boundaries(data, 1, b'\n'),
             vec![(0, data.len())]
+        );
+    }
+
+    #[test]
+    fn partition_accepts_exact_target_boundaries() {
+        assert_eq!(
+            find_partition_boundaries(b"a\nb\nc\nd\n", 4, b'\n'),
+            vec![(0, 2), (2, 4), (4, 6), (6, 8)]
+        );
+        assert_eq!(
+            find_partition_boundaries(b"a\r\nb\r\nc\r\nd\r\n", 4, b'\n'),
+            vec![(0, 3), (3, 6), (6, 9), (9, 12)]
+        );
+    }
+
+    #[test]
+    fn partition_exact_targets_preserve_record_edge_cases() {
+        assert_eq!(
+            find_partition_boundaries(b"a\nb\nc\nd", 4, b'\n'),
+            vec![(0, 2), (2, 4), (4, 6), (6, 7)]
+        );
+        assert_eq!(
+            find_partition_boundaries(b"a\n\nb\n", 4, b'\n'),
+            vec![(0, 2), (2, 3), (3, 5)]
+        );
+        assert_eq!(
+            find_partition_boundaries(b"aaaa\nb\nc\n", 4, b'\n'),
+            vec![(0, 5), (5, 7), (7, 9)]
         );
     }
 
