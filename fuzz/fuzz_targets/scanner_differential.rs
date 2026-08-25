@@ -109,11 +109,17 @@ fn scalar_partition(data: &[u8], partitions: usize, delimiter: u8) -> Vec<(usize
         return vec![(0, data.len())];
     }
 
+    let n = partitions.min(data.len());
     let mut cuts = Vec::new();
     let mut last_cut = 0;
-    for partition in 1..partitions {
-        let target = ((data.len() as u128 * partition as u128) / partitions as u128) as usize;
+    for partition in 1..n {
+        let target = ((data.len() as u128 * partition as u128) / n as u128) as usize;
         if target <= last_cut {
+            continue;
+        }
+        if data[target - 1] == delimiter {
+            cuts.push(target);
+            last_cut = target;
             continue;
         }
         let mut position = target;

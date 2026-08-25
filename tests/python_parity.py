@@ -62,11 +62,16 @@ def partition_reference(data: bytes, count: int, delimiter: int) -> list[bytes]:
     """Use independent absolute targets and forward byte searches."""
     if not data or count == 0:
         return []
+    count = min(count, len(data))
     boundaries: list[int] = []
     last = 0
     for index in range(1, count):
         target = len(data) * index // count
         if target <= last:
+            continue
+        if data[target - 1] == delimiter:
+            last = target
+            boundaries.append(last)
             continue
         found = data.find(bytes((delimiter,)), target)
         if found == -1:
