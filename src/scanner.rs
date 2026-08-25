@@ -989,7 +989,7 @@ pub(crate) fn find_byte_swar(haystack: &[u8], delimiter: u8) -> Option<usize> {
     // Phase 2: SWAR main loop (8-byte reads)
     while i + 8 <= len {
         let chunk: [u8; 8] = haystack[i..i + 8].try_into().unwrap();
-        let word = u64::from_ne_bytes(chunk);
+        let word = u64::from_le_bytes(chunk);
         let xored = word ^ pattern;
 
         let has_zero = xored.wrapping_sub(lo) & !xored & hi;
