@@ -98,6 +98,7 @@ def _coerce_path(path: PathLike) -> str:
 def _coerce_parts(parts: int) -> int:
     if isinstance(parts, bool) or not isinstance(parts, int):
         raise TypeError(f"parts must be an int, got {type(parts).__name__}")
+    parts = int.__int__(parts)
     if parts < 1:
         raise ValueError(f"parts must be >= 1, got {parts}")
     if parts > _SIZE_T_MAX:
@@ -108,8 +109,13 @@ def _coerce_parts(parts: int) -> int:
 
 
 def _coerce_delimiter(delimiter: _DelimiterInput) -> int:
+    if isinstance(delimiter, bool):
+        raise ValueError(
+            f"delimiter int must be a byte value 0..255, got {delimiter!r}"
+        )
     if isinstance(delimiter, int):
-        if isinstance(delimiter, bool) or not 0 <= delimiter <= 255:
+        delimiter = int.__int__(delimiter)
+        if not 0 <= delimiter <= 255:
             raise ValueError(
                 f"delimiter int must be a byte value 0..255, got {delimiter!r}"
             )
