@@ -136,6 +136,18 @@ def test_range_lengths_positive() -> None:
     assert all(r.length > 0 for r in plan.ranges)
 
 
+def test_exact_record_boundaries_produce_four_ranges(tmp_path: Path) -> None:
+    p = tmp_path / "four-records.jsonl"
+    p.write_bytes(b"a\nb\nc\nd\n")
+    plan = plan_file(p, parts=4)
+    assert plan.ranges == (
+        Range(0, 0, 2, 2),
+        Range(1, 2, 4, 2),
+        Range(2, 4, 6, 2),
+        Range(3, 6, 8, 2),
+    )
+
+
 @pytest.mark.parametrize("delimiter", [b"\n", 10, 0x0A])
 def test_delimiter_representations(delimiter) -> None:
     p = Path(__import__("tempfile").mkdtemp()) / "f.jsonl"

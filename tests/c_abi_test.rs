@@ -12,6 +12,11 @@ use mmap_chunker_core::{CChunkView, CEngineHandle};
 extern "C" {
     fn mmap_engine_open(path: *const std::ffi::c_char) -> *mut CEngineHandle;
     fn mmap_engine_scan_chunks(handle: *mut CEngineHandle, chunk_size_bytes: usize) -> usize;
+    fn mmap_engine_partition_records(
+        handle: *mut CEngineHandle,
+        requested_partitions: usize,
+        delimiter: u8,
+    ) -> usize;
     fn mmap_engine_get_chunk(handle: *mut CEngineHandle, index: usize, out: *mut CChunkView)
         -> i32;
     fn mmap_engine_free(handle: *mut CEngineHandle);
@@ -160,6 +165,40 @@ fn test_c_abi_edge_cases() {
         assert_eq!(view.len, 18);
 
         mmap_engine_free(h2);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_c_abi_exact_record_boundaries_produce_four_ranges() {
+    let dir = std::env::temp_dir().join("mmap_chunker_core_c_abi_exact_boundaries");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("four-records.txt");
+    std::fs::write(&file_path, b"a\nb\nc\nd\n").unwrap();
+
+    let c_path = CString::new(file_path.to_str().unwrap()).unwrap();
+    let expected: [&[u8]; 4] = [b"a\n", b"b\n", b"c\n", b"d\n"];
+
+    unsafe {
+        let handle = mmap_engine_open(c_path.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(mmap_engine_partition_records(handle, 4, b'\n'), 4);
+
+        for (index, expected_chunk) in expected.iter().enumerate() {
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(handle, index, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                *expected_chunk
+            );
+        }
+
+        mmap_engine_free(handle);
     }
 
     let _ = std::fs::remove_dir_all(&dir);
