@@ -44,17 +44,19 @@ if [ "$USE_CROSS" = "1" ]; then
 else
   cargo build --release --target "$TARGET"
 fi
-test -f "$RELEASE_DIR/$LIB_NAME" || { echo "ERROR: $RELEASE_DIR/$LIB_NAME missing" >&2; exit 1; }
+VERIFIED_NATIVE_LIBRARY="$RELEASE_DIR/$LIB_NAME"
+test -f "$VERIFIED_NATIVE_LIBRARY" || { echo "ERROR: $VERIFIED_NATIVE_LIBRARY missing" >&2; exit 1; }
+export MMAP_CHUNKER_NATIVE_LIBRARY="$VERIFIED_NATIVE_LIBRARY"
 
 echo "=== Dynamic ABI symbol verification ==="
 grep -vE '^[[:space:]]*(#|$)' abi/v1.symbols | sort > /tmp/expected.symbols
 case "$TARGET" in
   x86_64-pc-windows-msvc)
     if command -v llvm-readobj >/dev/null 2>&1; then
-      llvm-readobj --coff-exports "$RELEASE_DIR/$LIB_NAME" \
+      llvm-readobj --coff-exports "$VERIFIED_NATIVE_LIBRARY" \
         | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > /tmp/actual.symbols
     elif command -v dumpbin.exe >/dev/null 2>&1; then
-      dumpbin.exe /exports "$RELEASE_DIR/$LIB_NAME" \
+      dumpbin.exe /exports "$VERIFIED_NATIVE_LIBRARY" \
         | grep -oE 'mmap_engine_[A-Za-z0-9_]+' | sort > /tmp/actual.symbols
     else
       echo "ERROR: no PE export inspection tool available" >&2
@@ -62,11 +64,11 @@ case "$TARGET" in
     fi
     ;;
   *apple-darwin)
-    nm -gU "$RELEASE_DIR/$LIB_NAME" \
+    nm -gU "$VERIFIED_NATIVE_LIBRARY" \
       | awk '$3 ~ /^_?mmap_engine_/ {sub(/^_/, "", $3); print $3}' | sort > /tmp/actual.symbols
     ;;
   *linux-gnu)
-    nm -D --defined-only "$RELEASE_DIR/$LIB_NAME" \
+    nm -D --defined-only "$VERIFIED_NATIVE_LIBRARY" \
       | awk '$3 ~ /^mmap_engine_/ {print $3}' | sort > /tmp/actual.symbols
     ;;
 esac
@@ -75,7 +77,7 @@ echo "PASS: exported mmap_engine_* symbols match abi/v1.symbols"
 
 if [[ "$TARGET" == *linux-gnu ]]; then
   echo "=== GLIBC symbol ceiling (declared <= 2.17) ==="
-  GLIBC_VERSIONS=$(readelf --version-info "$RELEASE_DIR/$LIB_NAME" \
+  GLIBC_VERSIONS=$(readelf --version-info "$VERIFIED_NATIVE_LIBRARY" \
     | grep -oE 'GLIBC_[0-9.]+' | sort -Vu)
   printf '%s\n' "$GLIBC_VERSIONS"
   MAX_GLIBC=$(printf '%s\n' "$GLIBC_VERSIONS" | sort -V | tail -n 1)
@@ -100,7 +102,7 @@ fi
 
 echo "=== Copy native library into the package ==="
 mkdir -p python/mmap_chunker/_native
-cp "$RELEASE_DIR/$LIB_NAME" "python/mmap_chunker/_native/$LIB_NAME"
+cp "$VERIFIED_NATIVE_LIBRARY" "python/mmap_chunker/_native/$LIB_NAME"
 
 echo "=== Build wheel ==="
 rm -rf dist build
@@ -113,12 +115,14 @@ fi
 echo "=== Wheel inspection ==="
 WHEEL=$(ls dist/*.whl | head -n 1)
 echo "wheel=$WHEEL"
-python - "$WHEEL" <<'PY'
+python - "$WHEEL" "$VERIFIED_NATIVE_LIBRARY" <<'PY'
 import sys
 import zipfile
+from pathlib import Path
 from packaging.tags import sys_tags
 
 wheel = sys.argv[1]
+verified_native = Path(sys.argv[2])
 with zipfile.ZipFile(wheel) as z:
     names = z.namelist()
     wheel_meta = [n for n in names if n.endswith("dist-info/WHEEL")]
@@ -155,12 +159,20 @@ with zipfile.ZipFile(wheel) as z:
     }
     native = [n for n in normalized if n.startswith("mmap_chunker/_native/") and not n.endswith("/")]
     assert native, "no native payload"
+    expected_native = f"mmap_chunker/_native/{verified_native.name}"
+    native_members = [n for n in names if norm(n) == expected_native]
+    assert len(native_members) == 1, f"expected exactly one {expected_native} payload"
+    assert z.read(native_members[0]) == verified_native.read_bytes(), (
+        f"wheel payload {native_members[0]} differs from verified native library "
+        f"{verified_native}"
+    )
     for req in required:
         assert req in normalized, f"missing {req}"
     assert not any(n.startswith("mmap_chunker_core-") and n.endswith(".exe") for n in normalized), "CLI bundled"
     assert not any(n.startswith("src/") for n in normalized), "Rust sources in wheel"
     assert not any(n.startswith("target/") for n in normalized), "target/ in wheel"
     print("native payload:", native)
+    print("native payload matches verified artifact byte-for-byte")
     print("wheel content contract OK")
 PY
 

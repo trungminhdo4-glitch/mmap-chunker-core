@@ -55,13 +55,24 @@ def _build_native_library() -> None:
 def _prepare_native_library() -> None:
     """Copy the built shared library into the package tree for the wheel."""
     name = _library_name()
-    src = ROOT / "target" / "release" / name
-    if not src.is_file():
-        _build_native_library()
-    if not src.is_file():
-        raise RuntimeError(
-            f"native library not found at {src}; build it with `cargo build --release`"
-        )
+    explicit_src = os.environ.get("MMAP_CHUNKER_NATIVE_LIBRARY")
+    if explicit_src:
+        src = Path(explicit_src)
+        if not src.is_absolute():
+            src = ROOT / src
+        if not src.is_file():
+            raise RuntimeError(
+                "MMAP_CHUNKER_NATIVE_LIBRARY points to a missing native "
+                f"library: {src}"
+            )
+    else:
+        src = ROOT / "target" / "release" / name
+        if not src.is_file():
+            _build_native_library()
+        if not src.is_file():
+            raise RuntimeError(
+                f"native library not found at {src}; build it with `cargo build --release`"
+            )
     NATIVE_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, NATIVE_DIR / name)
 
