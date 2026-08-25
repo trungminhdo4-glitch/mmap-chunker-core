@@ -18,6 +18,7 @@ from typing import Union
 from mmap_chunker import _native
 
 DEFAULT_DELIMITER = 0x0A
+_SIZE_T_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
 
 PathLike = Union[str, "os.PathLike[str]"]
 _DelimiterInput = Union[bytes, int]
@@ -99,6 +100,10 @@ def _coerce_parts(parts: int) -> int:
         raise TypeError(f"parts must be an int, got {type(parts).__name__}")
     if parts < 1:
         raise ValueError(f"parts must be >= 1, got {parts}")
+    if parts > _SIZE_T_MAX:
+        raise OverflowError(
+            f"parts must be <= platform size_t maximum {_SIZE_T_MAX}, got {parts}"
+        )
     return parts
 
 
@@ -175,8 +180,9 @@ def plan_file(
     Args:
         path: A file path (str or os.PathLike). The file must exist, be a
             regular local file, and not be mutated while planning runs.
-        parts: Number of desired partitions; must be >= 1. The actual number
-            of ranges may be smaller when records are sparse.
+        parts: Number of desired partitions; must be >= 1 and no greater than
+            the platform ``size_t`` maximum. The actual number of ranges may
+            be smaller when records are sparse.
         delimiter: The single raw byte marking record boundaries. Defaults to
             the newline byte ``b"\\n"`` (also accepted as the int ``10``).
             Multi-byte partition delimiters are not supported by the current
@@ -190,6 +196,7 @@ def plan_file(
         TypeError: Invalid ``parts`` or ``delimiter`` type.
         ValueError: Non-positive ``parts``, invalid delimiter value, or an
             embedded NUL in the path.
+        OverflowError: ``parts`` exceeds the platform ``size_t`` maximum.
         FileNotFoundError: The input file does not exist.
         IsADirectoryError: The input path is a directory.
         PlanningError: The file is not a regular file, native planning fails,

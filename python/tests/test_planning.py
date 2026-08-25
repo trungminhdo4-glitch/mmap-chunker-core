@@ -9,6 +9,7 @@ partition`` output on the same fixtures.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import random
@@ -34,6 +35,10 @@ except ImportError:
     _FROM_SOURCE = True
 
 from mmap_chunker import Plan, PlanningError, Range, plan_file  # noqa: E402
+from mmap_chunker import planning  # noqa: E402
+
+
+SIZE_T_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
 
 
 def _cargo_version() -> str:
@@ -299,6 +304,22 @@ def test_reject_invalid_inputs(tmp_path: Path) -> None:
         plan_file(tmp_path / "nul\x00path.jsonl", parts=4)
     with pytest.raises(TypeError):
         plan_file(12345, parts=4)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("parts", [SIZE_T_MAX + 1, SIZE_T_MAX + 2])
+def test_reject_parts_above_size_t_before_native_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parts: int
+) -> None:
+    p = tmp_path / "f.jsonl"
+    _write_fixture(p, [{"text": "x"}])
+
+    def unexpected_native_load():
+        pytest.fail("native library must not be loaded for invalid parts")
+
+    monkeypatch.setattr(planning._native, "get_library", unexpected_native_load)
+
+    with pytest.raises(OverflowError, match="platform size_t maximum"):
+        plan_file(p, parts=parts)
 
 
 def test_fixture_reconstruction_matches_oracle(tmp_path: Path) -> None:
