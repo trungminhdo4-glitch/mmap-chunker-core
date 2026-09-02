@@ -28,6 +28,7 @@ Provider selection modes:
 
 from __future__ import annotations
 
+import os
 import platform
 from dataclasses import dataclass, field
 from typing import Any
@@ -267,6 +268,19 @@ class ShadowResult:
         }
 
 
+def _sequential_coverage(boundaries: list[tuple[int, int]], file_size: int) -> bool:
+    """Return True iff ``boundaries`` exactly partition ``[0, file_size)``.
+
+    No gaps, no overlaps, starts at 0, ends at ``file_size``.
+    """
+    expected = 0
+    for start, end in boundaries:
+        if start != expected or end < start:
+            return False
+        expected = end
+    return expected == file_size
+
+
 def shadow_compare(
     path: str,
     *,
@@ -278,7 +292,11 @@ def shadow_compare(
     The native provider is only used if available. Errors in either
     provider are captured, not raised. The comparison checks:
         * chunk count
-        * sequential byte coverage (no gaps, no overlaps)
+        * sequential byte coverage (no gaps, no overlaps): the baseline
+          partition must exactly cover the file, and both providers must
+          return byte-identical chunk sequences (identical sequences with
+          a valid baseline partition imply an identical valid native
+          partition)
         * total bytes covered
 
     Args:
@@ -307,11 +325,8 @@ def shadow_compare(
         baseline_elapsed = (time.perf_counter() - t0) * 1000.0
 
         b_total = sum(len(c) for c in b_chunks)
-        b_pos = 0
-        b_coverage = True
-        for c in b_chunks:
-            b_coverage = b_coverage and True
-            b_pos += len(c)
+        b_bounds = [baseline.chunk_bounds(i) for i in range(b_count)]
+        b_coverage = _sequential_coverage(b_bounds, os.path.getsize(path))
 
         baseline.close()
     except Exception as exc:
@@ -394,12 +409,16 @@ def shadow_compare(
             errors=errors,
         )
 
+    content_index_match = b_count == n_count and all(
+        bc == nc for bc, nc in zip(b_chunks, n_chunks)
+    )
+
     return ShadowResult(
         baseline_backend=_BACKEND_PYTHON,
         native_backend=_BACKEND_MMAP,
         native_available=True,
         chunk_count_match=b_count == n_count,
-        coverage_match=True,
+        coverage_match=b_coverage and content_index_match,
         total_bytes_match=b_total == n_total,
         baseline_elapsed_ms=baseline_elapsed,
         native_elapsed_ms=native_elapsed,

@@ -35,6 +35,8 @@ def _find_boundaries(
 
     Returns a list of ``(start, end)`` absolute byte offset pairs.
     """
+    if len(delimiter) != 1:
+        raise ValueError("delimiter must be a single byte, got %r" % delimiter)
     if not data:
         return _EMPTY_CHUNKS
 
@@ -123,6 +125,14 @@ class PythonChunkProvider:
             )
         start, end = self._boundaries[index]
         return self._data[start:end]
+
+    def chunk_bounds(self, index: int) -> tuple[int, int]:
+        """Return the ``(start, end)`` byte offsets of the chunk at ``index``."""
+        if index < 0 or index >= len(self._boundaries):
+            raise IndexError(
+                "chunk index %d out of range [0, %d)" % (index, len(self._boundaries))
+            )
+        return self._boundaries[index]
 
     def close(self) -> None:
         """Release all resources."""

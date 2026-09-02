@@ -123,6 +123,30 @@ class TestPythonChunkProvider(TestFileFixture, unittest.TestCase):
         self.assertEqual(doc.get_chunk(0), content)
         doc.close()
 
+    def test_scan_rejects_multibyte_delimiter(self) -> None:
+        content = b"a\r\nb\r\nc"
+        path = self._make_file("multidelim.txt", content)
+        doc = PythonChunkProvider()
+        doc.open(path)
+        with self.assertRaises(ValueError):
+            doc.scan(chunk_size=4, delimiter=b"\r\n")
+        with self.assertRaises(ValueError):
+            doc.scan(chunk_size=4, delimiter=b"<sep>")
+        doc.close()
+
+    def test_chunk_bounds_roundtrip(self) -> None:
+        content = b"aaa\nbbb\nccc\n"
+        path = self._make_file("bounds.txt", content)
+        doc = PythonChunkProvider()
+        doc.open(path)
+        doc.scan(chunk_size=4)
+        start, end = doc.chunk_bounds(0)
+        self.assertEqual((start, end), (0, len(doc.get_chunk(0))))
+        self.assertEqual(doc.chunk_bounds(doc.chunk_count - 1)[1], len(content))
+        with self.assertRaises(IndexError):
+            doc.chunk_bounds(doc.chunk_count)
+        doc.close()
+
     def test_no_trailing_newline(self) -> None:
         content = b"line1\nline2\nline3"
         path = self._make_file("notrail.txt", content)
@@ -536,6 +560,26 @@ class TestShadowCompare(TestFileFixture, unittest.TestCase):
         self.assertIn("baseline_elapsed_ms", d)
         if result.native_available:
             self.assertTrue(result.results_match)
+
+    def test_sequential_coverage_helper(self) -> None:
+        from native_io.discovery import _sequential_coverage
+
+        # valid partition covering [0, 12)
+        self.assertTrue(_sequential_coverage([(0, 4), (4, 8), (8, 12)], 12))
+        # gap: chunk starts after previous end
+        self.assertFalse(_sequential_coverage([(0, 4), (5, 8)], 8))
+        # overlap: second chunk starts before previous end
+        self.assertFalse(_sequential_coverage([(0, 4), (3, 8)], 8))
+        # does not start at 0
+        self.assertFalse(_sequential_coverage([(1, 4)], 4))
+        # wrong total (undershoot / overshoot)
+        self.assertFalse(_sequential_coverage([(0, 4)], 8))
+        self.assertFalse(_sequential_coverage([(0, 8)], 4))
+        # inverted bounds
+        self.assertFalse(_sequential_coverage([(0, 6), (6, 4)], 6))
+        # empty partition only valid for empty file
+        self.assertTrue(_sequential_coverage([], 0))
+        self.assertFalse(_sequential_coverage([], 4))
 
 
 class TestFullCoverage(TestFileFixture, unittest.TestCase):
