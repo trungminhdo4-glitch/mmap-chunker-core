@@ -11,3 +11,6 @@ __pycache__/
 
 # Local tooling
 .ruff_cache/
+
+# HF audit scratch workspace (vendored snapshots + dataset caches, ~300MB)
+.hf8268-audit/
