@@ -14,3 +14,9 @@ __pycache__/
 
 # HF audit scratch workspace (vendored snapshots + dataset caches, ~300MB)
 .hf8268-audit/
+
+# Release/audit validation outputs (extracted binaries, zips, run JSONs, bundles)
+.worktrees/
+second-ecosystem-audit/
+release-artifacts-*/
+*.bundle
