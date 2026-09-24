@@ -105,12 +105,11 @@ def partition_pattern_reference(
         target = len(data) * index // count
         if target <= last:
             continue
-        # Exact-target acceptance mirrors find_partition_boundaries_pattern
-        # (multi-byte path only; len == 1 delegates to the single-byte
-        # planner without this shortcut).
+        # Exact-target acceptance mirrors find_partition_boundaries_pattern.
+        # At the integrated head the single-byte planner also accepts exact
+        # targets (#32), so len == 1 delegation needs no exception.
         if (
-            len(delimiter) > 1
-            and target >= len(delimiter)
+            target >= len(delimiter)
             and data[target - len(delimiter) : target] == delimiter
         ):
             last = target

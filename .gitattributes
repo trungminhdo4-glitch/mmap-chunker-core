@@ -1,0 +1,5 @@
+# Byte-exact conformance fixtures must check out identically on every
+# platform. tests/conformance/corpus.jsonl pins LF-derived values in
+# expected.txt, so CRLF conversion (Windows autocrlf) breaks all four
+# conformance consumers. No blanket rules: only this fixture is pinned.
+tests/conformance/corpus.jsonl text eol=lf

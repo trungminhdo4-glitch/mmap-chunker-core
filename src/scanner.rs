@@ -683,12 +683,10 @@ mod differential_tests {
                 continue;
             }
 
-            // Exact-target acceptance mirrors the implementation (multi-byte
-            // path only; len == 1 delegates to the single-byte planner).
-            if pattern.len() > 1
-                && target >= pattern.len()
-                && data[target - pattern.len()..target] == pattern[..]
-            {
+            // Exact-target acceptance mirrors the implementation. At the
+            // integrated head the single-byte planner also accepts exact
+            // targets (#32), so len == 1 delegation needs no exception.
+            if target >= pattern.len() && data[target - pattern.len()..target] == pattern[..] {
                 cut_points.push(target);
                 last_cut = target;
                 if target == data.len() {

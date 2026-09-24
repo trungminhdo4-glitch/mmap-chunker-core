@@ -2100,7 +2100,7 @@ mod tests {
             assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
             assert_eq!(
                 std::slice::from_raw_parts(view.data, view.len),
-                b"aaa\nbbb\nccc\n"
+                b"aaa\nbbb\n"
             );
 
             mmap_engine_free(h);
