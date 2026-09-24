@@ -17,7 +17,7 @@ Diagnostics::
     import mmap_chunker
 
     mmap_chunker.__version__
-    mmap_chunker.abi_version()   # 0x00010003 (v1.3)
+    mmap_chunker.abi_version()   # 0x00010004 (v1.4)
     mmap_chunker.capabilities()  # native capability bitmask
 
 Optional DataTrove integration (requires the ``[datatrove]`` extra)::

@@ -683,6 +683,20 @@ mod differential_tests {
                 continue;
             }
 
+            // Exact-target acceptance mirrors the implementation (multi-byte
+            // path only; len == 1 delegates to the single-byte planner).
+            if pattern.len() > 1
+                && target >= pattern.len()
+                && data[target - pattern.len()..target] == pattern[..]
+            {
+                cut_points.push(target);
+                last_cut = target;
+                if target == data.len() {
+                    break;
+                }
+                continue;
+            }
+
             let mut candidate = target;
             let mut cut = data.len();
             while candidate + pattern.len() <= data.len() {
@@ -867,6 +881,21 @@ mod differential_tests {
                 "single-byte delegation mismatch: seed={PARTITION_SEED:#018x}, case={case}, data={data:?}, n={num_partitions}, delimiter={delimiter:#04x}"
             );
         }
+    }
+
+    #[test]
+    fn partition_pattern_accepts_exact_target_boundaries() {
+        // Ideal targets at 3/6/9 already follow a complete CRLF pattern,
+        // so they must be accepted exactly (mirrors the single-byte
+        // exact-target rule from #32).
+        assert_eq!(
+            find_partition_boundaries_pattern(b"a\r\nb\r\nc\r\nd\r\n", 4, b"\r\n"),
+            vec![(0, 3), (3, 6), (6, 9), (9, 12)]
+        );
+        assert_eq!(
+            scalar_partition_boundaries_pattern(b"a\r\nb\r\nc\r\nd\r\n", 4, b"\r\n"),
+            vec![(0, 3), (3, 6), (6, 9), (9, 12)]
+        );
     }
 
     #[test]
@@ -1419,6 +1448,10 @@ pub(crate) fn ranges_from_boundaries(file_len: usize, boundaries: &[usize]) -> V
 /// (e.g. `b"\r\n"` for CRLF records or `b"\r\n\r\n"` for HTTP-style
 /// framing), so no record is split.
 ///
+/// If an ideal target already follows a complete delimiter pattern it is
+/// accepted exactly (mirroring the single-byte exact-target rule);
+/// otherwise the search proceeds forward from the target.
+///
 /// When `delimiter.len() == 1`, this delegates to the single-byte SWAR
 /// path and produces byte-identical output.
 ///
@@ -1460,6 +1493,15 @@ pub fn find_partition_boundaries_pattern(
         // Overflow-safe: use u128 intermediate for multiplication.
         let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
         if target <= last_boundary {
+            continue;
+        }
+
+        // Mirror `find_partition_boundaries` exact-target semantics (#32):
+        // if the target already follows a complete delimiter pattern, accept
+        // it exactly instead of skipping ahead to the next occurrence.
+        if target >= delimiter.len() && data[target - delimiter.len()..target] == delimiter[..] {
+            boundaries.push(target);
+            last_boundary = target;
             continue;
         }
 

@@ -446,10 +446,7 @@ mod tests {
                 }
             }
             assert_eq!(total, file.len());
-            assert_eq!(
-                file.get_chunk(0),
-                Some(b"record1\r\nrecord2\r\nrecord3\r\n" as &[u8])
-            );
+            assert_eq!(file.get_chunk(0), Some(b"record1\r\nrecord2\r\n" as &[u8]));
         }
 
         cleanup(&path);

@@ -38,7 +38,7 @@ typedef struct {
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010003 (v1.3). Always succeeds, never panics.
+ * Current: 0x00010004 (v1.4). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -52,6 +52,7 @@ uint32_t mmap_engine_abi_version(void);
  * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
  * Bit 4: RECORD_PARTITIONING    — mmap_engine_partition_records() available
  * Bit 5: MULTI_BYTE_DELIMITER   — mmap_engine_scan_chunks_pattern() available
+ * Bit 6: MULTI_BYTE_PARTITIONING — mmap_engine_partition_records_pattern() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.

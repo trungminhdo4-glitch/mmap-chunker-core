@@ -878,6 +878,10 @@ mod tests {
             caps & CAP_MULTI_BYTE_DELIMITER != 0,
             "must have MULTI_BYTE_DELIMITER"
         );
+        assert!(
+            caps & CAP_MULTI_BYTE_PARTITIONING != 0,
+            "must have MULTI_BYTE_PARTITIONING"
+        );
     }
 
     #[test]
@@ -2000,7 +2004,7 @@ mod tests {
             assert_eq!(ret, 0);
             assert_eq!(
                 std::slice::from_raw_parts(view.data, view.len),
-                b"record1\r\nrecord2\r\nrecord3\r\n"
+                b"record1\r\nrecord2\r\n"
             );
 
             mmap_engine_free(h);
