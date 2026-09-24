@@ -9,12 +9,30 @@ use std::io::Write;
 
 use mmap_chunker_core::{CChunkView, CEngineHandle};
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CPartitionRange {
+    start: usize,
+    end: usize,
+}
+
 extern "C" {
     fn mmap_engine_open(path: *const std::ffi::c_char) -> *mut CEngineHandle;
     fn mmap_engine_scan_chunks(handle: *mut CEngineHandle, chunk_size_bytes: usize) -> usize;
     fn mmap_engine_get_chunk(handle: *mut CEngineHandle, index: usize, out: *mut CChunkView)
         -> i32;
     fn mmap_engine_free(handle: *mut CEngineHandle);
+    fn mmap_engine_plan_partition_ranges(
+        path: *const std::ffi::c_char,
+        requested_partitions: usize,
+        delimiter: *const u8,
+        delimiter_len: usize,
+        source_mode: u32,
+        window_bytes: usize,
+        out_ranges: *mut CPartitionRange,
+        capacity: usize,
+        out_count: *mut usize,
+    ) -> i32;
 }
 
 #[test]
@@ -132,7 +150,6 @@ fn test_c_abi_edge_cases() {
         let c_path = CString::new(test_no_trailing_nl.to_str().unwrap()).unwrap();
         let h = mmap_engine_open(c_path.as_ptr());
         assert!(!h.is_null());
-
         let count = mmap_engine_scan_chunks(h, 4);
         assert!(count > 0);
 
@@ -160,6 +177,81 @@ fn test_c_abi_edge_cases() {
         assert_eq!(view.len, 18);
 
         mmap_engine_free(h2);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_c_abi_plan_partition_ranges_source_modes() {
+    let dir = std::env::temp_dir().join("mmap_chunker_core_c_abi_plan");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("records.log");
+
+    let mut content = Vec::new();
+    for index in 0..1_000u32 {
+        content.extend_from_slice(format!("record-{index:05}\r\n").as_bytes());
+    }
+    std::fs::write(&file_path, &content).unwrap();
+
+    let c_path = CString::new(file_path.to_str().unwrap()).unwrap();
+    let delimiter = b"\r\n";
+    let requested = 9usize;
+
+    // Reference ranges via the slice scanner.
+    let expected: Vec<(usize, usize)> =
+        mmap_chunker_core::scanner::find_partition_boundaries_pattern(
+            &content, requested, delimiter,
+        );
+
+    unsafe {
+        for (mode, window) in [(0u32, 0usize), (1, 65536), (2, 0)] {
+            let mut needed = 0usize;
+            let query = mmap_engine_plan_partition_ranges(
+                c_path.as_ptr(),
+                requested,
+                delimiter.as_ptr(),
+                delimiter.len(),
+                mode,
+                window,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            assert_eq!(query, -2, "source mode {mode} should report capacity");
+            assert_eq!(needed, expected.len(), "source mode {mode}");
+
+            let mut ranges: Vec<CPartitionRange> = (0..needed)
+                .map(|_| CPartitionRange { start: 0, end: 0 })
+                .collect();
+            let result = mmap_engine_plan_partition_ranges(
+                c_path.as_ptr(),
+                requested,
+                delimiter.as_ptr(),
+                delimiter.len(),
+                mode,
+                window,
+                ranges.as_mut_ptr(),
+                ranges.len(),
+                &mut needed,
+            );
+            assert_eq!(result, 0, "source mode {mode} planning failed");
+
+            let actual: Vec<(usize, usize)> = ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect();
+            assert_eq!(actual, expected, "source mode {mode} ranges diverged");
+
+            let mut covered = 0usize;
+            for (start, end) in &actual {
+                assert_eq!(*start, covered, "source mode {mode}: gap or overlap");
+                assert!(end > start, "source mode {mode}: empty range");
+                covered = *end;
+            }
+            assert_eq!(covered, content.len(), "source mode {mode}: coverage");
+        }
     }
 
     let _ = std::fs::remove_dir_all(&dir);

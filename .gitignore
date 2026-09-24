@@ -1,5 +1,6 @@
 /target/
 Cargo.lock
+integrations/datafusion/target/
 
 # Python
 __pycache__/
@@ -18,5 +19,6 @@ __pycache__/
 # Release/audit validation outputs (extracted binaries, zips, run JSONs, bundles)
 .worktrees/
 second-ecosystem-audit/
+Data chunking/
 release-artifacts-*/
 *.bundle

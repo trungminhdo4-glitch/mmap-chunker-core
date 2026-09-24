@@ -2,6 +2,83 @@
 
 ## [Unreleased]
 
+> **Pending — uncommitted working-tree state (kein Release, kein Datum):**
+> Neu/untracked und damit pending: `src/framing.rs`, `src/source.rs`,
+> `src/manifest.rs`, `src/index.rs`, `src/json.rs` sowie
+> `native_io/plan_manifest.py`, `native_io/record_index.py`,
+> `integrations/` (DataFusion-Standalone-Crate), `tools/`
+> (`remote_verify.py`) plus `tests/test_plan_manifest.py`,
+> `tests/test_record_index.py` (Beleg: `git status --short`, `??`-Einträge).
+> Die `Added`/`Changed`-Einträge unten beschreiben diesen pending Stand,
+> keinen veröffentlichten Release. Commit und Version-Bump nur per
+> Owner-Entscheid (Tag-Drift `v0.2.6` vs. Cargo `0.2.2`, s. RELEASE.md
+> Known-Drift); dieses Changelog erfindet kein Release-Datum.
+
+### Added
+
+- `integrations/datafusion`: standalone crate that maps every planned
+  range to one DataFusion execution partition
+  (`PartitionedFile::with_range`) and parses each range with DataFusion's
+  `JsonSource` — no temporary files, no records split across partitions.
+  Consumes `mmap-chunker plan` manifests through the core crate's
+  zero-dependency JSON reader. Tests compare partitioned scans against a
+  single-partition reference scan. The core crate remains dependency-free.
+- `tools/remote_verify.py`: packages the worktree and runs heavy
+  verification (full suites, MSRV, DataFusion builds) in ephemeral Docker
+  containers on the Netcup host, with a JSON receipt and no host installs.
+- Pluggable framing strategies behind a `FramingStrategy`/`BoundaryScanner`
+  contract with three built-ins: delimiter patterns, fixed-width records, and
+  length-prefixed records (1..=8 byte prefix, LE/BE, optional prefix-inclusive
+  lengths). Planning uses
+  `plan_partition_ranges_with` / `mmap_engine_plan_partition_ranges_framed`
+  (ABI v1.6, `CAP_FRAMING_STRATEGIES`, bit 8) and CLI flags `--framing`,
+  `--record-bytes`, `--prefix-bytes`, `--prefix-endian`,
+  `--length-includes-prefix`. Plan manifests record the framing descriptor.
+- Persistent sparse record indexes (`mmap-chunker-index` schema v1):
+  `build_record_index` records every Nth record start with the file identity
+  and framing; `native_io.record_index` loads/verifies them and mirrors the
+  record-count-balanced planner. CLI `index FILE --every N` writes
+  `FILE.mmapidx`; `plan --index PATH` derives ranges without rescanning and
+  records `partitioning.strategy = "indexed_records"`.
+- A dependency-free strict JSON reader (`src/json.rs`) so Rust can load its
+  own manifests and indexes; bounded nesting, exact integer round-trips.
+- Multi-byte record partitioning across Rust, C ABI, CLI, and Python:
+  `find_partition_boundaries_pattern`,
+  `MmapChunker::partition_records_pattern`,
+  `mmap_engine_partition_records_pattern`, and CLI `--delimiter-hex`
+  (ABI v1.4, `CAP_MULTI_BYTE_PARTITIONING`, bit 6).
+- Source-selectable range planning behind a `ByteSource` trait with three
+  backends: full mmap (`MmapSource`), bounded moving-window mmap
+  (`WindowedMmapSource`), and positional reads (`PreadSource`). Exposed as
+  `plan_partition_ranges` and `mmap_engine_plan_partition_ranges`
+  (ABI v1.5, `CAP_WINDOWED_PLANNING`, bit 7). All backends produce
+  byte-identical ranges; windowed planning keeps peak virtual address usage
+  bounded by the window size.
+- Versioned `mmap-chunker plan` manifest (schema `mmap-chunker-plan`,
+  `schema_version` 1) with portable file identity: size, mtime,
+  device/inode, and a sampled FNV-1a content fingerprint. The planner
+  re-checks identity after planning and rejects plans whose source changed.
+- Python reference consumers `native_io.plan_manifest` and
+  `native_io.record_index` that load, validate, verify, and consume manifests
+  and indexes before workers use them. Manifest parsing covers every framing
+  strategy and indexed plans (`source_index`).
+- Rust tests for windowed mmap reads, framing parity, plan manifests, sparse
+  indexes, and planner differential parity; Python tests for provider
+  multi-byte delimiters, framing manifests, indexes, and C-ABI planner parity
+  (including framed planning) across all source modes.
+- Ignored benchmark `benchmark_source_modes` comparing full mmap, windowed,
+  and pread planners on the same file.
+
+### Changed
+
+- C ABI version is now `0x00010006` (v1.6); capability bits 6
+  (`MULTI_BYTE_PARTITIONING`), 7 (`WINDOWED_PLANNING`), and 8
+  (`FRAMING_STRATEGIES`) added across v1.4-v1.6.
+- The published `mmap-chunker-core` package excludes `integrations/` and
+  `tools/`; the DataFusion dependency never reaches the core crate.
+- Linux C/Python/Go/C# conformance consumers updated to the v1.6
+  ABI/capability surface.
+
 ## [0.2.2] — 2026-08-14
 
 ### Added

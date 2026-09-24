@@ -4,13 +4,39 @@
 
 Three independent version domains:
 
-| Domain        | Current  | Controls                                  |
-|---------------|----------|-------------------------------------------|
-| Crate SemVer  | 0.2.2    | crates.io package, GitHub tag, Release    |
-| C ABI         | 1.3      | Additive C API capability evolution       |
-| Rust MSRV     | 1.77     | Minimum Supported Rust Version            |
+| Domain        | Current            | Controls                                  |
+|---------------|--------------------|-------------------------------------------|
+| Crate SemVer  | 0.2.2              | crates.io package, GitHub tag, Release    |
+| C ABI         | 1.6 (`0x00010006`) | Additive C API capability evolution       |
+| Rust MSRV     | 1.77               | Minimum Supported Rust Version            |
 
 Crate SemVer and C ABI version evolve independently.
+
+Sources: `Cargo.toml` `version = "0.2.2"` (HEAD + worktree identisch,
+nur `exclude`-Zeile unterscheidet sich); `src/ffi.rs:26`
+`pub const ABI_VERSION: u32 = 0x0001_0006`; `AGENTS.md`
+"Public C ABI (14 functions, ABI v1.6)".
+
+## Known Drift — Tags vs. Cargo (KEIN Version-Bump in dieser Änderung)
+
+Git-Tags existieren bis `v0.2.6` (`v0.1.0` … `v0.2.6` per
+`git tag --list`; `v0.2.3` `db12a56` 2026-08-14 … `v0.2.6` `85d3a32`
+2026-08-21), während `Cargo.toml` im HEAD (`19a628d`,
+Branch `feat/prebuilt-cli-distribution`) und im Worktree weiterhin
+`0.2.2` meldet (`v0.2.6:Cargo.toml` meldet `0.2.6`).
+Der Worktree ist zusätzlich dirty (`git status --short`: ~30× `M` plus
+`?? integrations/`, `?? tools/`, `?? src/{framing,source,manifest,index,json}.rs`,
+`?? native_io/{plan_manifest,record_index}.py`,
+`?? tests/test_{plan_manifest,record_index}.py`).
+
+Das heißt: Tag-Drift + dirty Worktree — die Pre-Publish-Bedingungen
+"Tag match" und "Clean worktree" sind aktuell NICHT erfüllt.
+Diese Datei dokumentiert den Drift nur; es erfolgt hier bewusst
+KEIN Version-Bump, KEIN Re-Tag, KEIN Commit (Verbot im Scope).
+Owner-Entscheide ausstehend: (1) Version-Bump ja/nein — `Cargo.toml`
+auf `0.2.3+`/`0.2.6+`/nächste Minor anheben oder Tags als überholt
+markieren; (2) Commit ja/nein — pending Module (s. CHANGELOG
+`[Unreleased]` Pending-Notiz) committen oder weiter uncommitted lassen.
 
 ## Pre-Publish Checklist
 

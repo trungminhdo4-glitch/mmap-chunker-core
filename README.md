@@ -51,7 +51,12 @@ consumer.
 - Windows and Linux are validated in CI; macOS validation now included
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable raw single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
-- Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust and C ABI
+- Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust, C ABI, CLI, and Python
+- Multi-byte record-aligned partitioning (same delimiter patterns) — Rust, C ABI, CLI, and Python
+- Pluggable framing strategies: delimiter patterns, fixed-width records, and length-prefixed binary records
+- Selectable planning backends: full mmap, bounded windowed mmap, and positional reads (`pread`)
+- Versioned `plan` manifests with file identity (size, mtime, device/inode, sampled content fingerprint)
+- Persistent sparse record indexes (`FILE.mmapidx`) for repeated planning without rescanning
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
 - Panic containment at all FFI boundaries
@@ -93,6 +98,14 @@ size_t count = mmap_engine_scan_chunks_ex(h, 64 * 1024, '\n');
 // count = mmap_engine_scan_chunks_pattern(h, 64 * 1024, delimiter, 2);
 // or: mmap_engine_scan_fixed(h, 4096)              — fixed-size mode
 // or: mmap_engine_partition_records(h, 4, '\n')   — N-way partition planning
+// or: mmap_engine_partition_records_pattern(h, 4, delimiter, 2)  — CRLF-aware (ABI v1.4)
+// or, without an engine handle (ABI v1.5):
+//   CPartitionRange ranges[4];
+//   size_t range_count = 0;
+//   mmap_engine_plan_partition_ranges(
+//       "/data/records.jsonl", 4, delimiter, 2,
+//       MMAP_ENGINE_SOURCE_WINDOWED, 64 * 1024 * 1024,
+//       ranges, 4, &range_count);
 for (size_t i = 0; i < count; i++) {
     CChunkView view;
     mmap_engine_get_chunk(h, i, &view);
@@ -150,11 +163,122 @@ let mut file = unsafe { MmapChunker::open("data.txt")? };
 let n = file.scan_delimited_pattern(65536, b"\r\n");
 let chunk = file.get_chunk(0);
 
+// Multi-byte record-aligned partitioning (CRLF-aware)
+let parts = file.partition_records_pattern(4, b"\r\n");
+
 // Lazy cursor with multi-byte delimiter
 let file = unsafe { MmapChunker::open("data.txt")? };
 for chunk in file.delimited_cursor_pattern(65536, b"\r\n\r\n") {
     let _data: &[u8] = chunk;
 }
+```
+
+## Source-selectable range planning
+
+The planner can run on three backends without changing the result. Full mmap
+uses the slice scanner directly; windowed mmap maps one bounded window at a
+time; pread never maps the file. Use it to plan very large files on machines
+with limited address space, on network filesystems, or when mmap is
+undesirable:
+
+```rust
+use mmap_chunker_core::{
+    plan_partition_ranges, plan_file, PlannerOptions, SourceMode,
+};
+
+// Byte-identical ranges for all three modes:
+for mode in [SourceMode::Mmap, SourceMode::Windowed, SourceMode::Pread] {
+    let options = PlannerOptions::new(mode).with_window_bytes(64 * 1024 * 1024);
+    let ranges = unsafe {
+        plan_partition_ranges("huge.jsonl", 32, b"\r\n", &options)?
+    };
+    for (start, end) in ranges {
+        // worker: file bytes [start, end) — records are never split
+    }
+}
+
+// Or produce a versioned, identity-sealed plan manifest:
+let plan = unsafe { plan_file("huge.jsonl", 32, b"\r\n", SourceMode::Mmap, 0)? };
+std::fs::write("huge.jsonl.plan.json", plan.to_json())?;
+```
+
+### Framing strategies
+
+Record boundaries are pluggable. The built-ins cover delimited text,
+fixed-width binary, and length-prefixed binary records; the planner logic is
+identical for all of them:
+
+```rust
+use mmap_chunker_core::{
+    plan_partition_ranges_with, plan_file_with_framing, BuiltinFraming,
+    PlannerOptions, SourceMode,
+};
+
+// Fixed-width records (the final record may be shorter).
+let strategy = BuiltinFraming::fixed_width(512)?;
+let ranges = unsafe {
+    plan_partition_ranges_with(
+        "blocks.bin", 16, &strategy,
+        &PlannerOptions::new(SourceMode::Windowed),
+    )?
+};
+
+// 4-byte big-endian total record size, then payload.
+let strategy = BuiltinFraming::length_prefixed(4, false, true)?;
+let plan = unsafe {
+    plan_file_with_framing("records.bin", 8, &strategy, SourceMode::Pread, 0)?
+};
+
+// Custom/stateful formats implement FramingStrategy + BoundaryScanner.
+```
+
+### Sparse record indexes
+
+Scanning a 500 GB dataset on every planning call is wasteful. `index` records
+every Nth record start once, together with the file identity and framing:
+
+```sh
+mmap-chunker index huge.jsonl --every 10000
+# writes huge.jsonl.mmapidx
+mmap-chunker plan huge.jsonl --parts 32 --index huge.jsonl.mmapidx
+```
+
+Indexed planning uses record-count balancing and never rescans the source. A
+changed file is rejected through the same identity contract as plan
+manifests. Python consumers mirror the planner exactly:
+
+```python
+from native_io.record_index import (
+    load_verified_index,
+    plan_partition_boundaries_from_index,
+)
+
+index = load_verified_index("huge.jsonl.mmapidx")
+ranges = plan_partition_boundaries_from_index(index, 32, index.source_size)
+```
+
+### DataFusion integration
+
+[`integrations/datafusion`](integrations/datafusion/README.md) is a standalone
+crate that maps every planned range to exactly one DataFusion execution
+partition via `PartitionedFile::with_range`. DataFusion's JSON source then
+parses each byte range directly — no temporary files, no records split across
+partitions. The core crate stays dependency-free; DataFusion lives only in the
+integration crate.
+
+```rust
+use datafusion::prelude::SessionContext;
+use mmap_chunker_datafusion::{ndjson_schema, NdjsonRangeScan};
+
+let scan = NdjsonRangeScan::from_manifest("huge.jsonl.plan.json", ndjson_schema())?;
+let context = SessionContext::new();
+let batches = scan.collect(&context).await?;
+```
+
+Heavy builds run on the project's Netcup Docker runner:
+
+```sh
+python tools/remote_verify.py --dir integrations/datafusion -- cargo test
 ```
 
 ## Scanner primitives (standalone, no mmap)
@@ -201,7 +325,7 @@ Verified prebuilt native libraries are published on [GitHub Releases](https://gi
 import ctypes
 lib = ctypes.CDLL("./libmmap_chunker_core.so")  # or .dll / .dylib
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
-assert lib.mmap_engine_abi_version() == 0x00010003
+assert lib.mmap_engine_abi_version() >= 0x00010005
 ```
 
 ```c
@@ -257,7 +381,7 @@ worker startup, processing, and end-to-end wall time separately. Process startup
 and application parsing can dominate small workloads, so the example makes no
 universal multiprocessing speed claim.
 
-## Command-line partitioning
+## Command-line partitioning and planning
 
 Install the CLI with Cargo:
 
@@ -268,6 +392,19 @@ mmap-chunker partition records.jsonl --parts 8
 mmap-chunker partition records.jsonl --parts 8 --worker 3
 # Partition binary records on the NUL byte.
 mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
+# Partition CRLF-framed records on the complete two-byte pattern.
+mmap-chunker partition records.log --parts 8 --delimiter-hex 0d0a
+# Plan with a bounded 64 MiB window instead of a full mapping.
+mmap-chunker partition records.log --parts 8 --source windowed --window 67108864
+# Fixed-width binary records.
+mmap-chunker partition blocks.bin --parts 16 --framing fixed --record-bytes 512
+# Length-prefixed binary records (2-byte little-endian payload length).
+mmap-chunker partition records.bin --parts 8 --framing length-prefixed --prefix-bytes 2
+# Write a reproducible manifest for other systems to schedule.
+mmap-chunker plan records.log --parts 8 --delimiter-hex 0d0a --output plan.json
+# Build a sparse index once, then plan without rescanning.
+mmap-chunker index huge.jsonl --every 10000
+mmap-chunker plan huge.jsonl --parts 32 --index huge.jsonl.mmapidx
 ```
 
 `partition` writes one tab-separated numeric range per line; stdout has no header:
@@ -280,17 +417,67 @@ mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
 Offsets are bytes. Starts are inclusive and ends are exclusive, so
 `end_exclusive - start == length`. The default record delimiter remains newline
 byte `0x0A`. `--delimiter-byte B` accepts one decimal raw byte in the range
-`0..255`, including arbitrary binary delimiters such as NUL and `0xFF`. Ranges
-are deterministic, contiguous, and record-aligned; the actual range count can
-be lower than requested when giant records span multiple ideal partition
-positions. This is framing and planning only, not CSV/JSON parsing; multi-byte
-partition delimiters are not supported. The input file must remain immutable
-while it is mapped.
+`0..255`, including arbitrary binary delimiters such as NUL and `0xFF`.
+`--delimiter-hex HEX` accepts an even-length hex string, so multi-byte raw
+patterns such as CRLF (`0d0a`), HTTP-style separators (`0d0a0d0a`), or binary
+pairs (`0001`) are supported; embedded NUL bytes are allowed. `--source`
+selects the read backend (`mmap` default, `windowed`, or `pread`) and
+`--window BYTES` sets the windowed size (default 64 MiB, minimum 64 KiB). All
+backends produce identical ranges; the mode only changes how bytes are
+accessed. Ranges are deterministic, contiguous, and record-aligned; the actual
+range count can be lower than requested when giant records span multiple ideal
+partition positions. This is framing and planning only, not CSV/JSON parsing.
+The input file must remain immutable while it is planned.
 
 With `--worker K`, `K` must be less than `--parts` and the CLI emits only the
 zero-based range at index `K`. This lets independently launched workers request
 their own byte range. If record-aligned boundaries collapse and no actual range
 exists at a valid index, the command succeeds with no output.
+
+### Plan manifests
+
+`plan` emits a versioned JSON manifest (`schema: "mmap-chunker-plan"`) instead
+of TSV. The manifest seals the source identity — size, modification time,
+device/inode where the platform exposes it, and a sampled FNV-1a content
+fingerprint — together with the framing and the ranges:
+
+```json
+{
+  "schema": "mmap-chunker-plan",
+  "schema_version": 1,
+  "planner": { "name": "mmap-chunker-core", "version": "0.2.2" },
+  "source": { "path": "records.log", "size": 12739120,
+              "identity": { "sample_fingerprint": "fnv1a64:0x..." } },
+  "framing": { "strategy": "delimiter", "delimiter_hex": "0d0a", "delimiter_len": 2 },
+  "partitioning": { "strategy": "bytes", "requested_partitions": 8,
+                    "actual_partitions": 8, "source_mode": "mmap", "window_bytes": null },
+  "ranges": [ { "index": 0, "start": 0, "end": 1592389, "length": 1592389 } ]
+}
+```
+
+The planner captures identity before planning and re-checks it afterward, so a
+manifest can never describe mixed content. The `framing` block describes the
+record framing: `delimiter` (with `delimiter_hex`), `fixed_width` (with
+`record_bytes`), or `length_prefixed` (with `prefix_bytes`, `little_endian`,
+`length_includes_prefix`). Index-derived plans use
+`partitioning.strategy = "indexed_records"`, a null `source_mode`, and a
+`source_index` block with the stride and record count.
+
+Python consumers can verify a
+manifest before working:
+
+```python
+from native_io.plan_manifest import load_verified_plan
+
+plan = load_verified_plan("plan.json")
+for byte_range in plan.ranges:
+    ...  # process plan.source_path[byte_range.start:byte_range.end]
+```
+
+`load_verified_plan` raises `PlanIdentityMismatch` when the file's size,
+mtime, device/inode, or sampled fingerprint no longer matches the plan, and
+`PlanFormatError` for malformed manifests. mmap-chunker plans; other systems
+schedule.
 
 ### Installing the standalone CLI
 
@@ -384,23 +571,40 @@ cargo test
 cargo build --release
 ```
 
+Heavy verification (MSRV 1.77, full suites, DataFusion builds) runs on the
+Netcup Docker runner instead of the workstation:
+
+```sh
+python tools/remote_verify.py --image rust:1.94 -- sh -c "cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test"
+python tools/remote_verify.py --image rust:1.77 -- cargo check --all-targets
+python tools/remote_verify.py --dir integrations/datafusion -- cargo test
+```
+
 The suite covers delimiter semantics, cursor equivalence, fixed-size chunking,
-partitioning, C ABI behavior, and edge cases.
+partitioning, multi-byte framing, pluggable framing strategies,
+source-selectable planning, plan manifest identity, sparse record indexes,
+C ABI behavior, and edge cases.
 
 Companion test suites:
-- External C ABI consumer scenarios covering ABI discovery, errors, delimiter/pattern/fixed/partition modes, layout, and coverage (CI-validated on Linux and macOS)
-- Deterministic Python ctypes semantic parity in `tests/python_parity.py` (CI-validated on Linux)
+- External C ABI consumer scenarios covering ABI discovery, errors, delimiter/pattern/fixed/partition/framed modes, layout, and coverage (CI-validated on Linux and macOS)
+- Deterministic Python ctypes semantic parity in `tests/python_parity.py`, including planner parity across all three source modes and framed planning (CI-validated on Linux)
+- Plan manifest generation/verification in `tests/test_plan_manifest.py`
+- Sparse index build/verify/planning parity in `tests/test_record_index.py`
 
 ## Limitations
 
-- Full-file mapping only (no windowed mmap). Very large files may exhaust address space.
 - No copy-on-write or mutable access. Read-only mapping.
 - No regex delimiters. Multi-byte delimiters supported (e.g., `b"\r\n"`, `b"\r\n\r\n"`).
+- Windowed and pread planners return ranges only; zero-copy byte views still require a full mapping.
+- Length-prefixed framing supports 1..=8 byte fixed-width prefixes, not varint framing; a custom `FramingStrategy` can add that.
+- Sparse-index planning rounds cuts to recorded slots; the index stride bounds the best achievable balance.
 
 ## Roadmap
 
+- DataFusion/Arrow integration proof: feed planned NDJSON ranges into execution partitions
 - More real consumer integrations for record-aligned local worker pipelines
 - Benchmark-backed search backend decisions; no custom SIMD promise without a measured win
+- Seekable-compression adapters (BGZF, indexed zstd) behind format adapters
 
 ## License
 

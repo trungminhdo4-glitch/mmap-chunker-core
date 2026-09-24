@@ -1,0 +1,23 @@
+[package]
+name = "mmap-chunker-datafusion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "DataFusion integration: run NDJSON scans on mmap-chunker record-aligned byte ranges."
+license = "MIT OR Apache-2.0"
+
+# Standalone integration crate. The core crate has no runtime dependencies;
+# this crate intentionally pulls DataFusion and stays outside the published
+# mmap-chunker-core package.
+[dependencies]
+mmap-chunker-core = { path = "../.." }
+datafusion = "55.1.0"
+datafusion-datasource = "55.1.0"
+datafusion-datasource-json = "55.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]

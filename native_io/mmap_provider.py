@@ -27,6 +27,7 @@ from ctypes import (
     c_char_p,
     c_int,
     c_size_t,
+    c_ubyte,
     c_void_p,
 )
 from pathlib import Path
@@ -98,8 +99,16 @@ class MmapChunkProvider:
             for i in range(p.chunk_count):
                 chunk = p.get_chunk(i)
 
-    ``delimiter`` is always ``b"\\n"`` — the current ABI only
-    supports newline-delimited records.
+    ``delimiter`` may be any non-empty raw byte pattern: a single byte
+    (``b"\\n"``, ``b","``) or multiple bytes (``b"\\r\\n"``). Older
+    libraries without the required capability raise ``RuntimeError``
+    when the corresponding function is used.
+
+    Optional range planning::
+
+        p.partition_records(32, b"\\r\\n")
+        for i in range(p.chunk_count):
+            ...  # record-aligned partition i
     """
 
     backend: str
@@ -124,6 +133,46 @@ class MmapChunkProvider:
 
         self._lib.mmap_engine_scan_chunks.argtypes = [c_void_p, c_size_t]
         self._lib.mmap_engine_scan_chunks.restype = c_size_t
+
+        # Optional ABI v1.0+ function: configurable single-byte delimiter.
+        self._scan_chunks_ex = getattr(self._lib, "mmap_engine_scan_chunks_ex", None)
+        if self._scan_chunks_ex is not None:
+            self._scan_chunks_ex.argtypes = [c_void_p, c_size_t, c_ubyte]
+            self._scan_chunks_ex.restype = c_size_t
+
+        # Optional ABI v1.3+ function: multi-byte delimiter pattern.
+        self._scan_chunks_pattern = getattr(
+            self._lib, "mmap_engine_scan_chunks_pattern", None
+        )
+        if self._scan_chunks_pattern is not None:
+            self._scan_chunks_pattern.argtypes = [
+                c_void_p,
+                c_size_t,
+                POINTER(c_ubyte),
+                c_size_t,
+            ]
+            self._scan_chunks_pattern.restype = c_size_t
+
+        # Optional ABI v1.2+ function: record-aligned partitions.
+        self._partition_records = getattr(
+            self._lib, "mmap_engine_partition_records", None
+        )
+        if self._partition_records is not None:
+            self._partition_records.argtypes = [c_void_p, c_size_t, c_ubyte]
+            self._partition_records.restype = c_size_t
+
+        # Optional ABI v1.4+ function: multi-byte partition patterns.
+        self._partition_records_pattern = getattr(
+            self._lib, "mmap_engine_partition_records_pattern", None
+        )
+        if self._partition_records_pattern is not None:
+            self._partition_records_pattern.argtypes = [
+                c_void_p,
+                c_size_t,
+                POINTER(c_ubyte),
+                c_size_t,
+            ]
+            self._partition_records_pattern.restype = c_size_t
 
         self._lib.mmap_engine_get_chunk.argtypes = [
             c_void_p,
@@ -151,27 +200,102 @@ class MmapChunkProvider:
             raise OSError("mmap_engine_open failed for path: %s" % path)
         self._handle = result
 
+    def _pattern_storage(self, delimiter: bytes) -> ctypes.Array[ctypes.c_ubyte]:
+        return (c_ubyte * len(delimiter)).from_buffer_copy(delimiter)
+
     def scan(
         self,
         *,
         chunk_size: int = 65536,
         delimiter: bytes = b"\n",
     ) -> int:
-        """Scan for chunk boundaries.
-
-        Only ``delimiter=b"\\n"`` is supported by the current C ABI.
-        """
-        if delimiter != b"\n":
-            raise ValueError(
-                'MmapChunkProvider only supports newline delimiter (b"\\n"), '
-                "got %r" % delimiter
-            )
+        """Scan for chunk boundaries with the given raw byte delimiter."""
+        if not delimiter:
+            raise ValueError("delimiter must not be empty")
         if not self._handle:
             raise RuntimeError("open() must be called before scan()")
-        count = self._lib.mmap_engine_scan_chunks(  # type: ignore[union-attr]
-            self._handle,
-            c_size_t(chunk_size),
-        )
+
+        if len(delimiter) == 1:
+            if self._scan_chunks_ex is not None:
+                count = self._scan_chunks_ex(  # type: ignore[misc]
+                    self._handle,
+                    c_size_t(chunk_size),
+                    c_ubyte(delimiter[0]),
+                )
+            elif delimiter == b"\n":
+                count = self._lib.mmap_engine_scan_chunks(  # type: ignore[union-attr]
+                    self._handle,
+                    c_size_t(chunk_size),
+                )
+            else:
+                raise RuntimeError(
+                    "loaded mmap_chunker_core does not support configurable "
+                    "delimiters (requires ABI >= 1.0); rebuild with "
+                    "`cargo build --release`"
+                )
+        else:
+            if self._scan_chunks_pattern is None:
+                raise RuntimeError(
+                    "loaded mmap_chunker_core does not support multi-byte "
+                    "delimiters (requires ABI >= 1.3); rebuild with "
+                    "`cargo build --release`"
+                )
+            storage = self._pattern_storage(delimiter)
+            count = self._scan_chunks_pattern(  # type: ignore[misc]
+                self._handle,
+                c_size_t(chunk_size),
+                storage,
+                c_size_t(len(delimiter)),
+            )
+
+        self._chunk_count = count
+        return count
+
+    def partition_records(
+        self,
+        num_partitions: int,
+        delimiter: bytes = b"\n",
+    ) -> int:
+        """Plan ``num_partitions`` record-aligned partitions.
+
+        Replaces any previous chunk layout. Returns the actual number of
+        partitions, which may be lower than requested when records span
+        multiple ideal target positions.
+        """
+        if not self._handle:
+            raise RuntimeError("open() must be called before partition_records()")
+        if num_partitions <= 0:
+            raise ValueError("num_partitions must be > 0, got %d" % num_partitions)
+        if not delimiter:
+            raise ValueError("delimiter must not be empty")
+
+        if len(delimiter) == 1:
+            if self._partition_records is None:
+                raise RuntimeError(
+                    "loaded mmap_chunker_core does not support record "
+                    "partitioning (requires ABI >= 1.2); rebuild with "
+                    "`cargo build --release`"
+                )
+            count = self._partition_records(  # type: ignore[misc]
+                self._handle,
+                c_size_t(num_partitions),
+                c_ubyte(delimiter[0]),
+            )
+        else:
+            if self._partition_records_pattern is None:
+                raise RuntimeError(
+                    "loaded mmap_chunker_core does not support multi-byte "
+                    "partitioning (requires ABI >= 1.4); rebuild with "
+                    "`cargo build --release`"
+                )
+            storage = self._pattern_storage(delimiter)
+            count = self._partition_records_pattern(  # type: ignore[misc]
+                self._handle,
+                c_size_t(num_partitions),
+                storage,
+                c_size_t(len(delimiter)),
+            )
+
         self._chunk_count = count
         return count
 

@@ -34,9 +34,17 @@ class ByteChunkProvider(Protocol):
     the end of the file.
 
     Chunks partition the file exactly: no gaps, no overlaps.
-    Boundaries are placed after delimiter bytes found at or after
-    the target offset. If no delimiter exists in the remainder,
-    the remainder becomes one chunk extending to EOF.
+    Boundaries are placed after delimiter patterns found at or after
+    the target offset. The delimiter is a raw byte pattern: a single
+    byte (``b"\\n"``, ``b","``) or multiple bytes (``b"\\r\\n"``,
+    ``b"\\r\\n\\r\\n"``). No quoting or escaping semantics are applied.
+    If no delimiter exists in the remainder, the remainder becomes one
+    chunk extending to EOF.
+
+    Optional extension (not part of the protocol): providers may expose
+    ``partition_records(num_partitions, delimiter)`` to plan
+    record-aligned byte ranges for N-way parallel consumers. Ranges use
+    the same delimiter semantics and always cover the file exactly.
 
     Properties:
 

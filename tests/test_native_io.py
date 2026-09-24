@@ -8,6 +8,8 @@ Verifies:
     * No-delimiter handling
     * Small/large chunk sizes
     * Consecutive delimiters
+    * Single-byte and multi-byte delimiters
+    * Record-aligned partition planning (Python + native parity)
     * No trailing newline
     * Out-of-bounds index
     * scan-before-open error
@@ -123,15 +125,82 @@ class TestPythonChunkProvider(TestFileFixture, unittest.TestCase):
         self.assertEqual(doc.get_chunk(0), content)
         doc.close()
 
-    def test_scan_rejects_multibyte_delimiter(self) -> None:
-        content = b"a\r\nb\r\nc"
+    def test_scan_supports_multibyte_delimiter(self) -> None:
+        content = b"a\r\nbb\r\nccc\r\n"
         path = self._make_file("multidelim.txt", content)
         doc = PythonChunkProvider()
         doc.open(path)
+        count = doc.scan(chunk_size=4, delimiter=b"\r\n")
+        self.assertGreater(count, 0)
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+        for chunk in chunks[:-1]:
+            self.assertTrue(chunk.endswith(b"\r\n"))
+        doc.close()
+
+    def test_scan_supports_custom_single_byte_delimiter(self) -> None:
+        content = b"a,b,c,d"
+        path = self._make_file("comma.txt", content)
+        doc = PythonChunkProvider()
+        doc.open(path)
+        count = doc.scan(chunk_size=1, delimiter=b",")
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+        self.assertEqual(chunks[0], b"a,")
+        doc.close()
+
+    def test_scan_rejects_empty_delimiter(self) -> None:
+        path = self._make_file("empty_delim.txt", b"abc")
+        doc = PythonChunkProvider()
+        doc.open(path)
         with self.assertRaises(ValueError):
-            doc.scan(chunk_size=4, delimiter=b"\r\n")
+            doc.scan(chunk_size=4, delimiter=b"")
+        doc.close()
+
+    def test_partition_records_crlf(self) -> None:
+        content = b"a\r\nbb\r\nccc\r\ndddd"
+        path = self._make_file("partition_crlf.txt", content)
+        doc = PythonChunkProvider()
+        doc.open(path)
+        count = doc.partition_records(2, b"\r\n")
+        self.assertEqual(count, 2)
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+        self.assertTrue(chunks[0].endswith(b"\r\n"))
+        self.assertFalse(chunks[-1].endswith(b"\r\n"))
+        doc.close()
+
+    def test_partition_records_matches_chunk_bounds(self) -> None:
+        content = b"one\ntwo\nthree\nfour\nfive\n"
+        path = self._make_file("partition_bounds.txt", content)
+        doc = PythonChunkProvider()
+        doc.open(path)
+        count = doc.partition_records(3)
+        self.assertGreater(count, 0)
+        for i in range(count):
+            start, end = doc.chunk_bounds(i)
+            self.assertEqual(doc.get_chunk(i), content[start:end])
+        self.assertEqual(doc.chunk_bounds(count - 1)[1], len(content))
+        doc.close()
+
+    def test_partition_records_validation(self) -> None:
+        path = self._make_file("partition_validation.txt", b"a\nb\n")
+        doc = PythonChunkProvider()
+        with self.assertRaises(RuntimeError):
+            doc.partition_records(2)
+        doc.open(path)
         with self.assertRaises(ValueError):
-            doc.scan(chunk_size=4, delimiter=b"<sep>")
+            doc.partition_records(0)
+        with self.assertRaises(ValueError):
+            doc.partition_records(2, b"")
+        self.assertEqual(doc.partition_records(4, b"\n"), 2)
+        doc.close()
+
+    def test_partition_records_empty_file(self) -> None:
+        path = self._make_file("partition_empty.txt", b"")
+        doc = PythonChunkProvider()
+        doc.open(path)
+        self.assertEqual(doc.partition_records(8), 0)
         doc.close()
 
     def test_chunk_bounds_roundtrip(self) -> None:
@@ -384,7 +453,25 @@ class TestMmapChunkProvider(TestFileFixture, unittest.TestCase):
             doc.open(path)
             self.assertEqual(doc.scan(), 1)
 
-    def test_unsupported_delimiter(self) -> None:
+    def test_custom_delimiters(self) -> None:
+        content = b"a,b,c\nx\r\ny\r\n"
+        path = self._make_file("custom_delim.txt", content)
+        from native_io.mmap_provider import MmapChunkProvider
+
+        doc = MmapChunkProvider()
+        doc.open(path)
+        count = doc.scan(chunk_size=2, delimiter=b",")
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+
+        count = doc.scan(chunk_size=4, delimiter=b"\r\n")
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+        for chunk in chunks[:-1]:
+            self.assertTrue(chunk.endswith(b"\r\n"))
+        doc.close()
+
+    def test_scan_rejects_empty_delimiter(self) -> None:
         content = b"hello,world\n"
         path = self._make_file("comma.txt", content)
         from native_io.mmap_provider import MmapChunkProvider
@@ -392,7 +479,48 @@ class TestMmapChunkProvider(TestFileFixture, unittest.TestCase):
         doc = MmapChunkProvider()
         doc.open(path)
         with self.assertRaises(ValueError):
-            doc.scan(chunk_size=1024, delimiter=b",")
+            doc.scan(chunk_size=1024, delimiter=b"")
+        doc.close()
+
+    def test_partition_records_crlf(self) -> None:
+        content = b"a\r\nbb\r\nccc\r\ndddd"
+        path = self._make_file("mmap_partition_crlf.txt", content)
+        from native_io.mmap_provider import MmapChunkProvider
+
+        doc = MmapChunkProvider()
+        doc.open(path)
+        count = doc.partition_records(2, b"\r\n")
+        self.assertEqual(count, 2)
+        chunks = [doc.get_chunk(i) for i in range(count)]
+        self.assertEqual(b"".join(chunks), content)
+        self.assertTrue(chunks[0].endswith(b"\r\n"))
+        self.assertFalse(chunks[-1].endswith(b"\r\n"))
+        doc.close()
+
+    def test_partition_records_validation(self) -> None:
+        content = b"a\nb\n"
+        path = self._make_file("mmap_partition_validation.txt", content)
+        from native_io.mmap_provider import MmapChunkProvider
+
+        doc = MmapChunkProvider()
+        with self.assertRaises(RuntimeError):
+            doc.partition_records(2)
+        doc.open(path)
+        with self.assertRaises(ValueError):
+            doc.partition_records(0)
+        with self.assertRaises(ValueError):
+            doc.partition_records(2, b"")
+        self.assertEqual(doc.partition_records(4, b"\n"), 2)
+        doc.close()
+
+    def test_partition_records_empty_file(self) -> None:
+        path = self._make_file("mmap_partition_empty.txt", b"")
+        from native_io.mmap_provider import MmapChunkProvider
+
+        doc = MmapChunkProvider()
+        doc.open(path)
+        self.assertEqual(doc.partition_records(8), 0)
+        doc.close()
 
     def test_nonexistent_file(self) -> None:
         from native_io.mmap_provider import MmapChunkProvider
@@ -472,6 +600,40 @@ class TestInvariant(TestFileFixture, unittest.TestCase):
 
     def test_nul_bytes(self) -> None:
         self._compare(b"prefix\x00suffix\nmore\x00data\n", 100)
+
+    def _compare_partition(self, content: bytes, parts: int, delimiter: bytes) -> None:
+        path = self._make_file("partition_invariant.txt", content)
+        from native_io.mmap_provider import MmapChunkProvider
+
+        py = PythonChunkProvider()
+        py.open(path)
+        py_count = py.partition_records(parts, delimiter)
+        py_chunks = [py.get_chunk(i) for i in range(py_count)]
+        py.close()
+
+        mmap = MmapChunkProvider()
+        mmap.open(path)
+        mmap_count = mmap.partition_records(parts, delimiter)
+        mmap_chunks = [mmap.get_chunk(i) for i in range(mmap_count)]
+        mmap.close()
+
+        self.assertEqual(py_count, mmap_count, "partition count mismatch")
+        self.assertEqual(b"".join(py_chunks), content)
+        self.assertEqual(b"".join(mmap_chunks), content)
+        for i, (pc, mc) in enumerate(zip(py_chunks, mmap_chunks)):
+            self.assertEqual(pc, mc, "partition %d mismatch" % i)
+
+    def test_partition_single_byte(self) -> None:
+        self._compare_partition(b"aaa\nbbb\nccc\nddd\neee\n", 3, b"\n")
+
+    def test_partition_crlf(self) -> None:
+        self._compare_partition(b"a\r\nbb\r\nccc\r\ndddd\r\neeeee\r\n", 3, b"\r\n")
+
+    def test_partition_blank_line_pattern(self) -> None:
+        self._compare_partition(b"h1\r\n\r\nh2\r\n\r\nh3\r\n\r\n", 2, b"\r\n\r\n")
+
+    def test_partition_giant_record(self) -> None:
+        self._compare_partition(b"x" * 33 + b"\r\nsmall\r\nrecords\r\n", 8, b"\r\n")
 
 
 class TestProtocol(TestFileFixture, unittest.TestCase):

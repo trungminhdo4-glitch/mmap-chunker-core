@@ -19,9 +19,32 @@ typedef struct {
     size_t len;
 } CChunkView;
 
+/* ── Partition range (planner output) ─────────────────────────────────────── */
+
+typedef struct {
+    size_t start; /* inclusive byte offset */
+    size_t end;   /* exclusive byte offset */
+} CPartitionRange;
+
+/* ── Framing spec (planner) ───────────────────────────────────────────────── */
+
+#define MMAP_ENGINE_FRAME_DELIMITER       0U
+#define MMAP_ENGINE_FRAME_FIXED_WIDTH     1U
+#define MMAP_ENGINE_FRAME_LENGTH_PREFIXED 2U
+
+typedef struct {
+    uint32_t kind;                  /* MMAP_ENGINE_FRAME_* selector */
+    const uint8_t *delimiter;       /* kind 0: pattern bytes (not NUL-terminated) */
+    size_t delimiter_len;           /* kind 0: pattern length, must be > 0 */
+    size_t record_bytes;            /* kind 1: fixed record size, must be > 0 */
+    uint32_t prefix_bytes;          /* kind 2: prefix width, 1..=8 */
+    uint32_t prefix_little_endian;  /* kind 2: 0 = big endian, non-zero = little endian */
+    uint32_t length_includes_prefix;/* kind 2: non-zero = prefix counts total record size */
+} CFrameSpec;
+
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010003U
+#define MMAP_ENGINE_ABI_VERSION 0x00010006U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
@@ -31,13 +54,22 @@ typedef struct {
 #define MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING    (1U << 3)
 #define MMAP_ENGINE_CAP_RECORD_PARTITIONING    (1U << 4)
 #define MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER   (1U << 5)
+#define MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING (1U << 6)
+#define MMAP_ENGINE_CAP_WINDOWED_PLANNING      (1U << 7)
+#define MMAP_ENGINE_CAP_FRAMING_STRATEGIES     (1U << 8)
+
+/* ── Source modes (planner) ───────────────────────────────────────────────── */
+
+#define MMAP_ENGINE_SOURCE_MMAP     0U
+#define MMAP_ENGINE_SOURCE_WINDOWED 1U
+#define MMAP_ENGINE_SOURCE_PREAD    2U
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010003 (v1.3). Always succeeds, never panics.
+ * Current: 0x00010006 (v1.6). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -45,12 +77,15 @@ uint32_t mmap_engine_abi_version(void);
 /**
  * Return a bitmask of supported capabilities.
  *
- * Bit 0: ZERO_COPY              — chunk views reference mapped memory directly
- * Bit 1: CONFIGURABLE_DELIMITER — mmap_engine_scan_chunks_ex() available
- * Bit 2: ERROR_STRINGS          — mmap_engine_last_error() returns diagnostic text
- * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
- * Bit 4: RECORD_PARTITIONING    — mmap_engine_partition_records() available
- * Bit 5: MULTI_BYTE_DELIMITER   — mmap_engine_scan_chunks_pattern() available
+ * Bit 0: ZERO_COPY               — chunk views reference mapped memory directly
+ * Bit 1: CONFIGURABLE_DELIMITER  — mmap_engine_scan_chunks_ex() available
+ * Bit 2: ERROR_STRINGS           — mmap_engine_last_error() returns diagnostic text
+ * Bit 3: FIXED_SIZE_CHUNKING     — mmap_engine_scan_fixed() available
+ * Bit 4: RECORD_PARTITIONING     — mmap_engine_partition_records() available
+ * Bit 5: MULTI_BYTE_DELIMITER    — mmap_engine_scan_chunks_pattern() available
+ * Bit 6: MULTI_BYTE_PARTITIONING — mmap_engine_partition_records_pattern() available
+ * Bit 7: WINDOWED_PLANNING       — mmap_engine_plan_partition_ranges() available
+ * Bit 8: FRAMING_STRATEGIES      — mmap_engine_plan_partition_ranges_framed() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -263,6 +298,129 @@ size_t mmap_engine_partition_records(CEngineHandle *handle,
                                      uint8_t delimiter);
 
 /**
+ * Plan record-aligned partition byte ranges with a multi-byte delimiter
+ * pattern.
+ *
+ * Same semantics as mmap_engine_partition_records(), but each non-final
+ * partition ends immediately after the complete `delimiter` pattern, e.g.
+ * "\\r\\n" for CRLF records or "\\r\\n\\r\\n" for HTTP-style framing.
+ * A length-delimited byte pattern is used, so embedded NUL bytes are allowed.
+ *
+ * The delimiter memory is borrowed only for this call and is not retained by
+ * the engine. The caller must keep `delimiter` readable for `delimiter_len`
+ * bytes during the call; the pointer must be non-NULL and `delimiter_len`
+ * must be > 0. Invalid delimiter arguments return 0, set
+ * mmap_engine_last_error(), and do not replace the previous valid layout.
+ *
+ * When `delimiter_len == 1`, the result is byte-identical to
+ * mmap_engine_partition_records() with that byte.
+ *
+ * Calling this function replaces any previously computed chunk boundaries.
+ *
+ * @param handle                Valid handle from mmap_engine_open().
+ * @param requested_partitions  Desired number of partitions (must be > 0).
+ * @param delimiter             Pointer to delimiter bytes (not NUL-terminated).
+ * @param delimiter_len         Number of delimiter bytes; must be > 0.
+ * @return                      Actual partition count (may be < requested),
+ *                              or 0 on error / empty file.
+ *                              On error, call mmap_engine_last_error().
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.4 (detect with MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING).
+ */
+size_t mmap_engine_partition_records_pattern(CEngineHandle *handle,
+                                             size_t requested_partitions,
+                                             const uint8_t *delimiter,
+                                             size_t delimiter_len);
+
+/**
+ * Plan record-aligned partition ranges from a file with a selectable
+ * byte-source backend, without opening an engine handle.
+ *
+ * Source modes:
+ *   MMAP_ENGINE_SOURCE_MMAP     (0) — full-file read-only mapping
+ *   MMAP_ENGINE_SOURCE_WINDOWED (1) — bounded moving-window mapping;
+ *                                     window_bytes must be >= 65536
+ *   MMAP_ENGINE_SOURCE_PREAD    (2) — positional reads, no mapping
+ *
+ * All modes produce byte-identical ranges for the same file, delimiter,
+ * and partition count. `window_bytes` is ignored outside windowed mode.
+ *
+ * Two-phase usage:
+ *   Call once with out_ranges = NULL and capacity = 0; the function
+ *   returns -2 and stores the required range count in *out_count.
+ *   Allocate that many CPartitionRange values, then call again.
+ *
+ * @param path                  Null-terminated UTF-8 file path.
+ * @param requested_partitions  Desired number of partitions (must be > 0).
+ * @param delimiter             Pointer to delimiter bytes (not NUL-terminated).
+ * @param delimiter_len         Number of delimiter bytes; must be > 0.
+ * @param source_mode           MMAP_ENGINE_SOURCE_* selector.
+ * @param window_bytes          Window size for windowed mode (min 65536).
+ * @param out_ranges            Output buffer of CPartitionRange values.
+ * @param capacity              Number of elements out_ranges can hold.
+ * @param out_count             Required/actual number of ranges (non-NULL).
+ * @return                      0 on success, -1 on invalid argument or I/O
+ *                              error, -2 when capacity is too small.
+ *                              On -1, call mmap_engine_last_error().
+ *
+ * Threading: May be called concurrently from multiple threads; each call
+ * is independent.
+ *
+ * Added in ABI v1.5 (detect with MMAP_ENGINE_CAP_WINDOWED_PLANNING).
+ */
+int32_t mmap_engine_plan_partition_ranges(const char *path,
+                                          size_t requested_partitions,
+                                          const uint8_t *delimiter,
+                                          size_t delimiter_len,
+                                          uint32_t source_mode,
+                                          size_t window_bytes,
+                                          CPartitionRange *out_ranges,
+                                          size_t capacity,
+                                          size_t *out_count);
+
+/**
+ * Plan record-aligned partition ranges with a pluggable framing strategy.
+ *
+ * Same two-phase protocol, source modes, and return values as
+ * mmap_engine_plan_partition_ranges(), but record boundaries are defined
+ * by `frame`:
+ *
+ *   - MMAP_ENGINE_FRAME_DELIMITER: raw delimiter pattern (single or multi
+ *     byte; not CSV/JSON parsing)
+ *   - MMAP_ENGINE_FRAME_FIXED_WIDTH: records of exactly `record_bytes`
+ *   - MMAP_ENGINE_FRAME_LENGTH_PREFIXED: 1..=8 byte length prefix in the
+ *     selected endianness, optionally counting the prefix itself
+ *
+ * Invalid framing specifications return -1 and leave no output.
+ *
+ * @param path                  Null-terminated UTF-8 file path.
+ * @param requested_partitions  Desired number of partitions (must be > 0).
+ * @param frame                 Readable CFrameSpec (must not be NULL).
+ * @param source_mode           MMAP_ENGINE_SOURCE_* selector.
+ * @param window_bytes          Window size for windowed mode (min 65536).
+ * @param out_ranges            Output buffer of CPartitionRange values.
+ * @param capacity              Number of elements out_ranges can hold.
+ * @param out_count             Required/actual number of ranges (non-NULL).
+ * @return                      0 on success, -1 on invalid argument or I/O
+ *                              error, -2 when capacity is too small.
+ *                              On -1, call mmap_engine_last_error().
+ *
+ * Threading: May be called concurrently from multiple threads.
+ *
+ * Added in ABI v1.6 (detect with MMAP_ENGINE_CAP_FRAMING_STRATEGIES).
+ */
+int32_t mmap_engine_plan_partition_ranges_framed(const char *path,
+                                                 size_t requested_partitions,
+                                                 const CFrameSpec *frame,
+                                                 uint32_t source_mode,
+                                                 size_t window_bytes,
+                                                 CPartitionRange *out_ranges,
+                                                 size_t capacity,
+                                                 size_t *out_count);
+
+/**
  * Retrieve a chunk view by index (zero-copy).
  *
  * The `data` pointer references the memory-mapped file directly and
@@ -330,6 +488,10 @@ void mmap_engine_free(CEngineHandle *handle);
  *   v1.1 (0x00010001): Added mmap_engine_scan_fixed() + CAP_FIXED_SIZE_CHUNKING.
  *   v1.2 (0x00010002): Added mmap_engine_partition_records() + CAP_RECORD_PARTITIONING.
  *   v1.3 (0x00010003): Added mmap_engine_scan_chunks_pattern() + CAP_MULTI_BYTE_DELIMITER.
+ *   v1.4 (0x00010004): Added mmap_engine_partition_records_pattern() + CAP_MULTI_BYTE_PARTITIONING.
+ *   v1.5 (0x00010005): Added mmap_engine_plan_partition_ranges() + CAP_WINDOWED_PLANNING.
+ *   v1.6 (0x00010006): Added mmap_engine_plan_partition_ranges_framed() + CAP_FRAMING_STRATEGIES
+ *                      (delimiter, fixed-width, and length-prefixed record framing).
  *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *
@@ -338,6 +500,29 @@ void mmap_engine_free(CEngineHandle *handle);
  *   0       data    const uint8_t*  8
  *   8       len     size_t          8
  *   total: 16 bytes
+ *
+ * CPartitionRange layout (guaranteed by #[repr(C)]):
+ *
+ *   offset  field   type    size (64-bit)
+ *   ------  -----   ----    -------------
+ *   0       start   size_t  8
+ *   8       end     size_t  8
+ *   total: 16 bytes
+ *
+ * CFrameSpec layout (guaranteed by #[repr(C)]):
+ *
+ *   offset  field                    type            size (64-bit)
+ *   ------  -----                    ----            -------------
+ *   0       kind                     uint32_t        4
+ *   4       (padding)                —               4
+ *   8       delimiter                const uint8_t*  8
+ *   16      delimiter_len            size_t          8
+ *   24      record_bytes             size_t          8
+ *   32      prefix_bytes             uint32_t        4
+ *   36      prefix_little_endian     uint32_t        4
+ *   40      length_includes_prefix   uint32_t        4
+ *   44      (padding)                —               4
+ *   total: 48 bytes
  *
  * CEngineHandle is an opaque pointer type. The caller must never
  * dereference or sizeof() it.

@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
     }
 
     if (mmap_engine_abi_version() != MMAP_ENGINE_ABI_VERSION ||
-        mmap_engine_capabilities() != 63U) {
+        mmap_engine_capabilities() != 511U) {
         fail("ABI discovery mismatch");
     }
     if (sizeof(CChunkView) != 16 || offsetof(CChunkView, data) != 0 ||
@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
         "total_length=%zu;record_count=%zu;fnv1a64=%016llx;deterministic=1;"
         "n0_error=%s;chunk_view_size=%zu;chunk_view_data_offset=%zu;"
         "chunk_view_len_offset=%zu",
-        MMAP_ENGINE_ABI_VERSION, 63U, count, lengths_text, source_length,
+        MMAP_ENGINE_ABI_VERSION, 511U, count, lengths_text, source_length,
         record_count, (unsigned long long)hash, error_copy, sizeof(CChunkView),
         offsetof(CChunkView, data), offsetof(CChunkView, len));
     if (written < 0 || (size_t)written >= sizeof(result)) {

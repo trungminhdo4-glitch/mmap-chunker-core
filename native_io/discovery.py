@@ -15,7 +15,7 @@ Discovery result format::
         "platform": "windows",
         "library_path": "D:\\...\\mmap_chunker_core.dll",
         "symbols_ok": true,
-        "reason": "library loaded, all 4 symbols verified"
+        "reason": "library loaded, core symbols verified"
     }
 
 Provider selection modes:
@@ -117,7 +117,7 @@ def discover_mmap_provider() -> ProviderInfo:
         platform=platform_name,
         library_path=library_path,
         symbols_ok=True,
-        reason="library loaded successfully, all 4 symbols verified",
+        reason="library loaded successfully, core symbols verified",
     )
 
 

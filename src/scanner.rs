@@ -51,7 +51,8 @@ pub fn find_chunk_boundaries(data: &[u8], chunk_size: usize, delimiter: u8) -> V
 mod differential_tests {
     use super::{
         find_byte_swar, find_chunk_boundaries, find_chunk_boundaries_pattern,
-        find_partition_boundaries, ChunkCursor, PatternChunkCursor,
+        find_partition_boundaries, find_partition_boundaries_pattern, ChunkCursor,
+        PatternChunkCursor,
     };
 
     const SINGLE_SEED: u64 = 0x5349_4e47_4c45_0001;
@@ -60,6 +61,7 @@ mod differential_tests {
     const PATTERN_CURSOR_SEED: u64 = 0x5043_5552_534f_0004;
     const SWAR_SEED: u64 = 0x5357_4152_0000_0005;
     const PARTITION_SEED: u64 = 0x5041_5254_0000_0006;
+    const PARTITION_PATTERN_SEED: u64 = 0x5041_5254_5041_0007;
 
     #[derive(Clone, Copy)]
     struct Lcg {
@@ -229,6 +231,59 @@ mod differential_tests {
         partitions
     }
 
+    fn scalar_partition_boundaries_pattern(
+        data: &[u8],
+        num_partitions: usize,
+        pattern: &[u8],
+    ) -> Vec<(usize, usize)> {
+        assert!(!pattern.is_empty());
+        if data.is_empty() || num_partitions == 0 {
+            return Vec::new();
+        }
+        if num_partitions == 1 {
+            return vec![(0, data.len())];
+        }
+
+        let mut cut_points = Vec::new();
+        let mut last_cut = 0;
+
+        for partition in 1..num_partitions {
+            let target = data.len() * partition / num_partitions;
+            if target <= last_cut {
+                continue;
+            }
+
+            let mut candidate = target;
+            let mut cut = data.len();
+            while candidate + pattern.len() <= data.len() {
+                if data[candidate..candidate + pattern.len()] == pattern[..] {
+                    cut = candidate + pattern.len();
+                    break;
+                }
+                candidate += 1;
+            }
+            cut_points.push(cut);
+            last_cut = cut;
+
+            if cut == data.len() {
+                break;
+            }
+        }
+
+        let mut partitions = Vec::with_capacity(cut_points.len() + 1);
+        let mut start = 0;
+        for end in cut_points {
+            if end > start {
+                partitions.push((start, end));
+            }
+            start = end;
+        }
+        if start < data.len() {
+            partitions.push((start, data.len()));
+        }
+        partitions
+    }
+
     fn generated_single_case(seed: u64, case: usize) -> (Vec<u8>, usize, u8) {
         const LENGTHS: &[usize] = &[0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 127, 255];
         let mut rng = Lcg::new(seed ^ (case as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -367,6 +422,61 @@ mod differential_tests {
         (data, num_partitions, delimiter)
     }
 
+    fn generated_partition_pattern_case(seed: u64, case: usize) -> (Vec<u8>, usize, Vec<u8>) {
+        const LENGTHS: &[usize] = &[0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 127, 255];
+        const PATTERN_LENGTHS: &[usize] = &[1, 2, 2, 3, 4, 8, 16];
+        let mut rng = Lcg::new(seed ^ (case as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let len = if case % 4 == 0 {
+            LENGTHS[(case / 4) % LENGTHS.len()]
+        } else {
+            rng.next_usize(256)
+        };
+        let mut data = vec![0; len];
+        for byte in &mut data {
+            *byte = rng.next_u8();
+        }
+
+        let pattern_len = PATTERN_LENGTHS[case % PATTERN_LENGTHS.len()];
+        let mut pattern = vec![0; pattern_len];
+        for byte in &mut pattern {
+            *byte = rng.next_u8();
+        }
+        if case % 6 == 0 {
+            pattern.fill(b'a');
+            if pattern_len > 1 {
+                *pattern.last_mut().unwrap() = b'b';
+            }
+        }
+
+        match case % 10 {
+            0 => data.fill(pattern[0]),
+            1 => {}
+            _ if !data.is_empty() => {
+                let injections = 1 + case % 5;
+                let data_len = data.len();
+                for offset in 0..injections {
+                    if data_len >= pattern_len {
+                        let start = (case * 13 + offset * 17) % (data_len - pattern_len + 1);
+                        data[start..start + pattern_len].copy_from_slice(&pattern);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let num_partitions = match case % 9 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 8,
+            5 => 16,
+            6 => 64,
+            _ => 1 + rng.next_usize(128),
+        };
+        (data, num_partitions, pattern)
+    }
+
     fn cursor_ranges(data: &[u8], chunk_size: usize, delimiter: u8) -> Vec<(usize, usize)> {
         let base = data.as_ptr() as usize;
         let mut cursor = ChunkCursor::new(data, chunk_size, delimiter);
@@ -441,6 +551,40 @@ mod differential_tests {
             assert!(end > start, "empty partition at index {index}");
             if index + 1 < partitions.len() {
                 assert_eq!(data[end - 1], delimiter);
+            }
+            previous_end = end;
+        }
+        assert_eq!(previous_end, data.len());
+    }
+
+    fn assert_partition_invariants_pattern(
+        data: &[u8],
+        num_partitions: usize,
+        pattern: &[u8],
+        partitions: &[(usize, usize)],
+    ) {
+        assert!(!pattern.is_empty());
+        if data.is_empty() || num_partitions == 0 {
+            assert!(partitions.is_empty());
+            return;
+        }
+
+        assert!(!partitions.is_empty());
+        assert!(partitions.len() <= num_partitions);
+        assert_eq!(partitions.first().unwrap().0, 0);
+        assert_eq!(partitions.last().unwrap().1, data.len());
+
+        let mut previous_end = 0;
+        for (index, &(start, end)) in partitions.iter().enumerate() {
+            assert_eq!(start, previous_end, "gap or overlap at partition {index}");
+            assert!(end > start, "empty partition at index {index}");
+            if index + 1 < partitions.len() {
+                assert!(end >= pattern.len());
+                assert_eq!(
+                    &data[end - pattern.len()..end],
+                    pattern,
+                    "partition {index} did not end on the delimiter pattern"
+                );
             }
             previous_end = end;
         }
@@ -654,6 +798,98 @@ mod differential_tests {
             }
         }
     }
+
+    #[test]
+    fn partition_pattern_matches_scalar_oracle_for_fixtures() {
+        let cases: &[(&[u8], usize, &[u8])] = &[
+            (b"", 4, b"\r\n"),
+            (b"x", 1, b"\r\n"),
+            (b"no delimiter", 8, b"\r\n"),
+            (b"a\r\n\r\nb\r\n", 8, b"\r\n"),
+            (b"aa\r\nbbbb\r\ncccccccccccc\r\ndd\r\n", 4, b"\r\n"),
+            (b"one\r\n\r\ntwo\r\n\r\nthree\r\n\r\n", 2, b"\r\n\r\n"),
+            (b"a\x00\x01b\x00\x01c", 3, b"\x00\x01"),
+            (b"pattern longer than the entire file", 8, b"<missing>"),
+            (b"123456789", 0, b"\r\n"),
+            (b"123456789", 1, b"\r\n"),
+            (b"123456789", 64, b"\r\n"),
+        ];
+
+        for &(data, num_partitions, pattern) in cases {
+            let expected = scalar_partition_boundaries_pattern(data, num_partitions, pattern);
+            let actual = find_partition_boundaries_pattern(data, num_partitions, pattern);
+            assert_eq!(
+                actual, expected,
+                "pattern partition mismatch for data={data:?}, n={num_partitions}, pattern={pattern:?}"
+            );
+            assert_partition_invariants_pattern(data, num_partitions, pattern, &actual);
+        }
+
+        let mut giant = vec![b'x'; 10_000];
+        giant.extend_from_slice(b"\r\nsmall\r\nrecords\r\n");
+        let expected = scalar_partition_boundaries_pattern(&giant, 64, b"\r\n");
+        let actual = find_partition_boundaries_pattern(&giant, 64, b"\r\n");
+        assert_eq!(actual, expected);
+        assert_partition_invariants_pattern(&giant, 64, b"\r\n", &actual);
+    }
+
+    #[test]
+    fn partition_pattern_matches_generated_cases() {
+        for case in 0..4096 {
+            let (data, num_partitions, pattern) =
+                generated_partition_pattern_case(PARTITION_PATTERN_SEED, case);
+            let expected = scalar_partition_boundaries_pattern(&data, num_partitions, &pattern);
+            let actual = find_partition_boundaries_pattern(&data, num_partitions, &pattern);
+            assert_eq!(
+                actual, expected,
+                "pattern partition mismatch: seed={PARTITION_PATTERN_SEED:#018x}, case={case}, data={data:?}, n={num_partitions}, pattern={pattern:?}"
+            );
+            assert_partition_invariants_pattern(&data, num_partitions, &pattern, &actual);
+            assert_eq!(
+                find_partition_boundaries_pattern(&data, num_partitions, &pattern),
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn partition_pattern_delegates_to_single_byte_path() {
+        for case in 0..2048 {
+            let (data, num_partitions, delimiter) = generated_partition_case(PARTITION_SEED, case);
+            let single = find_partition_boundaries(&data, num_partitions, delimiter);
+            let pattern = find_partition_boundaries_pattern(&data, num_partitions, &[delimiter]);
+            assert_eq!(
+                pattern, single,
+                "single-byte delegation mismatch: seed={PARTITION_SEED:#018x}, case={case}, data={data:?}, n={num_partitions}, delimiter={delimiter:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_pattern_request_above_file_len_matches_file_len_oracle() {
+        for case in 0..4096 {
+            let (data, _, pattern) = generated_partition_pattern_case(PARTITION_PATTERN_SEED, case);
+            if data.is_empty() {
+                continue;
+            }
+
+            let expected = find_partition_boundaries_pattern(&data, data.len(), &pattern);
+            for requested in [data.len() + 1, usize::MAX] {
+                assert_eq!(
+                    find_partition_boundaries_pattern(&data, requested, &pattern),
+                    expected,
+                    "request above file length changed output: seed={PARTITION_PATTERN_SEED:#018x}, case={case}, data_len={}, requested={requested}, pattern={pattern:?}",
+                    data.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "delimiter must not be empty")]
+    fn partition_pattern_rejects_empty_delimiter() {
+        let _ = find_partition_boundaries_pattern(b"data", 2, b"");
+    }
 }
 
 /// A lazy, streaming cursor that yields delimiter-aligned chunks
@@ -769,7 +1005,7 @@ impl<'a> Iterator for ChunkCursor<'a> {
 ///
 /// Time complexity: O(n + m) typical, O(n*m) pathological (repeated
 /// prefix). No unsafe. No dependencies. MSRV 1.77.
-fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
+pub(crate) fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
     let plen = pattern.len();
     if plen == 0 || haystack.len() < plen {
         return None;
@@ -1136,15 +1372,25 @@ pub fn find_partition_boundaries(
         }
     }
 
-    let effective_n = boundaries.len() + 1;
-    let mut partitions = Vec::with_capacity(effective_n);
+    ranges_from_boundaries(file_len, &boundaries)
+}
+
+/// Convert ordered, potentially duplicate absolute cut points into
+/// contiguous `(start, end)` partitions covering `[0, file_len)`.
+///
+/// Shared by the single-byte and multi-byte partition planners so both
+/// produce identical assembly semantics: empty or duplicate cuts are
+/// skipped, adjacent partitions are contiguous, and the final range
+/// always reaches EOF.
+pub(crate) fn ranges_from_boundaries(file_len: usize, boundaries: &[usize]) -> Vec<(usize, usize)> {
+    let mut partitions = Vec::with_capacity(boundaries.len() + 1);
 
     let mut prev = 0usize;
-    for &b in &boundaries {
-        if b > prev {
-            partitions.push((prev, b));
+    for &boundary in boundaries {
+        if boundary > prev {
+            partitions.push((prev, boundary));
         }
-        prev = b;
+        prev = boundary;
     }
 
     if prev < file_len {
@@ -1152,6 +1398,77 @@ pub fn find_partition_boundaries(
     }
 
     partitions
+}
+
+/// Compute N record-aligned partition boundaries using a multi-byte
+/// delimiter pattern.
+///
+/// Same semantics as [`find_partition_boundaries`] but each non-final
+/// partition ends immediately after the complete `delimiter` pattern
+/// (e.g. `b"\r\n"` for CRLF records or `b"\r\n\r\n"` for HTTP-style
+/// framing), so no record is split.
+///
+/// When `delimiter.len() == 1`, this delegates to the single-byte SWAR
+/// path and produces byte-identical output.
+///
+/// # Properties
+///
+/// Identical to [`find_partition_boundaries`]: complete coverage, no
+/// gaps or overlaps, deterministic output, `O(N)` metadata, and bounded
+/// forward scanning. A delimiter longer than the file is valid and
+/// produces a single partition for a non-empty file.
+///
+/// # Panics
+///
+/// Panics if `delimiter` is empty.
+pub fn find_partition_boundaries_pattern(
+    data: &[u8],
+    num_partitions: usize,
+    delimiter: &[u8],
+) -> Vec<(usize, usize)> {
+    assert!(!delimiter.is_empty(), "delimiter must not be empty");
+    if delimiter.len() == 1 {
+        return find_partition_boundaries(data, num_partitions, delimiter[0]);
+    }
+
+    let file_len = data.len();
+    if file_len == 0 || num_partitions == 0 {
+        return Vec::new();
+    }
+    if num_partitions == 1 {
+        return vec![(0, file_len)];
+    }
+
+    // See `find_partition_boundaries` for the cap rationale.
+    let n = num_partitions.min(file_len);
+
+    let mut boundaries = Vec::new();
+    let mut last_boundary: usize = 0;
+
+    for i in 1..n {
+        // Overflow-safe: use u128 intermediate for multiplication.
+        let target = ((file_len as u128) * (i as u128) / (n as u128)) as usize;
+        if target <= last_boundary {
+            continue;
+        }
+
+        match find_pattern_in_slice(&data[target..], delimiter) {
+            Some(rel_pos) => {
+                let boundary = target
+                    .saturating_add(rel_pos)
+                    .saturating_add(delimiter.len())
+                    .min(file_len);
+                boundaries.push(boundary);
+                last_boundary = boundary;
+            }
+            None => {
+                boundaries.push(file_len);
+                break;
+            }
+        }
+    }
+
+    ranges_from_boundaries(file_len, &boundaries)
 }
 
 #[cfg(test)]

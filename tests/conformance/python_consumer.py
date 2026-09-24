@@ -32,9 +32,17 @@ def configure(library: Path) -> ctypes.CDLL:
     lib.mmap_engine_last_error.restype = ctypes.c_char_p
     lib.mmap_engine_open.argtypes = [ctypes.c_char_p]
     lib.mmap_engine_open.restype = ctypes.c_void_p
-    lib.mmap_engine_partition_records.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ubyte]
+    lib.mmap_engine_partition_records.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_ubyte,
+    ]
     lib.mmap_engine_partition_records.restype = ctypes.c_size_t
-    lib.mmap_engine_get_chunk.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(CChunkView)]
+    lib.mmap_engine_get_chunk.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(CChunkView),
+    ]
     lib.mmap_engine_get_chunk.restype = ctypes.c_int32
     lib.mmap_engine_free.argtypes = [ctypes.c_void_p]
     lib.mmap_engine_free.restype = None
@@ -76,10 +84,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    if ctypes.sizeof(CChunkView) != 16 or CChunkView.data.offset != 0 or CChunkView.len.offset != 8:
+    if (
+        ctypes.sizeof(CChunkView) != 16
+        or CChunkView.data.offset != 0
+        or CChunkView.len.offset != 8
+    ):
         raise AssertionError("CChunkView layout mismatch")
     lib = configure(args.library.resolve())
-    if lib.mmap_engine_abi_version() != 0x00010003 or lib.mmap_engine_capabilities() != 63:
+    if (
+        lib.mmap_engine_abi_version() != 0x00010006
+        or lib.mmap_engine_capabilities() != 511
+    ):
         raise AssertionError("ABI discovery mismatch")
 
     source = args.fixture.read_bytes()
@@ -97,9 +112,11 @@ def main() -> None:
         raise AssertionError(f"N=0 error contract mismatch: {n0_error!r}")
     lib.mmap_engine_free(handle)
 
-    record_count = source.count(b"\n") + int(bool(source) and not source.endswith(b"\n"))
+    record_count = source.count(b"\n") + int(
+        bool(source) and not source.endswith(b"\n")
+    )
     result = (
-        f"abi_version=65539;capabilities=63;partition_count={len(first)};"
+        f"abi_version=65542;capabilities=511;partition_count={len(first)};"
         f"partition_lengths={','.join(str(len(chunk)) for chunk in first)};"
         f"total_length={len(source)};record_count={record_count};"
         f"fnv1a64={digest:016x};deterministic=1;n0_error={n0_error};"
@@ -109,7 +126,9 @@ def main() -> None:
     )
     expected = args.expected.read_text(encoding="utf-8").strip()
     if result != expected:
-        raise AssertionError(f"canonical result mismatch\nexpected: {expected}\nactual:   {result}")
+        raise AssertionError(
+            f"canonical result mismatch\nexpected: {expected}\nactual:   {result}"
+        )
     args.output.write_text(result + "\n", encoding="utf-8")
     print("PASS: Python conformance consumer")
 

@@ -1,16 +1,41 @@
 pub mod ffi;
+pub mod framing;
+pub mod index;
+pub mod json;
+pub mod manifest;
 pub mod mmap;
 pub mod scanner;
+pub mod source;
 
 mod plan;
 
 pub use ffi::{
-    CChunkView, CEngineHandle, ABI_VERSION, CAP_CONFIGURABLE_DELIMITER, CAP_ERROR_STRINGS,
-    CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER, CAP_RECORD_PARTITIONING, CAP_ZERO_COPY,
+    CChunkView, CEngineHandle, CFrameSpec, CPartitionRange, ABI_VERSION,
+    CAP_CONFIGURABLE_DELIMITER, CAP_ERROR_STRINGS, CAP_FIXED_SIZE_CHUNKING, CAP_FRAMING_STRATEGIES,
+    CAP_MULTI_BYTE_DELIMITER, CAP_MULTI_BYTE_PARTITIONING, CAP_RECORD_PARTITIONING,
+    CAP_WINDOWED_PLANNING, CAP_ZERO_COPY, FRAME_KIND_DELIMITER, FRAME_KIND_FIXED_WIDTH,
+    FRAME_KIND_LENGTH_PREFIXED, SOURCE_MODE_MMAP, SOURCE_MODE_PREAD, SOURCE_MODE_WINDOWED,
 };
-pub use mmap::MmapFile;
+pub use framing::{
+    BoundaryScanner, BuiltinFraming, FramingDescriptor, FramingStrategy, MAX_LENGTH_PREFIX_BYTES,
+};
+pub use index::{
+    build_record_index, plan_partition_boundaries_from_index, RecordIndex, INDEX_SCHEMA,
+    INDEX_SCHEMA_VERSION,
+};
+pub use manifest::{
+    identify_file, plan_file, plan_file_with_framing, plan_from_ranges, FileIdentity,
+    IndexReference, ManifestError, ManifestErrorKind, RangePlan, IDENTITY_SAMPLE_BYTES,
+    MAX_MANIFEST_BYTES, MAX_MANIFEST_RANGES, PLAN_SCHEMA, PLAN_SCHEMA_VERSION,
+};
+pub use mmap::{MmapFile, WindowedMmapFile};
 pub use scanner::ChunkCursor;
 pub use scanner::PatternChunkCursor;
+pub use source::{
+    plan_partition_boundaries, plan_partition_boundaries_with, plan_partition_ranges,
+    plan_partition_ranges_with, ByteSource, MmapSource, PlannerOptions, PreadSource, SourceMode,
+    WindowedMmapSource, DEFAULT_SCAN_BUFFER_BYTES, DEFAULT_WINDOW_BYTES, MIN_WINDOW_BYTES,
+};
 
 use std::io;
 use std::path::Path;
@@ -174,6 +199,35 @@ impl MmapChunker {
     #[inline]
     pub fn delimited_cursor(&self, chunk_size: usize, delimiter: u8) -> ChunkCursor<'_> {
         ChunkCursor::new(self.as_bytes(), chunk_size, delimiter)
+    }
+
+    /// Plan record-aligned partition byte ranges using a multi-byte
+    /// delimiter pattern.
+    ///
+    /// Same semantics as [`partition_records`](Self::partition_records)
+    /// but each partition boundary falls immediately after the complete
+    /// `delimiter` pattern — e.g. `b"\r\n"` for CRLF records or
+    /// `b"\r\n\r\n"` for HTTP-style framing.
+    ///
+    /// When `delimiter.len() == 1`, this delegates to the single-byte
+    /// path and produces byte-identical output.
+    ///
+    /// Replaces any previous layout. Returns the number of partitions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
+    pub fn partition_records_pattern(&mut self, num_partitions: usize, delimiter: &[u8]) -> usize {
+        let data = self.mmap.as_bytes();
+        let file_len = data.len();
+        if file_len == 0 || num_partitions == 0 {
+            self.plan = ChunkPlan::empty();
+            return 0;
+        }
+        let partitions =
+            scanner::find_partition_boundaries_pattern(data, num_partitions, delimiter);
+        self.plan = ChunkPlan::from_ranges(partitions);
+        self.plan.len()
     }
 
     /// Scan with a multi-byte delimiter (e.g., `b"\r\n"` for CRLF).
@@ -389,6 +443,61 @@ mod tests {
                 assert!(!chunk.is_empty());
             }
             assert_eq!(total, file.len());
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_chunker_partition_records_pattern_crlf() {
+        let path = temp_file(
+            "partition_crlf",
+            b"record1\r\nrecord2\r\nrecord3\r\nrecord4\r\n",
+        );
+
+        unsafe {
+            let mut file = MmapChunker::open(&path).unwrap();
+            let count = file.partition_records_pattern(2, b"\r\n");
+            assert_eq!(count, 2);
+
+            let mut total = 0usize;
+            for i in 0..count {
+                let chunk = file.get_chunk(i).unwrap();
+                total += chunk.len();
+                assert!(!chunk.is_empty());
+                if i + 1 < count {
+                    assert!(chunk.ends_with(b"\r\n"), "partition split a CRLF record");
+                }
+            }
+            assert_eq!(total, file.len());
+            assert_eq!(
+                file.get_chunk(0),
+                Some(b"record1\r\nrecord2\r\nrecord3\r\n" as &[u8])
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_chunker_partition_records_pattern_single_byte_parity() {
+        let path = temp_file("partition_parity", b"a\nb\nc\nd\ne\n");
+
+        unsafe {
+            let mut single = MmapChunker::open(&path).unwrap();
+            let single_count = single.partition_records(3, b'\n');
+            let single_ranges: Vec<Option<Vec<u8>>> = (0..single_count)
+                .map(|i| single.get_chunk(i).map(<[u8]>::to_vec))
+                .collect();
+
+            let mut pattern = MmapChunker::open(&path).unwrap();
+            let pattern_count = pattern.partition_records_pattern(3, b"\n");
+            let pattern_ranges: Vec<Option<Vec<u8>>> = (0..pattern_count)
+                .map(|i| pattern.get_chunk(i).map(<[u8]>::to_vec))
+                .collect();
+
+            assert_eq!(single_count, pattern_count);
+            assert_eq!(single_ranges, pattern_ranges);
         }
 
         cleanup(&path);
