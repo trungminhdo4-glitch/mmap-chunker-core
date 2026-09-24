@@ -16,10 +16,11 @@ use std::ffi::{c_char, c_int, CStr};
 use crate::mmap::MmapFile;
 use crate::plan::ChunkPlan;
 use crate::scanner;
+use crate::source::{plan_partition_ranges, PlannerOptions, SourceMode};
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0004;
+pub const ABI_VERSION: u32 = 0x0001_0005;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
@@ -28,6 +29,14 @@ pub const CAP_FIXED_SIZE_CHUNKING: u32 = 1 << 3;
 pub const CAP_RECORD_PARTITIONING: u32 = 1 << 4;
 pub const CAP_MULTI_BYTE_DELIMITER: u32 = 1 << 5;
 pub const CAP_MULTI_BYTE_PARTITIONING: u32 = 1 << 6;
+pub const CAP_WINDOWED_PLANNING: u32 = 1 << 7;
+
+/// Source mode passed to `mmap_engine_plan_partition_ranges`.
+pub const SOURCE_MODE_MMAP: u32 = 0;
+/// Source mode passed to `mmap_engine_plan_partition_ranges`.
+pub const SOURCE_MODE_WINDOWED: u32 = 1;
+/// Source mode passed to `mmap_engine_plan_partition_ranges`.
+pub const SOURCE_MODE_PREAD: u32 = 2;
 
 const MAX_ERROR_LEN: usize = 256;
 
@@ -64,6 +73,15 @@ pub struct CChunkView {
     pub len: usize,
 }
 
+/// A record-aligned partition range produced by the planner.
+///
+/// Offsets are bytes; `start` is inclusive and `end` is exclusive.
+#[repr(C)]
+pub struct CPartitionRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 /// Opaque engine handle.
 ///
 /// Allocated by `mmap_engine_open` and must be freed with `mmap_engine_free`.
@@ -84,7 +102,7 @@ struct Engine {
 
 /// Return the ABI version as `(major << 16) | minor`.
 ///
-/// Current: `0x0001_0004` (v1.4). Always succeeds, never panics.
+/// Current: `0x0001_0005` (v1.5). Always succeeds, never panics.
 #[no_mangle]
 pub extern "C" fn mmap_engine_abi_version() -> u32 {
     ABI_VERSION
@@ -95,7 +113,7 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.4):
+/// Current bits (v1.5):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
@@ -103,6 +121,7 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 ///   - Bit 4: `RECORD_PARTITIONING` — `mmap_engine_partition_records` available
 ///   - Bit 5: `MULTI_BYTE_DELIMITER` — `mmap_engine_scan_chunks_pattern` available
 ///   - Bit 6: `MULTI_BYTE_PARTITIONING` — `mmap_engine_partition_records_pattern` available
+///   - Bit 7: `WINDOWED_PLANNING` — `mmap_engine_plan_partition_ranges` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
     CAP_ZERO_COPY
@@ -112,6 +131,7 @@ pub extern "C" fn mmap_engine_capabilities() -> u32 {
         | CAP_RECORD_PARTITIONING
         | CAP_MULTI_BYTE_DELIMITER
         | CAP_MULTI_BYTE_PARTITIONING
+        | CAP_WINDOWED_PLANNING
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -593,6 +613,152 @@ pub unsafe extern "C" fn mmap_engine_partition_records_pattern(
     }
 }
 
+/// Plan record-aligned partition ranges from a file without an engine
+/// handle and without returning file bytes.
+///
+/// This is the source-selectable planning entry point: instead of
+/// mapping the whole file into an engine, it writes `C`-visible
+/// `(start, end)` range pairs into a caller-provided buffer. Three
+/// backends are available:
+///
+///   - `SOURCE_MODE_MMAP` (0): full-file read-only mapping
+///   - `SOURCE_MODE_WINDOWED` (1): bounded moving-window mapping;
+///     `window_bytes` must be >= 65536 (otherwise error)
+///   - `SOURCE_MODE_PREAD` (2): positional reads, no mapping
+///
+/// All three produce byte-identical ranges for the same file and
+/// delimiter; the mode only changes how bytes are accessed.
+///
+/// # Two-phase usage
+///
+/// Call once with `out_ranges = NULL` and `capacity = 0`; the function
+/// returns -2 and writes the required range count to `*out_count`.
+/// Allocate that many `CPartitionRange` values, then call again.
+///
+/// # Return value
+///
+///   - `0`: success; `*out_count` ranges were written
+///   - `-1`: invalid argument or I/O error; call `mmap_engine_last_error()`
+///   - `-2`: `capacity` too small; `*out_count` holds the required count
+///
+/// # Threading
+///
+/// May be called concurrently from multiple threads; each call is
+/// independent and holds no shared planner state.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated C string. If
+/// `delimiter_len` is non-zero, `delimiter` must be non-null and point
+/// to `delimiter_len` readable bytes for the duration of the call.
+/// `out_count` must be non-null and writable. If `capacity` is
+/// non-zero, `out_ranges` must point to `capacity` writable
+/// `CPartitionRange` values. The input file must not be modified while
+/// this function runs (mmap-backed modes).
+///
+/// Added in ABI v1.5 (detect with `MMAP_ENGINE_CAP_WINDOWED_PLANNING`).
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_plan_partition_ranges(
+    path: *const c_char,
+    requested_partitions: usize,
+    delimiter: *const u8,
+    delimiter_len: usize,
+    source_mode: u32,
+    window_bytes: usize,
+    out_ranges: *mut CPartitionRange,
+    capacity: usize,
+    out_count: *mut usize,
+) -> c_int {
+    let inner = move || {
+        clear_error();
+
+        if path.is_null() {
+            set_error("path is null");
+            return -1;
+        }
+        if delimiter_len == 0 {
+            set_error("delimiter_len must be > 0");
+            return -1;
+        }
+        if delimiter.is_null() {
+            set_error("delimiter is null");
+            return -1;
+        }
+        if delimiter_len > isize::MAX as usize {
+            set_error("delimiter_len exceeds supported range");
+            return -1;
+        }
+        if out_count.is_null() {
+            set_error("out_count is null");
+            return -1;
+        }
+        if capacity > 0 && out_ranges.is_null() {
+            set_error("out_ranges is null with non-zero capacity");
+            return -1;
+        }
+        if requested_partitions == 0 {
+            set_error("requested_partitions must be > 0");
+            return -1;
+        }
+
+        let mode = match source_mode {
+            SOURCE_MODE_MMAP => SourceMode::Mmap,
+            SOURCE_MODE_WINDOWED => SourceMode::Windowed,
+            SOURCE_MODE_PREAD => SourceMode::Pread,
+            _ => {
+                set_error("source_mode must be 0 (mmap), 1 (windowed), or 2 (pread)");
+                return -1;
+            }
+        };
+
+        let c_str = unsafe { CStr::from_ptr(path) };
+        let path_lossy = c_str.to_string_lossy();
+        // SAFETY: the caller guarantees that `delimiter` points to
+        // `delimiter_len` readable, immutable bytes for this call.
+        let delimiter = unsafe { std::slice::from_raw_parts(delimiter, delimiter_len) };
+
+        let options = PlannerOptions::new(mode).with_window_bytes(window_bytes);
+        // SAFETY: forward the caller's immutable-input contract.
+        let ranges = match unsafe {
+            plan_partition_ranges(&*path_lossy, requested_partitions, delimiter, &options)
+        } {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                set_error(&format!("range planning failed: {error}"));
+                return -1;
+            }
+        };
+
+        // SAFETY: `out_count` is non-null by the check above.
+        unsafe {
+            *out_count = ranges.len();
+        }
+
+        if ranges.len() > capacity {
+            return -2;
+        }
+
+        for (index, &(start, end)) in ranges.iter().enumerate() {
+            // SAFETY: the caller guarantees `out_ranges` holds
+            // `capacity >= ranges.len()` writable elements.
+            unsafe {
+                (*out_ranges.add(index)).start = start;
+                (*out_ranges.add(index)).end = end;
+            }
+        }
+
+        0
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(result) => result,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_plan_partition_ranges");
+            -1
+        }
+    }
+}
+
 /// Retrieve a chunk view by index.
 ///
 /// Writes the chunk's data pointer and length into `out_chunk`. The
@@ -881,6 +1047,10 @@ mod tests {
         assert!(
             caps & CAP_MULTI_BYTE_PARTITIONING != 0,
             "must have MULTI_BYTE_PARTITIONING"
+        );
+        assert!(
+            caps & CAP_WINDOWED_PLANNING != 0,
+            "must have WINDOWED_PLANNING"
         );
     }
 
@@ -2104,6 +2274,162 @@ mod tests {
             );
 
             mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plan_partition_ranges_all_source_modes() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_plan_sources");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.log");
+
+        let mut content = Vec::new();
+        for index in 0..500u32 {
+            content.extend_from_slice(format!("record-{index:04}\r\n").as_bytes());
+        }
+        std::fs::write(&file_path, &content).unwrap();
+
+        let expected = scanner::find_partition_boundaries_pattern(&content, 7, b"\r\n");
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        let delimiter = b"\r\n";
+
+        for (mode, window) in [
+            (SOURCE_MODE_MMAP, 0usize),
+            (SOURCE_MODE_WINDOWED, 65536),
+            (SOURCE_MODE_PREAD, 0),
+        ] {
+            let mut needed = 0usize;
+            let query = unsafe {
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    7,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    mode,
+                    window,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            };
+            assert_eq!(query, -2, "mode {mode}: query should report capacity");
+            assert_eq!(needed, expected.len(), "mode {mode}");
+
+            let mut ranges: Vec<CPartitionRange> = (0..needed)
+                .map(|_| CPartitionRange { start: 0, end: 0 })
+                .collect();
+            let result = unsafe {
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    7,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    mode,
+                    window,
+                    ranges.as_mut_ptr(),
+                    ranges.len(),
+                    &mut needed,
+                )
+            };
+            assert_eq!(result, 0, "mode {mode}: planning failed");
+
+            let actual: Vec<(usize, usize)> = ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect();
+            assert_eq!(actual, expected, "mode {mode}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plan_partition_ranges_rejects_invalid_arguments() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_plan_invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.log");
+        std::fs::write(&file_path, b"a\r\nb\r\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        let delimiter = b"\r\n";
+        let mut count = 0usize;
+        let mut range = CPartitionRange { start: 0, end: 0 };
+
+        unsafe {
+            assert_eq!(
+                mmap_engine_plan_partition_ranges(
+                    std::ptr::null(),
+                    2,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    SOURCE_MODE_MMAP,
+                    0,
+                    &mut range,
+                    1,
+                    &mut count,
+                ),
+                -1
+            );
+            assert_eq!(
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    2,
+                    delimiter.as_ptr(),
+                    0,
+                    SOURCE_MODE_MMAP,
+                    0,
+                    &mut range,
+                    1,
+                    &mut count,
+                ),
+                -1
+            );
+            assert_eq!(
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    2,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    99,
+                    0,
+                    &mut range,
+                    1,
+                    &mut count,
+                ),
+                -1
+            );
+            assert_eq!(
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    0,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    SOURCE_MODE_MMAP,
+                    0,
+                    &mut range,
+                    1,
+                    &mut count,
+                ),
+                -1
+            );
+            assert_eq!(
+                mmap_engine_plan_partition_ranges(
+                    c_path.as_ptr(),
+                    2,
+                    delimiter.as_ptr(),
+                    delimiter.len(),
+                    SOURCE_MODE_WINDOWED,
+                    1024,
+                    &mut range,
+                    1,
+                    &mut count,
+                ),
+                -1
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,17 +1,23 @@
 pub mod ffi;
 pub mod mmap;
 pub mod scanner;
+pub mod source;
 
 mod plan;
 
 pub use ffi::{
-    CChunkView, CEngineHandle, ABI_VERSION, CAP_CONFIGURABLE_DELIMITER, CAP_ERROR_STRINGS,
-    CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER, CAP_MULTI_BYTE_PARTITIONING,
-    CAP_RECORD_PARTITIONING, CAP_ZERO_COPY,
+    CChunkView, CEngineHandle, CPartitionRange, ABI_VERSION, CAP_CONFIGURABLE_DELIMITER,
+    CAP_ERROR_STRINGS, CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER,
+    CAP_MULTI_BYTE_PARTITIONING, CAP_RECORD_PARTITIONING, CAP_WINDOWED_PLANNING, CAP_ZERO_COPY,
+    SOURCE_MODE_MMAP, SOURCE_MODE_PREAD, SOURCE_MODE_WINDOWED,
 };
 pub use mmap::MmapFile;
 pub use scanner::ChunkCursor;
 pub use scanner::PatternChunkCursor;
+pub use source::{
+    MmapSource, PlannerOptions, PreadSource, SourceMode, WindowedMmapSource,
+    DEFAULT_SCAN_BUFFER_BYTES, DEFAULT_WINDOW_BYTES, MIN_WINDOW_BYTES,
+};
 
 use std::io;
 use std::path::Path;
