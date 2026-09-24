@@ -87,6 +87,399 @@ mod sys {
 
 // ─── MmapFile ─────────────────────────────────────────────────────────────────
 
+/// Alignment granularity for windowed mappings.
+///
+/// 64 KiB is the Windows allocation granularity (views must start at a
+/// multiple of it) and a multiple of common Unix page sizes (4 KiB,
+/// 16 KiB on Apple silicon), so one constant works on every supported
+/// platform.
+pub const VIEW_ALIGNMENT: u64 = 65_536;
+
+/// A single mapped view inside a [`WindowedMmapFile`].
+#[derive(Debug)]
+struct WindowView {
+    ptr: *const u8,
+    aligned_start: u64,
+    mapped_len: usize,
+}
+
+// SAFETY: the view is a read-only mapping. The pointer is never exposed
+// for mutation and is unmapped exactly once by the owning
+// `WindowedMmapFile` while holding the state lock.
+unsafe impl Send for WindowView {}
+
+/// A read-only memory-mapped file exposing one bounded window at a time.
+///
+/// Unlike [`MmapFile`], this type never maps the complete file. Each
+/// [`read_at`](Self::read_at) call is served from a cached view of at
+/// most `window_bytes` (plus alignment slack); a request outside the
+/// cached view remaps. Peak virtual address usage is therefore bounded
+/// by the window size instead of the file size, which matters for very
+/// large files or address-space-constrained consumers.
+///
+/// The window is aligned down to [`VIEW_ALIGNMENT`]; the returned bytes
+/// always start exactly at the requested offset.
+///
+/// # Safety
+///
+/// Same immutable-input contract as [`MmapFile`]: the backing file must
+/// not be modified, truncated, or deleted while the mapping is alive.
+#[derive(Debug)]
+pub struct WindowedMmapFile {
+    size: usize,
+    window_bytes: usize,
+    view: std::sync::Mutex<Option<WindowView>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fd: std::ffi::c_int,
+    #[cfg(windows)]
+    file_handle: isize,
+    #[cfg(windows)]
+    mapping_handle: isize,
+}
+
+impl WindowedMmapFile {
+    /// Open `path` for windowed read-only access.
+    ///
+    /// `window_bytes` must be at least [`VIEW_ALIGNMENT`]; values below
+    /// that are rejected with [`std::io::ErrorKind::InvalidInput`]
+    /// because they would force a remap for nearly every read.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the backing file is not modified for
+    /// the entire lifetime of the returned value.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub unsafe fn open_path(
+        path: impl AsRef<std::path::Path>,
+        window_bytes: usize,
+    ) -> std::io::Result<Self> {
+        use std::ffi::CString;
+        use std::io;
+        use std::os::unix::ffi::OsStrExt;
+
+        if window_bytes < VIEW_ALIGNMENT as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window_bytes must be at least 64 KiB",
+            ));
+        }
+
+        let bytes = path.as_ref().as_os_str().as_bytes();
+        let c_str =
+            CString::new(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        // SAFETY: `c_str` is a valid null-terminated string; `open` is a
+        // read-only POSIX syscall. The returned fd is owned by `self`.
+        let fd = unsafe { sys::open(c_str.as_ptr(), sys::O_RDONLY) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: `fd` was just opened; `lseek(SEEK_END)` only reports size.
+        let file_size = unsafe { sys::lseek(fd, 0, sys::SEEK_END) };
+        let size = match usize::try_from(file_size) {
+            Ok(size) => size,
+            Err(_) => {
+                // SAFETY: `fd` is owned and no longer needed.
+                unsafe { sys::close(fd) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file size does not fit in usize",
+                ));
+            }
+        };
+
+        Ok(Self {
+            size,
+            window_bytes,
+            view: std::sync::Mutex::new(None),
+            fd,
+        })
+    }
+
+    /// Open `path` for windowed read-only access.
+    ///
+    /// See the Unix variant for the full contract.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the backing file is not modified for
+    /// the entire lifetime of the returned value.
+    #[cfg(windows)]
+    pub unsafe fn open_path(
+        path: impl AsRef<std::path::Path>,
+        window_bytes: usize,
+    ) -> std::io::Result<Self> {
+        use std::io;
+        use std::os::windows::ffi::OsStrExt;
+
+        if window_bytes < VIEW_ALIGNMENT as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "window_bytes must be at least 64 KiB",
+            ));
+        }
+
+        let wide: Vec<u16> = path
+            .as_ref()
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `wide` is a valid null-terminated UTF-16 string.
+        let file_handle = unsafe {
+            sys::CreateFileW(
+                wide.as_ptr(),
+                sys::GENERIC_READ,
+                sys::FILE_SHARE_READ,
+                std::ptr::null(),
+                sys::OPEN_EXISTING,
+                sys::FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        if file_handle == sys::INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut file_size: i64 = 0;
+        // SAFETY: `file_handle` is valid; `GetFileSizeEx` writes the size.
+        if unsafe { sys::GetFileSizeEx(file_handle, &mut file_size) } == 0 {
+            let error = io::Error::last_os_error();
+            // SAFETY: `file_handle` is owned and no longer needed.
+            unsafe { sys::CloseHandle(file_handle) };
+            return Err(error);
+        }
+        let size = match usize::try_from(file_size) {
+            Ok(size) => size,
+            Err(_) => {
+                // SAFETY: `file_handle` is owned and no longer needed.
+                unsafe { sys::CloseHandle(file_handle) };
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file size does not fit in usize",
+                ));
+            }
+        };
+
+        // A section object for the whole file allows views at any
+        // 64 KiB-aligned offset without reopening the file.
+        let mapping_handle = if size == 0 {
+            0
+        } else {
+            // SAFETY: `file_handle` is valid; `PAGE_READONLY` creates a
+            // read-only section; a zero maximum size means "file size".
+            let mapping = unsafe {
+                sys::CreateFileMappingW(
+                    file_handle,
+                    std::ptr::null(),
+                    sys::PAGE_READONLY,
+                    0,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if mapping == 0 {
+                let error = io::Error::last_os_error();
+                // SAFETY: `file_handle` is owned and no longer needed.
+                unsafe { sys::CloseHandle(file_handle) };
+                return Err(error);
+            }
+            mapping
+        };
+
+        Ok(Self {
+            size,
+            window_bytes,
+            view: std::sync::Mutex::new(None),
+            file_handle,
+            mapping_handle,
+        })
+    }
+
+    /// Returns the file size in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Returns `true` if the file is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// Read up to `out.len()` bytes starting at `offset`.
+    ///
+    /// Returns the number of bytes copied (0 at or beyond EOF). On
+    /// success, `out[..n]` contains the file bytes at
+    /// `[offset, offset + n)`.
+    pub fn read_at(&self, offset: usize, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() || offset >= self.size {
+            return Ok(0);
+        }
+        let n = out.len().min(self.size - offset);
+
+        let mut guard = self
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(view) = guard.as_ref() {
+            let view_start = view.aligned_start;
+            let view_end = view_start + view.mapped_len as u64;
+            let request_end = offset as u64 + n as u64;
+            if offset as u64 >= view_start && request_end <= view_end {
+                let relative = (offset as u64 - view_start) as usize;
+                // SAFETY: the cached view covers `[offset, offset + n)`
+                // and lives until it is replaced under this lock.
+                let source = unsafe { std::slice::from_raw_parts(view.ptr.add(relative), n) };
+                out[..n].copy_from_slice(source);
+                return Ok(n);
+            }
+        }
+
+        let aligned_start = (offset as u64 / VIEW_ALIGNMENT) * VIEW_ALIGNMENT;
+        let slack = offset as u64 - aligned_start;
+        let needed = slack + n as u64;
+        let desired = (self.window_bytes as u64 + slack).max(needed);
+        let mapped_len = desired.min(self.size as u64 - aligned_start) as usize;
+
+        let view = self.map_view(aligned_start, mapped_len)?;
+        let relative = slack as usize;
+        // SAFETY: `view.ptr` maps `mapped_len` bytes starting at
+        // `aligned_start`; `relative + n <= mapped_len` by construction.
+        let source = unsafe { std::slice::from_raw_parts(view.ptr.add(relative), n) };
+        out[..n].copy_from_slice(source);
+
+        if let Some(old) = guard.replace(view) {
+            self.unmap_view(old);
+        }
+        Ok(n)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn map_view(&self, aligned_start: u64, mapped_len: usize) -> std::io::Result<WindowView> {
+        use std::io;
+
+        if mapped_len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty view"));
+        }
+
+        let offset = i64::try_from(aligned_start)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds i64"))?;
+
+        // SAFETY: `self.fd` is valid for the lifetime of `self`;
+        // `aligned_start` is a multiple of VIEW_ALIGNMENT (and therefore
+        // page-aligned); `mapped_len` is clamped to the file.
+        let ptr = unsafe {
+            sys::mmap(
+                std::ptr::null_mut(),
+                mapped_len,
+                sys::PROT_READ,
+                sys::MAP_PRIVATE,
+                self.fd,
+                offset,
+            )
+        };
+        if ptr == sys::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(WindowView {
+            ptr: ptr as *const u8,
+            aligned_start,
+            mapped_len,
+        })
+    }
+
+    #[cfg(windows)]
+    fn map_view(&self, aligned_start: u64, mapped_len: usize) -> std::io::Result<WindowView> {
+        use std::io;
+
+        if mapped_len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty view"));
+        }
+
+        // SAFETY: `mapping_handle` is a valid section object for the
+        // file; `aligned_start` is a multiple of the allocation
+        // granularity; `mapped_len` is clamped to the file.
+        let ptr = unsafe {
+            sys::MapViewOfFile(
+                self.mapping_handle,
+                sys::FILE_MAP_READ,
+                (aligned_start >> 32) as u32,
+                (aligned_start & 0xFFFF_FFFF) as u32,
+                mapped_len,
+            )
+        };
+        if ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(WindowView {
+            ptr: ptr as *const u8,
+            aligned_start,
+            mapped_len,
+        })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unmap_view(&self, view: WindowView) {
+        // SAFETY: `view` was returned by `map_view` and is unmapped once.
+        unsafe {
+            sys::munmap(view.ptr as *mut c_void, view.mapped_len);
+        }
+    }
+
+    #[cfg(windows)]
+    fn unmap_view(&self, view: WindowView) {
+        // SAFETY: `view` was returned by `map_view` and is unmapped once.
+        unsafe {
+            sys::UnmapViewOfFile(view.ptr as *const c_void);
+        }
+    }
+}
+
+impl Drop for WindowedMmapFile {
+    fn drop(&mut self) {
+        let view = self
+            .view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(view) = view {
+            self.unmap_view(view);
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.fd >= 0 {
+                // SAFETY: `fd` is owned by `self` and not closed elsewhere.
+                unsafe {
+                    sys::close(self.fd);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if self.mapping_handle != 0 {
+                // SAFETY: `mapping_handle` is owned and not closed elsewhere.
+                unsafe {
+                    sys::CloseHandle(self.mapping_handle);
+                }
+            }
+            if self.file_handle != 0 && self.file_handle != sys::INVALID_HANDLE_VALUE {
+                // SAFETY: `file_handle` is owned and not closed elsewhere.
+                unsafe {
+                    sys::CloseHandle(self.file_handle);
+                }
+            }
+        }
+    }
+}
+
 /// A read-only memory-mapped file.
 ///
 /// Provides zero-copy access to file contents. Automatically unmaps the
@@ -727,5 +1120,89 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── WindowedMmapFile tests ──────────────────────────────────────────
+
+    fn windowed_temp_file(label: &str, content: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mmap_chunker_core_windowed_{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.bin");
+        std::fs::write(&file_path, content).unwrap();
+        file_path
+    }
+
+    #[test]
+    fn test_windowed_open_nonexistent() {
+        unsafe {
+            let error =
+                WindowedMmapFile::open_path("nonexistent_windowed_xyz.dat", 65536).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+
+    #[test]
+    fn test_windowed_rejects_tiny_window() {
+        let path = windowed_temp_file("tiny", b"data");
+        unsafe {
+            let error = WindowedMmapFile::open_path(&path, 1024).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_windowed_empty_file() {
+        let path = windowed_temp_file("empty", b"");
+        unsafe {
+            let file = WindowedMmapFile::open_path(&path, 65536).unwrap();
+            assert!(file.is_empty());
+            assert_eq!(file.len(), 0);
+            let mut out = [0u8; 16];
+            assert_eq!(file.read_at(0, &mut out).unwrap(), 0);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_windowed_reads_cross_window_boundaries() {
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let path = windowed_temp_file("cross", &content);
+        unsafe {
+            let file = WindowedMmapFile::open_path(&path, 65536).unwrap();
+            assert_eq!(file.len(), content.len());
+
+            // Sequential 1 MiB reads.
+            let mut out = vec![0u8; 1_048_576];
+            let mut offset = 0usize;
+            while offset < content.len() {
+                let read = file.read_at(offset, &mut out).unwrap();
+                assert!(read > 0);
+                assert_eq!(&out[..read], &content[offset..offset + read]);
+                offset += read;
+            }
+            assert_eq!(offset, content.len());
+
+            // Unaligned reads near window boundaries.
+            for &start in &[0usize, 1, 4095, 65535, 65536, 65537, 131_071, 199_999] {
+                let mut small = [0u8; 8];
+                let expected_len = (content.len() - start).min(small.len());
+                let read = file.read_at(start, &mut small).unwrap();
+                assert_eq!(read, expected_len, "offset {start}");
+                assert_eq!(&small[..read], &content[start..start + read]);
+            }
+
+            // Read at EOF and beyond.
+            let mut small = [0u8; 8];
+            assert_eq!(file.read_at(content.len(), &mut small).unwrap(), 0);
+            assert_eq!(file.read_at(content.len() + 10, &mut small).unwrap(), 0);
+
+            // Partial final read is clamped to EOF.
+            let read = file.read_at(content.len() - 3, &mut small).unwrap();
+            assert_eq!(read, 3);
+            assert_eq!(&small[..3], &content[content.len() - 3..]);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

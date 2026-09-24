@@ -4,13 +4,16 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use mmap_chunker_core::source::{
+    plan_partition_ranges, PlannerOptions, SourceMode, MIN_WINDOW_BYTES,
+};
 use mmap_chunker_core::MmapChunker;
 
 const HELP: &str = "\
 mmap-chunker - record-aligned byte-range planning for immutable local files
 
 Usage:
-  mmap-chunker partition FILE --parts N [--delimiter-byte B | --delimiter-hex HEX] [--worker K]
+  mmap-chunker partition FILE --parts N [--delimiter-byte B | --delimiter-hex HEX] [--source MODE] [--window BYTES] [--worker K]
   mmap-chunker partition-files --parts N [--delimiter-byte B] FILE...
   mmap-chunker --help
   mmap-chunker --version
@@ -31,6 +34,13 @@ Options:
                 Record delimiter bytes as an even-length hex string, e.g.
                 0d0a for CRLF. Mutually exclusive with --delimiter-byte.
                 Only valid for `partition`; `partition-files` uses one raw byte.
+  --source MODE Byte source backend for `partition`: mmap (default, full-file
+                mapping), windowed (bounded moving-window mapping), or pread
+                (positional reads, no mapping). All backends emit identical
+                ranges; the mode only changes how bytes are accessed.
+  --window BYTES
+                Window size in bytes for --source windowed (default 67108864,
+                minimum 65536). Requires --source windowed.
   --worker K    Emit only zero-based worker K's actual partition. K must be
                 less than --parts. If record-aligned boundaries collapse and
                 no actual partition K exists, the command succeeds silently.
@@ -89,6 +99,9 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
     let mut delimiter = vec![0x0A];
     let mut delimiter_seen = false;
     let mut worker = None;
+    let mut source = SourceMode::Mmap;
+    let mut source_seen = false;
+    let mut window = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -136,6 +149,25 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
                 .get(index)
                 .ok_or_else(|| "missing value for `--worker`".to_owned())?;
             worker = Some(parse_worker(value)?);
+        } else if argument == "--source" {
+            if source_seen {
+                return Err("duplicate option `--source`".to_owned());
+            }
+            source_seen = true;
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--source`".to_owned())?;
+            source = parse_source(value)?;
+        } else if argument == "--window" {
+            if window.is_some() {
+                return Err("duplicate option `--window`".to_owned());
+            }
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--window`".to_owned())?;
+            window = Some(parse_window(value)?);
         } else if argument.as_os_str().to_string_lossy().starts_with('-') {
             return Err(format!(
                 "unexpected option `{}`",
@@ -156,9 +188,24 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
         if worker >= parts {
             return Err("`--worker` must be less than `--parts`".to_owned());
         }
-        emit_partitions_for_delimiter(file, parts, &delimiter, Some(worker))
-    } else {
-        emit_partitions_for_delimiter(file, parts, &delimiter, None)
+    }
+    if let Some(window_bytes) = window {
+        if source != SourceMode::Windowed {
+            return Err("`--window` requires `--source windowed`".to_owned());
+        }
+        let options = PlannerOptions::new(SourceMode::Windowed).with_window_bytes(window_bytes);
+        return emit_partitions_sourced(file, parts, &delimiter, worker, &options);
+    }
+    match source {
+        SourceMode::Mmap => emit_partitions_for_delimiter(file, parts, &delimiter, worker),
+        SourceMode::Windowed => {
+            let options = PlannerOptions::new(SourceMode::Windowed);
+            emit_partitions_sourced(file, parts, &delimiter, worker, &options)
+        }
+        SourceMode::Pread => {
+            let options = PlannerOptions::new(SourceMode::Pread);
+            emit_partitions_sourced(file, parts, &delimiter, worker, &options)
+        }
     }
 }
 
@@ -463,6 +510,37 @@ fn parse_worker(value: &OsStr) -> Result<usize, String> {
         })
 }
 
+fn parse_source(value: &OsStr) -> Result<SourceMode, String> {
+    match value.to_str() {
+        Some("mmap") => Ok(SourceMode::Mmap),
+        Some("windowed") => Ok(SourceMode::Windowed),
+        Some("pread") => Ok(SourceMode::Pread),
+        _ => Err(format!(
+            "invalid value for `--source`: `{}` (expected mmap, windowed, or pread)",
+            value.to_string_lossy()
+        )),
+    }
+}
+
+fn parse_window(value: &OsStr) -> Result<usize, String> {
+    let parsed = value
+        .to_str()
+        .ok_or_else(|| "`--window` must be a positive integer".to_owned())?
+        .parse::<usize>()
+        .map_err(|_| {
+            format!(
+                "invalid value for `--window`: `{}`",
+                value.to_string_lossy()
+            )
+        })?;
+    if parsed < MIN_WINDOW_BYTES {
+        return Err(format!(
+            "`--window` must be at least {MIN_WINDOW_BYTES} bytes"
+        ));
+    }
+    Ok(parsed)
+}
+
 fn parse_delimiter_byte(value: &OsStr) -> Result<u8, String> {
     let value_text = value.to_str().ok_or_else(|| {
         "`--delimiter-byte` must be a decimal byte in the range 0..255".to_owned()
@@ -550,6 +628,35 @@ fn emit_partitions_pattern(
         .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
     let count = chunker.partition_records_pattern(parts, delimiter);
     emit_indexed_chunks(&chunker, count, worker)
+}
+
+fn emit_partitions_sourced(
+    path: PathBuf,
+    parts: usize,
+    delimiter: &[u8],
+    worker: Option<usize>,
+    options: &PlannerOptions,
+) -> Result<(), String> {
+    // Safety: the CLI's contract requires the input file to remain immutable
+    // while it is accessed (mmap-backed modes map it read-only).
+    let ranges = unsafe { plan_partition_ranges(&path, parts, delimiter, options) }
+        .map_err(|error| format!("failed to plan {}: {error}", path.display()))?;
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
+
+    let indices: Vec<usize> = match worker {
+        Some(index) if index < ranges.len() => vec![index],
+        Some(_) => Vec::new(),
+        None => (0..ranges.len()).collect(),
+    };
+    for index in indices {
+        let (start, end) = ranges[index];
+        writeln!(output, "{index}\t{start}\t{end}\t{}", end - start)
+            .map_err(|error| format!("failed to write output: {error}"))?;
+    }
+    output
+        .flush()
+        .map_err(|error| format!("failed to write output: {error}"))
 }
 
 fn emit_indexed_chunks(

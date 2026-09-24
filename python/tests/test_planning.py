@@ -133,7 +133,7 @@ def _verify_plan(path: Path, plan: Plan, delimiter: int, parts: int) -> None:
 
 def test_version_and_abi() -> None:
     assert mmap_chunker.__version__ == _cargo_version()
-    assert mmap_chunker.abi_version() == 0x0001_0004
+    assert mmap_chunker.abi_version() == 0x0001_0005
     caps = mmap_chunker.capabilities()
     assert caps & (1 << 4)  # RECORD_PARTITIONING
 

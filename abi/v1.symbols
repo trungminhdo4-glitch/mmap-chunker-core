@@ -16,5 +16,6 @@ mmap_engine_scan_chunks_pattern
 mmap_engine_scan_fixed
 mmap_engine_partition_records
 mmap_engine_partition_records_pattern
+mmap_engine_plan_partition_ranges
 mmap_engine_get_chunk
 mmap_engine_free

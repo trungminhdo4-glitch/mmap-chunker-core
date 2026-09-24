@@ -17,7 +17,7 @@ Diagnostics::
     import mmap_chunker
 
     mmap_chunker.__version__
-    mmap_chunker.abi_version()   # 0x00010004 (v1.4)
+    mmap_chunker.abi_version()   # 0x00010005 (v1.5)
     mmap_chunker.capabilities()  # native capability bitmask
 
 Optional DataTrove integration (requires the ``[datatrove]`` extra)::
@@ -86,7 +86,7 @@ __version__ = _read_version()
 def abi_version() -> int:
     """Return the native ABI version as ``(major << 16) | minor``.
 
-    The bundled library must report ABI 0x00010004 (v1.4); loading it also
+    The bundled library must report ABI 0x00010005 (v1.5); loading it also
     validates this requirement.
     """
     return int(_native.get_library().mmap_engine_abi_version())
