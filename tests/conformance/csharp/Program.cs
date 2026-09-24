@@ -118,7 +118,7 @@ internal static class Program
             Marshal.OffsetOf<Native.CChunkView>("data").ToInt32() != 0 ||
             Marshal.OffsetOf<Native.CChunkView>("len").ToInt32() != 8)
             Fail("CChunkView layout mismatch");
-        if (Native.mmap_engine_abi_version() != 0x00010003 || Native.mmap_engine_capabilities() != 63)
+        if (Native.mmap_engine_abi_version() != 0x00010004 || Native.mmap_engine_capabilities() != 127)
             Fail("ABI discovery mismatch");
 
         byte[] source = File.ReadAllBytes(fixture);
@@ -145,7 +145,7 @@ internal static class Program
         int dataOffset = Marshal.OffsetOf<Native.CChunkView>("data").ToInt32();
         int lenOffset = Marshal.OffsetOf<Native.CChunkView>("len").ToInt32();
         string result =
-            $"abi_version=65539;capabilities=63;partition_count={first.Count};" +
+            $"abi_version=65540;capabilities=127;partition_count={first.Count};" +
             $"partition_lengths={lengths};total_length={source.Length};record_count={recordCount};" +
             $"fnv1a64={digest:x16};deterministic=1;n0_error={n0Error};" +
             $"chunk_view_size={chunkViewSize};" +

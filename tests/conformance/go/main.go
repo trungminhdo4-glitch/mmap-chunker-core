@@ -96,8 +96,8 @@ func main() {
 	if unsafe.Offsetof(layout.data) != 0 || unsafe.Offsetof(layout.len) != 8 {
 		fail("CChunkView offset mismatch")
 	}
-	if C.mmap_engine_abi_version() != C.uint32_t(0x00010003) ||
-		C.mmap_engine_capabilities() != C.uint32_t(63) {
+	if C.mmap_engine_abi_version() != C.uint32_t(0x00010004) ||
+		C.mmap_engine_capabilities() != C.uint32_t(127) {
 		fail("ABI discovery mismatch")
 	}
 
@@ -139,7 +139,7 @@ func main() {
 		lengths[index] = fmt.Sprintf("%d", len(chunk))
 	}
 	result := fmt.Sprintf(
-		"abi_version=65539;capabilities=63;partition_count=%d;partition_lengths=%s;"+
+		"abi_version=65540;capabilities=127;partition_count=%d;partition_lengths=%s;"+
 			"total_length=%d;record_count=%d;fnv1a64=%016x;deterministic=1;"+
 			"n0_error=%s;chunk_view_size=%d;chunk_view_data_offset=0;chunk_view_len_offset=8",
 		len(first), strings.Join(lengths, ","), len(source), recordCount, digest,

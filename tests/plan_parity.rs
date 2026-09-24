@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use mmap_chunker_core::ffi::{
     mmap_engine_free, mmap_engine_get_chunk, mmap_engine_open, mmap_engine_partition_records,
-    mmap_engine_scan_chunks_ex, mmap_engine_scan_chunks_pattern, mmap_engine_scan_fixed,
-    CChunkView,
+    mmap_engine_partition_records_pattern, mmap_engine_scan_chunks_ex,
+    mmap_engine_scan_chunks_pattern, mmap_engine_scan_fixed, CChunkView,
 };
 use mmap_chunker_core::MmapChunker;
 
@@ -31,6 +31,10 @@ enum PlanRequest {
     Partition {
         partitions: usize,
         delimiter: u8,
+    },
+    PartitionPattern {
+        partitions: usize,
+        delimiter: Vec<u8>,
     },
 }
 
@@ -65,6 +69,10 @@ fn rust_ranges(path: &Path, request: &PlanRequest) -> Vec<ObservedRange> {
             partitions,
             delimiter,
         } => chunker.partition_records(*partitions, *delimiter),
+        PlanRequest::PartitionPattern {
+            partitions,
+            delimiter,
+        } => chunker.partition_records_pattern(*partitions, delimiter),
     };
 
     let source = chunker.as_bytes();
@@ -107,6 +115,15 @@ unsafe fn ffi_ranges(path: &Path, request: &PlanRequest) -> Vec<ObservedRange> {
             partitions,
             delimiter,
         } => mmap_engine_partition_records(handle, *partitions, *delimiter),
+        PlanRequest::PartitionPattern {
+            partitions,
+            delimiter,
+        } => mmap_engine_partition_records_pattern(
+            handle,
+            *partitions,
+            delimiter.as_ptr(),
+            delimiter.len(),
+        ),
     };
 
     let mut views = Vec::with_capacity(count);
@@ -307,6 +324,66 @@ fn partition_plans_have_cross_surface_parity() {
         PlanRequest::Partition {
             partitions: 4,
             delimiter: b'\n',
+        },
+    );
+}
+
+#[test]
+fn partition_pattern_plans_have_cross_surface_parity() {
+    assert_parity(
+        "partition_pattern_crlf",
+        b"a\r\nb\r\nc\r\nd\r\n",
+        PlanRequest::PartitionPattern {
+            partitions: 2,
+            delimiter: b"\r\n".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_double_crlf",
+        b"head\r\n\r\nbody\r\n\r\ntail\r\n\r\n",
+        PlanRequest::PartitionPattern {
+            partitions: 2,
+            delimiter: b"\r\n\r\n".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_embedded_nul",
+        b"a\x00\x01b\x00\x01c\x00\x01",
+        PlanRequest::PartitionPattern {
+            partitions: 2,
+            delimiter: b"\x00\x01".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_absent",
+        b"abcdef",
+        PlanRequest::PartitionPattern {
+            partitions: 4,
+            delimiter: b"\r\n".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_longer_than_data",
+        b"abc",
+        PlanRequest::PartitionPattern {
+            partitions: 4,
+            delimiter: b"abcdef".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_empty_file",
+        b"",
+        PlanRequest::PartitionPattern {
+            partitions: 4,
+            delimiter: b"\r\n".to_vec(),
+        },
+    );
+    assert_parity(
+        "partition_pattern_single_byte_parity",
+        b"a\nb\nc\nd\ne\n",
+        PlanRequest::PartitionPattern {
+            partitions: 3,
+            delimiter: b"\n".to_vec(),
         },
     );
 }

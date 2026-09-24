@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- Multi-byte record partitioning: `find_partition_boundaries_pattern`,
+  `MmapChunker::partition_records_pattern`,
+  `mmap_engine_partition_records_pattern`, and CLI `--delimiter-hex`
+  (C ABI v1.4, `CAP_MULTI_BYTE_PARTITIONING`, bit 6). A single-byte
+  pattern delegates to the single-byte path with byte-identical output;
+  `partition-files` remains single-byte (`--delimiter-hex` is rejected
+  there). No new runtime dependencies; Rust MSRV remains 1.77.
+
+### Changed
+
+- C ABI version is now `0x00010004` (v1.4); existing symbols,
+  signatures, layouts, and capability bits 0–5 are unchanged.
+  Conformance pins updated (`abi_version=65540`, `capabilities=127`).
+
 ## [0.2.6] — 2026-08-20
 
 ### Fixed

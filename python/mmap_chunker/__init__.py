@@ -86,7 +86,7 @@ __version__ = _read_version()
 def abi_version() -> int:
     """Return the native ABI version as ``(major << 16) | minor``.
 
-    The bundled library must report ABI 0x00010003 (v1.3); loading it also
+    The bundled library must report ABI 0x00010004 (v1.4); loading it also
     validates this requirement.
     """
     return int(_native.get_library().mmap_engine_abi_version())

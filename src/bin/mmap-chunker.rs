@@ -10,7 +10,7 @@ const HELP: &str = "\
 mmap-chunker - record-aligned byte-range planning for immutable local files
 
 Usage:
-  mmap-chunker partition FILE --parts N [--delimiter-byte B] [--worker K]
+  mmap-chunker partition FILE --parts N [--delimiter-byte B | --delimiter-hex HEX] [--worker K]
   mmap-chunker partition-files --parts N [--delimiter-byte B] FILE...
   mmap-chunker --help
   mmap-chunker --version
@@ -18,13 +18,19 @@ Usage:
 Commands:
   partition    Emit record-aligned byte ranges for FILE using one raw delimiter byte.
   partition-files
-               Emit record-aligned worker/source ranges for an ordered logical dataset.
+                Emit record-aligned worker/source ranges for an ordered logical dataset.
 
 Options:
   --parts N     Request N record-aligned partitions.
   --delimiter-byte B
                 Record delimiter byte in decimal (0..255). Defaults to 10
                 (LF/newline). Raw byte framing only; no CSV/JSON quoting semantics.
+                Mutually exclusive with --delimiter-hex. Only valid for `partition`
+                and `partition-files`.
+  --delimiter-hex HEX
+                Record delimiter bytes as an even-length hex string, e.g.
+                0d0a for CRLF. Mutually exclusive with --delimiter-byte.
+                Only valid for `partition`; `partition-files` uses one raw byte.
   --worker K    Emit only zero-based worker K's actual partition. K must be
                 less than --parts. If record-aligned boundaries collapse and
                 no actual partition K exists, the command succeeds silently.
@@ -33,7 +39,8 @@ Output:
   partition:       index<TAB>start<TAB>end_exclusive<TAB>length
   partition-files: worker<TAB>source<TAB>start<TAB>end_exclusive<TAB>length
 
-The delimiter is one raw byte; multi-byte partition delimiters are not supported.
+The delimiter is one raw byte; multi-byte partition delimiters are supported
+by `partition` via --delimiter-hex, while `partition-files` uses one raw byte.
 Offsets are bytes; starts are inclusive and ends are exclusive. The input file
 must remain immutable while it is mapped. The actual number of ranges can be
 lower than N when records span multiple ideal partition positions.
@@ -79,7 +86,7 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
 
     let mut file = None;
     let mut parts = None;
-    let mut delimiter = 0x0A;
+    let mut delimiter = vec![0x0A];
     let mut delimiter_seen = false;
     let mut worker = None;
     let mut index = 0;
@@ -96,14 +103,30 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
             parts = Some(parse_parts(value)?);
         } else if argument == "--delimiter-byte" {
             if delimiter_seen {
-                return Err("duplicate option `--delimiter-byte`".to_owned());
+                return Err(
+                    "duplicate delimiter option (`--delimiter-byte` / `--delimiter-hex`)"
+                        .to_owned(),
+                );
             }
             delimiter_seen = true;
             index += 1;
             let value = arguments
                 .get(index)
                 .ok_or_else(|| "missing value for `--delimiter-byte`".to_owned())?;
-            delimiter = parse_delimiter_byte(value)?;
+            delimiter = vec![parse_delimiter_byte(value)?];
+        } else if argument == "--delimiter-hex" {
+            if delimiter_seen {
+                return Err(
+                    "duplicate delimiter option (`--delimiter-byte` / `--delimiter-hex`)"
+                        .to_owned(),
+                );
+            }
+            delimiter_seen = true;
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--delimiter-hex`".to_owned())?;
+            delimiter = parse_delimiter_hex(value)?;
         } else if argument == "--worker" {
             if worker.is_some() {
                 return Err("duplicate option `--worker`".to_owned());
@@ -133,9 +156,9 @@ fn run_partition(arguments: &[OsString]) -> Result<(), String> {
         if worker >= parts {
             return Err("`--worker` must be less than `--parts`".to_owned());
         }
-        emit_partitions(file, parts, delimiter, Some(worker))
+        emit_partitions_for_delimiter(file, parts, &delimiter, Some(worker))
     } else {
-        emit_partitions(file, parts, delimiter, None)
+        emit_partitions_for_delimiter(file, parts, &delimiter, None)
     }
 }
 
@@ -464,6 +487,45 @@ fn parse_delimiter_byte(value: &OsStr) -> Result<u8, String> {
     })
 }
 
+fn decode_hex_pair(pair: &[u8]) -> u8 {
+    let text = std::str::from_utf8(pair).expect("validated hex pair must be ASCII");
+    u8::from_str_radix(text, 16).expect("validated hex pair must parse")
+}
+
+fn parse_delimiter_hex(value: &OsStr) -> Result<Vec<u8>, String> {
+    let invalid = || {
+        format!(
+            "invalid value for `--delimiter-hex`: `{}` (expected an even-length hex string, e.g. 0d0a)",
+            value.to_string_lossy()
+        )
+    };
+    let text = value.to_str().ok_or_else(invalid)?;
+    if text.is_empty() || text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid());
+    }
+    Ok(text
+        .as_bytes()
+        .chunks_exact(2)
+        .map(decode_hex_pair)
+        .collect())
+}
+
+fn emit_partitions_for_delimiter(
+    path: PathBuf,
+    parts: usize,
+    delimiter: &[u8],
+    worker: Option<usize>,
+) -> Result<(), String> {
+    // A single-byte delimiter takes the exact pre-v1.4 single-byte path;
+    // longer patterns use record-aligned multi-byte partitioning.
+    if delimiter.len() == 1 {
+        emit_partitions(path, parts, delimiter[0], worker)
+    } else {
+        emit_partitions_pattern(path, parts, delimiter, worker)
+    }
+}
+
 fn emit_partitions(
     path: PathBuf,
     parts: usize,
@@ -474,6 +536,27 @@ fn emit_partitions(
     let mut chunker = unsafe { MmapChunker::open(&path) }
         .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
     let count = chunker.partition_records(parts, delimiter);
+    emit_indexed_chunks(&chunker, count, worker)
+}
+
+fn emit_partitions_pattern(
+    path: PathBuf,
+    parts: usize,
+    delimiter: &[u8],
+    worker: Option<usize>,
+) -> Result<(), String> {
+    // Safety: the CLI's contract requires the input file to remain immutable while mapped.
+    let mut chunker = unsafe { MmapChunker::open(&path) }
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let count = chunker.partition_records_pattern(parts, delimiter);
+    emit_indexed_chunks(&chunker, count, worker)
+}
+
+fn emit_indexed_chunks(
+    chunker: &MmapChunker,
+    count: usize,
+    worker: Option<usize>,
+) -> Result<(), String> {
     let source = chunker.as_bytes();
     let base = source.as_ptr();
     let stdout = io::stdout();
@@ -504,7 +587,7 @@ fn emit_partitions(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_delimiter_byte, parse_parts, parse_worker};
+    use super::{parse_delimiter_byte, parse_delimiter_hex, parse_parts, parse_worker};
     use mmap_chunker_core::MmapChunker;
     use std::ffi::OsStr;
 
@@ -534,6 +617,35 @@ mod tests {
         assert!(parse_delimiter_byte(OsStr::new("0x0a")).is_err());
         assert!(parse_delimiter_byte(OsStr::new("+10")).is_err());
         assert!(parse_delimiter_byte(OsStr::new("nope")).is_err());
+    }
+
+    #[test]
+    fn delimiter_hex_accepts_even_length_hex_strings() {
+        assert_eq!(parse_delimiter_hex(OsStr::new("0a")), Ok(vec![0x0A]));
+        assert_eq!(
+            parse_delimiter_hex(OsStr::new("0d0a")),
+            Ok(vec![0x0D, 0x0A])
+        );
+        assert_eq!(
+            parse_delimiter_hex(OsStr::new("0D0A0d0a")),
+            Ok(vec![0x0D, 0x0A, 0x0D, 0x0A])
+        );
+        assert_eq!(parse_delimiter_hex(OsStr::new("00")), Ok(vec![0x00]));
+        assert_eq!(
+            parse_delimiter_hex(OsStr::new("ffFF")),
+            Ok(vec![0xFF, 0xFF])
+        );
+    }
+
+    #[test]
+    fn delimiter_hex_rejects_invalid_forms() {
+        assert!(parse_delimiter_hex(OsStr::new("")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("0")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("0d0")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("0x0a")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("zz")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("0d 0a")).is_err());
+        assert!(parse_delimiter_hex(OsStr::new("-1")).is_err());
     }
 
     #[test]

@@ -79,7 +79,7 @@ def main() -> None:
     if ctypes.sizeof(CChunkView) != 16 or CChunkView.data.offset != 0 or CChunkView.len.offset != 8:
         raise AssertionError("CChunkView layout mismatch")
     lib = configure(args.library.resolve())
-    if lib.mmap_engine_abi_version() != 0x00010003 or lib.mmap_engine_capabilities() != 63:
+    if lib.mmap_engine_abi_version() != 0x00010004 or lib.mmap_engine_capabilities() != 127:
         raise AssertionError("ABI discovery mismatch")
 
     source = args.fixture.read_bytes()
@@ -99,7 +99,7 @@ def main() -> None:
 
     record_count = source.count(b"\n") + int(bool(source) and not source.endswith(b"\n"))
     result = (
-        f"abi_version=65539;capabilities=63;partition_count={len(first)};"
+        f"abi_version=65540;capabilities=127;partition_count={len(first)};"
         f"partition_lengths={','.join(str(len(chunk)) for chunk in first)};"
         f"total_length={len(source)};record_count={record_count};"
         f"fnv1a64={digest:016x};deterministic=1;n0_error={n0_error};"
