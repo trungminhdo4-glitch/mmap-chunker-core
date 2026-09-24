@@ -32,6 +32,15 @@ pub const DEFAULT_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 /// Minimum accepted window size (one [`VIEW_ALIGNMENT`] unit).
 pub const MIN_WINDOW_BYTES: usize = VIEW_ALIGNMENT as usize;
 
+/// Initial probe size for adaptive buffered search (4 KiB).
+///
+/// Dense inputs find a delimiter within the first probe, avoiding the
+/// 1 MiB fixed-probe over-read. Sparse inputs double geometrically up to
+/// the caller's buffer capacity. The value covers a typical record plus
+/// a multi-byte delimiter while staying well below the default 1 MiB
+/// buffer.
+const ADAPTIVE_INITIAL_PROBE_BYTES: usize = 4096;
+
 #[cfg(windows)]
 const WINDOWS_FILE_SHARE_READ: u32 = 0x0000_0001;
 
@@ -292,7 +301,16 @@ impl PlannerOptions {
 }
 
 /// Find the first occurrence of `delimiter` at an absolute offset
-/// `>= from`, reading through `source` in `buffer`-sized steps.
+/// `>= from`, reading through `source` with adaptive probe sizes.
+///
+/// The first probe covers `max(delimiter.len(), 4096)` bytes (capped at
+/// `buffer.len()`); each miss doubles the probe up to `buffer.len()`.
+/// Dense inputs therefore stop after one small read instead of a full
+/// 1 MiB fixed probe, while sparse inputs converge to the previous
+/// fixed-size behavior. The caller's `buffer` is reused as the backing
+/// store (prefix `buffer[..probe_len]`), so no allocation occurs on
+/// expansion and arbitrarily long delimiters are handled within the
+/// existing `max(scan_buffer, dlen)` sizing.
 ///
 /// Buffers overlap by `delimiter.len() - 1` bytes so a pattern that
 /// spans two reads is still found. Returns `None` when the pattern does
@@ -307,6 +325,15 @@ pub(crate) fn find_pattern_from(
     let dlen = delimiter.len();
     debug_assert!(dlen > 0);
     debug_assert!(buffer.len() >= dlen);
+    if buffer.is_empty() || dlen == 0 {
+        return Ok(None);
+    }
+
+    // Start small for dense inputs; cap at the existing maximum so a
+    // single probe never exceeds the fixed-probe budget. `max(dlen, 4096)`
+    // guarantees the first probe can hold one complete pattern.
+    let max_probe = buffer.len();
+    let mut probe_len = dlen.max(ADAPTIVE_INITIAL_PROBE_BYTES).min(max_probe);
 
     let mut offset = from;
     loop {
@@ -319,7 +346,7 @@ pub(crate) fn find_pattern_from(
         // source is exhausted. Without this, a dribble source would
         // starve the pattern matcher: a 1-byte read can never hold a
         // multi-byte delimiter.
-        let want = buffer.len().min(file_len - offset);
+        let want = probe_len.min(file_len - offset);
         let mut filled = 0usize;
         while filled < want {
             let read = source.read_at(offset + filled, &mut buffer[filled..want])?;
@@ -337,7 +364,7 @@ pub(crate) fn find_pattern_from(
             return Ok(Some(offset + position));
         }
 
-        if offset + read >= file_len {
+        if offset.saturating_add(read) >= file_len {
             return Ok(None);
         }
 
@@ -345,9 +372,16 @@ pub(crate) fn find_pattern_from(
         // starting inside this buffer but ending in the next is not
         // missed. `max(1)` guarantees forward progress even when a
         // source returns fewer bytes than the overlap.
-        let overlap = dlen - 1;
+        let overlap = dlen.saturating_sub(1);
         let advance = read.saturating_sub(overlap).max(1);
         offset = offset.saturating_add(advance);
+
+        // Geometric growth only on miss, capped at the existing maximum
+        // buffer size so sparse inputs converge to fixed-probe behavior
+        // with no unbounded growth.
+        if probe_len < max_probe {
+            probe_len = probe_len.saturating_mul(2).min(max_probe);
+        }
     }
 }
 
@@ -519,6 +553,59 @@ mod tests {
             }
             let n = out.len().min(self.max_read).min(self.data.len() - offset);
             out[..n].copy_from_slice(&self.data[offset..offset + n]);
+            Ok(n)
+        }
+
+        fn as_slice(&self) -> Option<&[u8]> {
+            None
+        }
+    }
+
+    struct CountingSource<'a> {
+        data: &'a [u8],
+        max_read: usize,
+        calls: std::sync::atomic::AtomicU64,
+        requested: std::sync::atomic::AtomicU64,
+        returned: std::sync::atomic::AtomicU64,
+    }
+
+    impl<'a> CountingSource<'a> {
+        fn new(data: &'a [u8], max_read: usize) -> Self {
+            Self {
+                data,
+                max_read,
+                calls: std::sync::atomic::AtomicU64::new(0),
+                requested: std::sync::atomic::AtomicU64::new(0),
+                returned: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn totals(&self) -> (u64, u64, u64) {
+            use std::sync::atomic::Ordering;
+            (
+                self.calls.load(Ordering::Relaxed),
+                self.requested.load(Ordering::Relaxed),
+                self.returned.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl ByteSource for CountingSource<'_> {
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+
+        fn read_at(&self, offset: usize, out: &mut [u8]) -> io::Result<usize> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.requested
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            if offset >= self.data.len() || out.is_empty() {
+                return Ok(0);
+            }
+            let n = out.len().min(self.max_read).min(self.data.len() - offset);
+            out[..n].copy_from_slice(&self.data[offset..offset + n]);
+            self.returned.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
         }
 
@@ -733,5 +820,222 @@ mod tests {
         let path = temp_file("empty_delim", b"data");
         let options = PlannerOptions::default();
         let _ = unsafe { plan_partition_ranges(&path, 2, b"", &options) };
+    }
+
+    #[test]
+    fn adaptive_probe_reduces_dense_read_amplification() {
+        // Direct probe-level proof (immune to exact-target alignment
+        // coincidences): search mid-record in dense JSONL-like input.
+        // The delimiter is ~100 B ahead, so the adaptive 4 KiB first
+        // probe finds it immediately while the fixed 1 MiB probe reads
+        // 1 MiB. This test FAILS against the original fixed-probe
+        // behavior (requested == 1 MiB).
+        let line = b"2024-01-15T10:30:00Z,event_type_alpha,192.168.1.100,user_12345,session_abc,payload_00042,status_ok\n";
+        let mut content = Vec::new();
+        while content.len() < 1024 * 1024 {
+            content.extend_from_slice(line);
+        }
+        let source = CountingSource::new(&content, usize::MAX);
+        let mut buffer = vec![0u8; DEFAULT_SCAN_BUFFER_BYTES];
+        let found = find_pattern_from(&source, 1, b"\n", &mut buffer)
+            .unwrap()
+            .expect("delimiter must be found");
+        assert_eq!(found, line.len() - 1, "first delimiter position");
+        let (_, requested, returned) = source.totals();
+        assert!(
+            requested <= 4096,
+            "read amplification not reduced: requested {requested} bytes"
+        );
+        assert!(
+            returned <= 4096,
+            "bytes returned not reduced: {returned} bytes"
+        );
+        // Plan-level proof with a misaligned dense file (guaranteed
+        // non-exact targets): 32 MiB would be slow in unit tests, so use
+        // 1 MiB + 37 B to break exact-target alignment.
+        let mut misaligned = content.clone();
+        misaligned.extend_from_slice(&[b'x'; 37]);
+        let parts = 16usize;
+        let expected = scanner::find_partition_boundaries_pattern(&misaligned, parts, b"\n");
+        let source = CountingSource::new(&misaligned, usize::MAX);
+        let actual =
+            plan_partition_boundaries(&source, parts, b"\n", DEFAULT_SCAN_BUFFER_BYTES).unwrap();
+        assert_eq!(actual, expected, "adaptive parity");
+        // Gapless, overlap-free, delimiter-aligned (non-final ranges end on \n).
+        let mut covered = 0usize;
+        for (index, &(start, end)) in actual.iter().enumerate() {
+            assert_eq!(start, covered, "gap or overlap at {index}");
+            assert!(end > start, "empty range at {index}");
+            if index + 1 < actual.len() {
+                assert_eq!(
+                    misaligned[end - 1],
+                    b'\n',
+                    "range {index} not delimiter-aligned"
+                );
+            }
+            covered = end;
+        }
+        assert_eq!(covered, misaligned.len(), "incomplete coverage");
+    }
+
+    #[test]
+    fn adaptive_probe_matches_oracle_across_adversarial_matrix() {
+        // Each case checks exact backend parity with the independent slice
+        // scanner plus gapless/overlap-free reconstruction.
+        let cases: Vec<(Vec<u8>, usize, Vec<u8>, &str)> = vec![
+            (vec![], 4, b"\n".to_vec(), "empty"),
+            (b"only record".to_vec(), 8, b"\n".to_vec(), "single-record"),
+            (
+                b"no delimiter here".to_vec(),
+                4,
+                b"\n".to_vec(),
+                "no-delimiter",
+            ),
+            (
+                b"a\nb\nc\nd\ne\nf\ng\nh\n".to_vec(),
+                4,
+                b"\n".to_vec(),
+                "dense",
+            ),
+            (
+                vec![b'x'; 1024 * 1024],
+                4,
+                b"\n".to_vec(),
+                "giant-no-trailing",
+            ),
+            (b"aaa\n".to_vec(), 4, b"\n".to_vec(), "missing-final"),
+            (b"a\n\n\nb\n".to_vec(), 8, b"\n".to_vec(), "consecutive"),
+            (b"\nabc\n".to_vec(), 4, b"\n".to_vec(), "start-and-end"),
+            (b"aaaaaa".to_vec(), 3, b"aa".to_vec(), "overlapping-aa"),
+            (
+                b"a\r\n\r\nb\r\n".to_vec(),
+                4,
+                b"\r\n".to_vec(),
+                "prefix-ambiguous-crlf",
+            ),
+            (
+                b"one\r\n\r\ntwo\r\n\r\nthree\r\n\r\n".to_vec(),
+                2,
+                b"\r\n\r\n".to_vec(),
+                "crlfcrlf",
+            ),
+            // Delimiter straddling the 4 KiB initial-probe boundary.
+            (
+                {
+                    let mut v = vec![b'x'; 4095];
+                    v.extend_from_slice(b"\r\n");
+                    v.extend_from_slice(&vec![b'y'; 4095]);
+                    v.extend_from_slice(b"\r\n");
+                    v
+                },
+                4,
+                b"\r\n".to_vec(),
+                "cross-initial-probe",
+            ),
+            // EOF during an incomplete multi-byte delimiter.
+            (b"abc\r".to_vec(), 2, b"\r\n".to_vec(), "eof-incomplete"),
+            (
+                b"a\r\nb\r\nc\r\nd\r\n".to_vec(),
+                100,
+                b"\r\n".to_vec(),
+                "parts-gt-records",
+            ),
+            (
+                b"a\r\nb\r\nc\r\nd\r\n".to_vec(),
+                4,
+                b"\r\n".to_vec(),
+                "exact-target",
+            ),
+            (
+                b"a\nb\nc\n".to_vec(),
+                usize::MAX,
+                b"\n".to_vec(),
+                "extreme-parts",
+            ),
+        ];
+        for (content, parts, delimiter, label) in &cases {
+            // Full reads plus single-byte dribble reads.
+            for max_read in [usize::MAX, 1] {
+                let source = CountingSource::new(content, max_read);
+                let expected =
+                    scanner::find_partition_boundaries_pattern(content, *parts, delimiter);
+                let actual = plan_partition_boundaries(
+                    &source,
+                    *parts,
+                    delimiter,
+                    DEFAULT_SCAN_BUFFER_BYTES,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "{label} max_read={max_read}");
+                // Gapless/overlap-free reconstruction.
+                if content.is_empty() || *parts == 0 {
+                    assert!(actual.is_empty(), "{label}");
+                    continue;
+                }
+                let mut covered = 0usize;
+                for (index, &(start, end)) in actual.iter().enumerate() {
+                    assert_eq!(start, covered, "{label} gap/overlap at {index}");
+                    assert!(end > start, "{label} empty at {index}");
+                    if index + 1 < actual.len() {
+                        assert_eq!(
+                            &content[end - delimiter.len()..end],
+                            delimiter.as_slice(),
+                            "{label} range {index} not delimiter-aligned"
+                        );
+                    }
+                    covered = end;
+                }
+                assert_eq!(covered, content.len(), "{label} incomplete");
+            }
+        }
+        // Repeated deterministic planning.
+        let content = b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n".to_vec();
+        let first = plan_partition_boundaries(
+            &CountingSource::new(&content, usize::MAX),
+            3,
+            b"\r\n",
+            DEFAULT_SCAN_BUFFER_BYTES,
+        )
+        .unwrap();
+        for _ in 0..8 {
+            let again = plan_partition_boundaries(
+                &CountingSource::new(&content, usize::MAX),
+                3,
+                b"\r\n",
+                DEFAULT_SCAN_BUFFER_BYTES,
+            )
+            .unwrap();
+            assert_eq!(again, first, "nondeterministic planning");
+        }
+        // Single-byte semantics unchanged: pattern len 1 delegates exactly.
+        let single = scanner::find_partition_boundaries(&content, 3, b'\n');
+        let via_pattern = scanner::find_partition_boundaries_pattern(&content, 3, b"\n");
+        assert_eq!(single, via_pattern, "single-byte parity");
+    }
+
+    #[test]
+    fn adaptive_probe_handles_long_delimiter_without_unbounded_alloc() {
+        // 10 KiB delimiter: the first probe starts at max(dlen, 4 KiB)
+        // within the existing max(scan_buffer, dlen) buffer — no extra
+        // allocation, no unbounded growth.
+        let delimiter = vec![b'D'; 10 * 1024];
+        let mut content = vec![b'x'; 4000];
+        content.extend_from_slice(&delimiter);
+        content.extend_from_slice(&[b'y'; 4000]);
+        content.extend_from_slice(&delimiter);
+        content.extend_from_slice(&[b'z'; 100]);
+        let parts = 3usize;
+        let expected = scanner::find_partition_boundaries_pattern(&content, parts, &delimiter);
+        let source = CountingSource::new(&content, usize::MAX);
+        let actual =
+            plan_partition_boundaries(&source, parts, &delimiter, DEFAULT_SCAN_BUFFER_BYTES)
+                .unwrap();
+        assert_eq!(actual, expected, "long-delimiter parity");
+        let (_, requested, _) = source.totals();
+        // Two boundaries max; each probe is bounded by the 1 MiB buffer.
+        assert!(
+            requested <= 2 * DEFAULT_SCAN_BUFFER_BYTES as u64 + 2 * delimiter.len() as u64,
+            "unbounded probe growth: {requested}"
+        );
     }
 }
