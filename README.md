@@ -344,7 +344,7 @@ exclusive. Ranges
 are deterministic, contiguous, and record-aligned; the actual range count can
 be lower than requested when giant records span multiple ideal partition
 positions. This is framing and planning only, not CSV/JSON parsing.
-`partition-files` accepts only `--delimiter-byte`. The input file must remain immutable
+`partition-files` accepts `--delimiter-byte` or `--delimiter-hex`. The input file must remain immutable
 while it is mapped.
 
 With `--worker K`, `K` must be less than `--parts` and the CLI emits only the
@@ -359,8 +359,9 @@ of independent local files:
 
 ```sh
 mmap-chunker partition-files --parts 8 file-a.jsonl file-b.jsonl file-c.jsonl
-# The delimiter option is the same raw single-byte framing contract:
+# The delimiter options are the same raw framing contract as `partition`:
 mmap-chunker partition-files --parts 8 --delimiter-byte 0 file-a.bin file-b.bin
+mmap-chunker partition-files --parts 8 --delimiter-hex 0d0a file-a.log file-b.log
 ```
 
 `partition-files` accepts only the explicitly ordered file paths shown on the
@@ -386,8 +387,10 @@ empty sources succeeds with empty stdout. Omitting all source paths is an error.
 The planner computes ideal worker targets over the sum of all source lengths. A
 target at a file boundary is kept because file boundaries are valid logical
 segment boundaries. A target inside a source is projected forward to the next
-single-byte delimiter boundary, or to that source's EOF when no delimiter
-remains. Records never cross a source boundary or a worker boundary. The actual
+delimiter boundary — one raw byte for `--delimiter-byte`, or the complete
+pattern for `--delimiter-hex` (an ideal target that already follows a
+complete pattern is accepted exactly) — or to that source's EOF when no
+delimiter remains. Records never cross a source boundary or a worker boundary. The actual
 worker count can be lower than `--parts` when multiple ideal targets fall inside
 one record; `worker_index` is then compacted to the workers that received bytes.
 The result is deterministic. This is planning/framing only: record alignment can

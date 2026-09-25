@@ -14,7 +14,7 @@ mmap-chunker - record-aligned byte-range planning for immutable local files
 
 Usage:
   mmap-chunker partition FILE --parts N [--delimiter-byte B | --delimiter-hex HEX] [--source MODE] [--window BYTES] [--worker K]
-  mmap-chunker partition-files --parts N [--delimiter-byte B] FILE...
+  mmap-chunker partition-files --parts N [--delimiter-byte B | --delimiter-hex HEX] FILE...
   mmap-chunker --help
   mmap-chunker --version
 
@@ -33,7 +33,7 @@ Options:
   --delimiter-hex HEX
                 Record delimiter bytes as an even-length hex string, e.g.
                 0d0a for CRLF. Mutually exclusive with --delimiter-byte.
-                Only valid for `partition`; `partition-files` uses one raw byte.
+                Valid for `partition` and `partition-files`.
   --source MODE Byte source backend for `partition`: mmap (default, full-file
                 mapping), windowed (bounded moving-window mapping), or pread
                 (positional reads, no mapping). All backends emit identical
@@ -49,8 +49,9 @@ Output:
   partition:       index<TAB>start<TAB>end_exclusive<TAB>length
   partition-files: worker<TAB>source<TAB>start<TAB>end_exclusive<TAB>length
 
-The delimiter is one raw byte; multi-byte partition delimiters are supported
-by `partition` via --delimiter-hex, while `partition-files` uses one raw byte.
+The delimiter is raw byte framing only; no CSV/JSON quoting semantics.
+`partition` and `partition-files` accept either `--delimiter-byte` for one
+byte or `--delimiter-hex` for a multi-byte pattern (e.g. 0d0a for CRLF).
 Offsets are bytes; starts are inclusive and ends are exclusive. The input file
 must remain immutable while it is mapped. The actual number of ranges can be
 lower than N when records span multiple ideal partition positions.
@@ -217,7 +218,7 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
 
     let mut files = Vec::new();
     let mut parts = None;
-    let mut delimiter = 0x0A;
+    let mut delimiter = vec![0x0A];
     let mut delimiter_seen = false;
     let mut index = 0;
     while index < arguments.len() {
@@ -233,14 +234,30 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
             parts = Some(parse_parts(value)?);
         } else if argument == "--delimiter-byte" {
             if delimiter_seen {
-                return Err("duplicate option `--delimiter-byte`".to_owned());
+                return Err(
+                    "duplicate delimiter option (`--delimiter-byte` / `--delimiter-hex`)"
+                        .to_owned(),
+                );
             }
             delimiter_seen = true;
             index += 1;
             let value = arguments
                 .get(index)
                 .ok_or_else(|| "missing value for `--delimiter-byte`".to_owned())?;
-            delimiter = parse_delimiter_byte(value)?;
+            delimiter = vec![parse_delimiter_byte(value)?];
+        } else if argument == "--delimiter-hex" {
+            if delimiter_seen {
+                return Err(
+                    "duplicate delimiter option (`--delimiter-byte` / `--delimiter-hex`)"
+                        .to_owned(),
+                );
+            }
+            delimiter_seen = true;
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--delimiter-hex`".to_owned())?;
+            delimiter = parse_delimiter_hex(value)?;
         } else if argument.as_os_str().to_string_lossy().starts_with('-') {
             return Err(format!(
                 "unexpected option `{}`",
@@ -256,7 +273,7 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
     if files.is_empty() {
         return Err("missing FILE (provide one or more ordered source paths)".to_owned());
     }
-    emit_file_partitions(files, parts, delimiter)
+    emit_file_partitions(files, parts, &delimiter)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -279,7 +296,7 @@ struct BoundarySearchState {
     cached_boundary: Option<usize>,
 }
 
-fn emit_file_partitions(paths: Vec<PathBuf>, parts: usize, delimiter: u8) -> Result<(), String> {
+fn emit_file_partitions(paths: Vec<PathBuf>, parts: usize, delimiter: &[u8]) -> Result<(), String> {
     let mut sources = Vec::with_capacity(paths.len());
     for path in paths {
         // Safety: the CLI contract requires every input file to remain
@@ -314,7 +331,7 @@ fn emit_file_partitions(paths: Vec<PathBuf>, parts: usize, delimiter: u8) -> Res
 fn plan_logical_partitions(
     sources: &[MmapChunker],
     requested_parts: usize,
-    delimiter: u8,
+    delimiter: &[u8],
 ) -> Result<Vec<WorkerAssignment>, String> {
     if requested_parts == 0 {
         return Ok(Vec::new());
@@ -387,7 +404,7 @@ fn project_logical_target(
     target: u128,
     prefixes: &[u128],
     sources: &[MmapChunker],
-    delimiter: u8,
+    delimiter: &[u8],
     states: &mut [BoundarySearchState],
 ) -> Result<u128, String> {
     // A source boundary is always a valid logical boundary, including the
@@ -410,7 +427,12 @@ fn project_logical_target(
     let state = states
         .get_mut(source_index)
         .ok_or_else(|| "internal error: boundary state out of bounds".to_owned())?;
-    let local_boundary = next_record_boundary(data, local_target, delimiter, state);
+    let local_boundary = if delimiter.len() == 1 {
+        // Byte-identical to the pre-existing single-byte path.
+        next_record_boundary(data, local_target, delimiter[0], state)
+    } else {
+        next_record_boundary_pattern(data, local_target, delimiter, state)
+    };
     Ok(source_start + usize_to_u128(local_boundary)?)
 }
 
@@ -446,6 +468,67 @@ fn next_record_boundary(
     state.scan_from = boundary;
     state.cached_boundary = Some(boundary);
     boundary
+}
+
+fn next_record_boundary_pattern(
+    data: &[u8],
+    target: usize,
+    delimiter: &[u8],
+    state: &mut BoundarySearchState,
+) -> usize {
+    debug_assert!(delimiter.len() > 1);
+    if let Some(cached_boundary) = state.cached_boundary {
+        if target < cached_boundary {
+            return cached_boundary;
+        }
+    }
+
+    // Mirror `scanner::find_partition_boundaries_pattern` exact-target
+    // semantics: a target that already follows a complete delimiter pattern
+    // is a valid record boundary and is accepted exactly.
+    if target >= delimiter.len()
+        && target <= data.len()
+        && data[target - delimiter.len()..target] == delimiter[..]
+    {
+        state.scan_from = target.max(state.scan_from);
+        state.cached_boundary = Some(target);
+        return target;
+    }
+
+    let scan_from = target.max(state.scan_from);
+    let boundary = if scan_from >= data.len() {
+        data.len()
+    } else {
+        // First occurrence of the complete pattern at or after `scan_from`
+        // (overlap-safe: candidates advance by one byte). This is the same
+        // observable contract as the library's SWAR-accelerated
+        // `find_pattern_in_slice`; the CLI keeps a dependency-free local
+        // loop because the binary crate cannot see the library's
+        // `pub(crate)` primitive and the pattern lengths here are tiny.
+        find_first_pattern_from(&data[scan_from..], delimiter)
+            .map(|relative| {
+                scan_from
+                    .saturating_add(relative)
+                    .saturating_add(delimiter.len())
+                    .min(data.len())
+            })
+            .unwrap_or(data.len())
+    };
+    state.scan_from = boundary;
+    state.cached_boundary = Some(boundary);
+    boundary
+}
+
+/// First offset of `pattern` in `haystack`, or `None`.
+///
+/// Overlap-safe linear scan with the same observable contract as
+/// `scanner::find_pattern_in_slice` (first occurrence; empty pattern and
+/// short haystack yield `None`). Callers guarantee a non-empty pattern.
+fn find_first_pattern_from(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
+    if pattern.is_empty() || haystack.len() < pattern.len() {
+        return None;
+    }
+    (0..=haystack.len() - pattern.len()).find(|offset| haystack[*offset..].starts_with(pattern))
 }
 
 fn ranges_for_interval(
@@ -786,7 +869,7 @@ mod tests {
             multi_sources.push(unsafe { MmapChunker::open(path).unwrap() });
         }
         let multi_started = Instant::now();
-        let assignments = super::plan_logical_partitions(&multi_sources, PARTS, b'\n').unwrap();
+        let assignments = super::plan_logical_partitions(&multi_sources, PARTS, b"\n").unwrap();
         let multi_elapsed = multi_started.elapsed();
         assert!(!assignments.is_empty());
 

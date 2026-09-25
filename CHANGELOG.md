@@ -19,9 +19,15 @@
   `MmapChunker::partition_records_pattern`,
   `mmap_engine_partition_records_pattern`, and CLI `--delimiter-hex`
   (C ABI v1.4, `CAP_MULTI_BYTE_PARTITIONING`, bit 6). A single-byte
-  pattern delegates to the single-byte path with byte-identical output;
-  `partition-files` remains single-byte (`--delimiter-hex` is rejected
-  there). No new runtime dependencies; Rust MSRV remains 1.77.
+  pattern delegates to the single-byte path with byte-identical output.
+  No new runtime dependencies; Rust MSRV remains 1.77.
+- `partition-files` accepts `--delimiter-hex` for multi-byte record
+  delimiters (e.g. `0d0a` for CRLF) with the same raw-framing contract as
+  `partition`: ordered independent sources, local byte offsets, no
+  cross-file records, unchanged five-field TSV output, and byte-identical
+  output for single-byte invocations. A target that already follows a
+  complete delimiter pattern is accepted exactly, mirroring
+  `find_partition_boundaries_pattern`. No C ABI, dependency, or MSRV changes.
 - Python source-selectable planning: `mmap_chunker.plan_file_ranges`
   with `source="mmap" | "windowed" | "pread"` and `window_bytes`,
   driving the v1.5 two-phase native API with a capability gate. Returns
