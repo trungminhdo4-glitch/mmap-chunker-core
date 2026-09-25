@@ -462,7 +462,29 @@ fn delimiter_hex_rejects_invalid_forms() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // `partition-files` stays single-byte: --delimiter-hex is rejected.
+    // The two delimiter options are mutually exclusive for `partition-files` too.
+    let both_arguments = [
+        OsString::from("partition-files"),
+        OsString::from("--parts"),
+        OsString::from("2"),
+        OsString::from("--delimiter-byte"),
+        OsString::from("10"),
+        OsString::from("--delimiter-hex"),
+        OsString::from("0d0a"),
+        path.as_os_str().to_owned(),
+    ];
+    let both_refs: Vec<&OsStr> = both_arguments.iter().map(OsString::as_os_str).collect();
+    let both_output = run(&both_refs);
+    assert!(!both_output.status.success());
+    assert!(both_output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&both_output.stderr).contains("duplicate delimiter option"),
+        "stderr: {}",
+        String::from_utf8_lossy(&both_output.stderr)
+    );
+
+    // `partition-files` accepts `--delimiter-hex` (multi-byte coverage lives
+    // in `tests/cli_partition_files.rs`); it must succeed here.
     let files_arguments = [
         OsString::from("partition-files"),
         OsString::from("--parts"),
@@ -473,8 +495,11 @@ fn delimiter_hex_rejects_invalid_forms() {
     ];
     let files_refs: Vec<&OsStr> = files_arguments.iter().map(OsString::as_os_str).collect();
     let files_output = run(&files_refs);
-    assert!(!files_output.status.success());
-    assert!(files_output.stdout.is_empty());
+    assert!(
+        files_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&files_output.stderr)
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -735,7 +760,7 @@ fn help_and_version_are_available() {
     assert!(help_text.contains("0..255"));
     assert!(help_text.contains("Raw byte framing only"));
     assert!(help_text.contains("Mutually exclusive with --delimiter-hex"));
-    assert!(help_text.contains("`partition-files` uses one raw byte"));
+    assert!(help_text.contains("Valid for `partition` and `partition-files`"));
     assert!(help_text.contains("--worker K"));
     assert!(help_text.contains("no actual partition K exists"));
 

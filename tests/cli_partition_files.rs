@@ -53,6 +53,18 @@ fn run_partition_files(paths: &[&Path], parts: usize, delimiter: Option<u8>) -> 
     Command::new(binary()).args(arguments).output().unwrap()
 }
 
+fn run_partition_files_hex(paths: &[&Path], parts: usize, hex: &str) -> Output {
+    let mut arguments = vec![
+        OsString::from("partition-files"),
+        OsString::from("--parts"),
+        OsString::from(parts.to_string()),
+        OsString::from("--delimiter-hex"),
+        OsString::from(hex),
+    ];
+    arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    Command::new(binary()).args(arguments).output().unwrap()
+}
+
 fn parse_rows(stdout: &[u8]) -> Vec<Row> {
     let text = std::str::from_utf8(stdout).unwrap();
     text.lines()
@@ -77,6 +89,13 @@ fn parse_rows(stdout: &[u8]) -> Vec<Row> {
 
 fn is_record_boundary(data: &[u8], offset: usize, delimiter: u8) -> bool {
     offset == 0 || offset == data.len() || (offset > 0 && data[offset - 1] == delimiter)
+}
+
+fn is_record_boundary_pattern(data: &[u8], offset: usize, delimiter: &[u8]) -> bool {
+    assert!(!delimiter.is_empty());
+    offset == 0
+        || offset == data.len()
+        || (offset >= delimiter.len() && data[offset - delimiter.len()..offset] == delimiter[..])
 }
 
 fn assert_dataset_oracle(paths: &[PathBuf], parts: usize, delimiter: Option<u8>) -> Vec<Row> {
@@ -162,6 +181,87 @@ fn assert_dataset_oracle(paths: &[PathBuf], parts: usize, delimiter: Option<u8>)
         expected.len(),
         max_worker,
         max_worker as f64 / ideal
+    );
+    rows
+}
+
+fn assert_dataset_oracle_pattern(
+    paths: &[PathBuf],
+    parts: usize,
+    hex: &str,
+    delimiter: &[u8],
+) -> Vec<Row> {
+    assert!(!delimiter.is_empty());
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    let first = run_partition_files_hex(&path_refs, parts, hex);
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+
+    let second = run_partition_files_hex(&path_refs, parts, hex);
+    assert!(second.status.success());
+    assert_eq!(
+        first.stdout, second.stdout,
+        "CLI output was not deterministic"
+    );
+
+    let source_bytes: Vec<Vec<u8>> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+    let expected: Vec<u8> = source_bytes.iter().flatten().copied().collect();
+    let rows = parse_rows(&first.stdout);
+    if expected.is_empty() {
+        assert!(rows.is_empty(), "all-empty datasets must emit empty stdout");
+        return rows;
+    }
+    assert!(!rows.is_empty());
+    assert_eq!(rows[0].worker, 0);
+
+    let mut cursors = vec![0usize; source_bytes.len()];
+    let mut reconstructed = Vec::new();
+    let mut previous_worker = 0;
+    let mut previous_source = 0;
+    for (row_index, row) in rows.iter().copied().enumerate() {
+        if row_index > 0 {
+            assert!(row.worker == previous_worker || row.worker == previous_worker + 1);
+            if row.worker == previous_worker {
+                assert!(row.source >= previous_source);
+            }
+        }
+        assert!(row.source < source_bytes.len());
+        let source = &source_bytes[row.source];
+        assert!(row.start <= row.end_exclusive);
+        assert!(row.end_exclusive <= source.len());
+        assert_eq!(row.end_exclusive - row.start, row.length);
+        assert!(
+            is_record_boundary_pattern(source, row.start, delimiter),
+            "row start split a record: {row:?}"
+        );
+        assert!(
+            is_record_boundary_pattern(source, row.end_exclusive, delimiter),
+            "row end split a record: {row:?}"
+        );
+        assert_eq!(
+            row.start, cursors[row.source],
+            "gap or overlap in source range"
+        );
+        cursors[row.source] = row.end_exclusive;
+        reconstructed.extend_from_slice(&source[row.start..row.end_exclusive]);
+        previous_worker = row.worker;
+        previous_source = row.source;
+    }
+
+    for (source_index, (cursor, source)) in cursors.iter().zip(&source_bytes).enumerate() {
+        assert_eq!(
+            *cursor,
+            source.len(),
+            "source {source_index} was not covered exactly"
+        );
+    }
+    assert_eq!(
+        reconstructed, expected,
+        "worker/source rows did not reconstruct dataset"
     );
     rows
 }
@@ -349,4 +449,196 @@ fn help_documents_the_multi_file_contract() {
     assert!(help.contains("worker<TAB>source<TAB>start<TAB>end_exclusive<TAB>length"));
     assert!(help.contains("ordered logical dataset"));
     assert!(help.contains("all-empty dataset succeeds"));
+}
+
+#[test]
+fn hex_crlf_partitions_records_across_sources() {
+    let (directory, paths) = write_sources(
+        "hex_crlf",
+        &[
+            b"row-1\r\nrow-2\r\n",
+            b"",
+            b"row-3\r\nrow-4\r\nrow-5\r\n",
+            b"row-6\r\n",
+        ],
+    );
+    let rows = assert_dataset_oracle_pattern(&paths, 3, "0d0a", b"\r\n");
+    assert!(rows.iter().any(|row| row.source == 0));
+    assert!(rows.iter().any(|row| row.source == 2));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn hex_single_byte_matches_delimiter_byte_exactly() {
+    let (directory, paths) =
+        write_sources("hex_parity", &[b"one\ntwo\nthree\nfour\n", b"five\nsix\n"]);
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    for parts in [1, 2, 3, 8] {
+        let byte = run_partition_files(&path_refs, parts, Some(b'\n'));
+        let hex = run_partition_files_hex(&path_refs, parts, "0a");
+        let upper_hex = run_partition_files_hex(&path_refs, parts, "0A");
+        assert!(byte.status.success() && hex.status.success() && upper_hex.status.success());
+        assert_eq!(
+            hex.stdout, byte.stdout,
+            "hex 0a diverged from --delimiter-byte 10 at parts={parts}"
+        );
+        assert_eq!(
+            upper_hex.stdout, byte.stdout,
+            "hex 0A diverged from --delimiter-byte 10 at parts={parts}"
+        );
+    }
+    // NUL through hex takes the same single-byte path as --delimiter-byte 0.
+    let (nul_directory, nul_paths) =
+        write_sources("hex_nul_parity", &[&[0x01, 0x00, 0x02, 0x00, 0x03]]);
+    let nul_refs: Vec<_> = nul_paths.iter().map(PathBuf::as_path).collect();
+    let byte = run_partition_files(&nul_refs, 2, Some(0));
+    let hex = run_partition_files_hex(&nul_refs, 2, "00");
+    assert!(byte.status.success() && hex.status.success());
+    assert_eq!(hex.stdout, byte.stdout);
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(nul_directory).unwrap();
+}
+
+#[test]
+fn hex_handles_overlapping_and_repeated_patterns() {
+    // Overlapping pattern "AA": occurrences at 1, 4, 7 in "aAAbAAcAA".
+    // Targets 3 and 6 already follow a complete pattern, so both are
+    // accepted exactly (mirrors the single-file exact-target rule).
+    let (directory, paths) = write_sources("hex_overlap", &[b"aAAbAAcAA"]);
+    let rows = assert_dataset_oracle_pattern(&paths, 3, "4141", b"AA");
+    assert_eq!(
+        rows,
+        vec![
+            Row {
+                worker: 0,
+                source: 0,
+                start: 0,
+                end_exclusive: 3,
+                length: 3,
+            },
+            Row {
+                worker: 1,
+                source: 0,
+                start: 3,
+                end_exclusive: 6,
+                length: 3,
+            },
+            Row {
+                worker: 2,
+                source: 0,
+                start: 6,
+                end_exclusive: 9,
+                length: 3,
+            },
+        ]
+    );
+    fs::remove_dir_all(directory).unwrap();
+
+    // Consecutive CRLF records and a missing trailing delimiter.
+    let (directory, paths) =
+        write_sources("hex_consecutive", &[b"\r\n\r\n\r\n", b"tail-no-delimiter"]);
+    assert_dataset_oracle_pattern(&paths, 4, "0d0a", b"\r\n");
+    fs::remove_dir_all(directory).unwrap();
+
+    // Double-CRLF framing and a delimiter longer than a source.
+    let (directory, paths) = write_sources(
+        "hex_double_crlf",
+        &[b"a\r\n\r\nb\r\n\r\n", b"\r\n", b"tiny"],
+    );
+    assert_dataset_oracle_pattern(&paths, 4, "0d0a0d0a", b"\r\n\r\n");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn hex_handles_empty_giant_and_collapsed_targets() {
+    let (directory, paths) = write_sources("hex_all_empty", &[b"", b"", b""]);
+    assert_dataset_oracle_pattern(&paths, 8, "0d0a", b"\r\n");
+    fs::remove_dir_all(directory).unwrap();
+
+    let (directory, paths) = write_sources(
+        "hex_empty_edges",
+        &[b"", b"one\r\n", b"two\r\nthree", b"single record"],
+    );
+    assert_dataset_oracle_pattern(&paths, 1, "0d0a", b"\r\n");
+    let rows = assert_dataset_oracle_pattern(&paths, usize::MAX, "0d0a", b"\r\n");
+    assert!(
+        rows.len() <= 5,
+        "record alignment should collapse excess targets"
+    );
+    fs::remove_dir_all(directory).unwrap();
+
+    let giant_record = vec![b'x'; 2048];
+    let (directory, paths) = write_sources("hex_giant", &[b"a\r\n", &giant_record, b"z\r\n"]);
+    let rows = assert_dataset_oracle_pattern(&paths, 16, "0d0a", b"\r\n");
+    let worker_count = rows.last().unwrap().worker + 1;
+    assert!(
+        worker_count < 16,
+        "a giant record must collapse worker targets"
+    );
+    fs::remove_dir_all(directory).unwrap();
+
+    // Duplicate paths stay distinct sources under a hex delimiter.
+    let (directory, paths) = write_sources("hex_duplicate", &[b"k\r\nv\r\n"]);
+    let duplicates = vec![paths[0].clone(), paths[0].clone()];
+    let rows = assert_dataset_oracle_pattern(&duplicates, 3, "0d0a", b"\r\n");
+    assert!(rows.iter().any(|row| row.source == 0));
+    assert!(rows.iter().any(|row| row.source == 1));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn hex_rejects_invalid_forms_and_conflicts() {
+    let (directory, paths) = write_sources("hex_invalid", &[b"a\r\nb\r\n"]);
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    for hex in ["", "0", "0d0", "0x0a", "zz", "0d 0a", "-1"] {
+        let output = run_partition_files_hex(&path_refs, 2, hex);
+        assert!(
+            !output.status.success(),
+            "hex `{hex}` unexpectedly succeeded"
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("--delimiter-hex"),
+            "stderr does not name the option: {stderr}"
+        );
+    }
+
+    let both = Command::new(binary())
+        .args([
+            OsString::from("partition-files"),
+            OsString::from("--parts"),
+            OsString::from("2"),
+            OsString::from("--delimiter-byte"),
+            OsString::from("10"),
+            OsString::from("--delimiter-hex"),
+            OsString::from("0d0a"),
+            paths[0].as_os_str().to_owned(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    assert!(both.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("duplicate delimiter option"),
+        "stderr: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
+    let duplicate_hex = Command::new(binary())
+        .args([
+            OsString::from("partition-files"),
+            OsString::from("--parts"),
+            OsString::from("2"),
+            OsString::from("--delimiter-hex"),
+            OsString::from("0d0a"),
+            OsString::from("--delimiter-hex"),
+            OsString::from("0a"),
+            paths[0].as_os_str().to_owned(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!duplicate_hex.status.success());
+    assert!(duplicate_hex.stdout.is_empty());
+    fs::remove_dir_all(directory).unwrap();
 }
