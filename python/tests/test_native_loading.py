@@ -35,7 +35,7 @@ def test_loader_returns_singleton_cdll() -> None:
 
 def test_abi_version_matches_expected() -> None:
     lib = _native.get_library()
-    assert int(lib.mmap_engine_abi_version()) == 0x0001_0003
+    assert int(lib.mmap_engine_abi_version()) == 0x0001_0004
 
 
 def test_required_capability_present() -> None:
@@ -43,6 +43,7 @@ def test_required_capability_present() -> None:
     caps = int(lib.mmap_engine_capabilities())
     assert caps & _native.CAP_RECORD_PARTITIONING
     assert caps & _native.CAP_ZERO_COPY
+    assert caps & _native.CAP_MULTI_BYTE_PARTITIONING
 
 
 def test_native_symbols_available() -> None:
@@ -50,6 +51,7 @@ def test_native_symbols_available() -> None:
     for symbol in (
         "mmap_engine_open",
         "mmap_engine_partition_records",
+        "mmap_engine_partition_records_pattern",
         "mmap_engine_get_chunk",
         "mmap_engine_free",
         "mmap_engine_last_error",

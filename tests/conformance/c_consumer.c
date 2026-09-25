@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
     }
 
     if (mmap_engine_abi_version() != MMAP_ENGINE_ABI_VERSION ||
-        mmap_engine_capabilities() != 63U) {
+        mmap_engine_capabilities() != 127U) {
         fail("ABI discovery mismatch");
     }
     if (sizeof(CChunkView) != 16 || offsetof(CChunkView, data) != 0 ||
@@ -142,6 +142,23 @@ int main(int argc, char **argv) {
     if (count != repeat_count || hash != repeat_hash ||
         memcmp(lengths, repeat_lengths, count * sizeof(size_t)) != 0) {
         fail("partition plan is not deterministic");
+    }
+
+    {
+        // v1.4: a single-byte pattern must delegate to the single-byte
+        // path and reproduce the captured plan exactly.
+        static const uint8_t newline[1] = {'\n'};
+        size_t pattern_count =
+            mmap_engine_partition_records_pattern(handle, 4, newline, 1);
+        if (pattern_count != count) {
+            fail("pattern single-byte delegation count differs");
+        }
+        CChunkView first = {0};
+        if (mmap_engine_get_chunk(handle, 0, &first) != 0 ||
+            first.len != lengths[0] ||
+            memcmp(first.data, source, first.len) != 0) {
+            fail("pattern single-byte delegation bytes differ");
+        }
     }
 
     if (mmap_engine_partition_records(handle, 0, '\n') != 0) {
@@ -179,7 +196,7 @@ int main(int argc, char **argv) {
         "total_length=%zu;record_count=%zu;fnv1a64=%016llx;deterministic=1;"
         "n0_error=%s;chunk_view_size=%zu;chunk_view_data_offset=%zu;"
         "chunk_view_len_offset=%zu",
-        MMAP_ENGINE_ABI_VERSION, 63U, count, lengths_text, source_length,
+        MMAP_ENGINE_ABI_VERSION, 127U, count, lengths_text, source_length,
         record_count, (unsigned long long)hash, error_copy, sizeof(CChunkView),
         offsetof(CChunkView, data), offsetof(CChunkView, len));
     if (written < 0 || (size_t)written >= sizeof(result)) {

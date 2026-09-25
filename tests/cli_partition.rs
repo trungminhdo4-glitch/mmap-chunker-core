@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -48,6 +48,71 @@ fn run_partition(path: &Path, parts: &str, delimiter: Option<u8>, worker: Option
         arguments.push(OsString::from(worker.to_string()));
     }
     Command::new(binary()).args(arguments).output().unwrap()
+}
+
+fn run_partition_hex(path: &Path, parts: &str, hex: &str, worker: Option<usize>) -> Output {
+    let mut arguments = vec![
+        OsString::from("partition"),
+        path.as_os_str().to_owned(),
+        OsString::from("--parts"),
+        OsString::from(parts),
+        OsString::from("--delimiter-hex"),
+        OsString::from(hex),
+    ];
+    if let Some(worker) = worker {
+        arguments.push(OsString::from("--worker"));
+        arguments.push(OsString::from(worker.to_string()));
+    }
+    Command::new(binary()).args(arguments).output().unwrap()
+}
+
+fn assert_partition_hex_oracle(path: &Path, parts: &str, hex: &str, delimiter: &[u8]) {
+    let first = run_partition_hex(path, parts, hex, None);
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.stderr.is_empty());
+    let second = run_partition_hex(path, parts, hex, None);
+    assert_eq!(
+        first.stdout, second.stdout,
+        "CLI output was not deterministic"
+    );
+
+    let source = fs::read(path).unwrap();
+    let ranges = parse_ranges(&first.stdout);
+    if source.is_empty() {
+        assert!(ranges.is_empty());
+        return;
+    }
+
+    let mut cursor = 0;
+    let mut reconstructed = Vec::new();
+    for (expected_index, (index, start, end, length)) in ranges.iter().copied().enumerate() {
+        assert_eq!(index, expected_index);
+        assert_eq!(start, cursor, "gap or overlap at range {index}");
+        assert_eq!(end - start, length);
+        assert!(end <= source.len());
+        reconstructed.extend_from_slice(&source[start..end]);
+        if index + 1 < ranges.len() {
+            assert_eq!(
+                &source[end - delimiter.len()..end],
+                delimiter,
+                "range {index} split a record"
+            );
+        }
+        cursor = end;
+    }
+    assert_eq!(
+        cursor,
+        source.len(),
+        "ranges did not cover the complete file"
+    );
+    assert_eq!(
+        reconstructed, source,
+        "ranges did not reconstruct the source"
+    );
 }
 
 fn parse_ranges(stdout: &[u8]) -> Vec<(usize, usize, usize, usize)> {
@@ -291,6 +356,126 @@ fn configurable_delimiter_covers_binary_and_boundary_edge_cases() {
         assert_worker_projection_oracle(&path, parts.parse().unwrap(), Some(*delimiter));
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[test]
+fn delimiter_hex_partitions_multibyte_records() {
+    let cases: &[(&str, &[u8], &str, &[u8])] = &[
+        ("crlf", b"a\r\nb\r\nc\r\nd\r\n", "2", b"\r\n"),
+        (
+            "double_crlf",
+            b"head\r\n\r\nbody\r\n\r\ntail\r\n\r\n",
+            "2",
+            b"\r\n\r\n",
+        ),
+        (
+            "embedded_nul_pair",
+            b"a\x00\x01b\x00\x01c\x00\x01",
+            "2",
+            b"\x00\x01",
+        ),
+        ("no_delimiter", b"abcdef", "4", b"\r\n"),
+        ("longer_than_file", b"abc", "4", b"abcdef"),
+        ("empty", b"", "4", b"\r\n"),
+    ];
+
+    for (label, contents, parts, delimiter) in cases {
+        let hex: String = delimiter.iter().map(|byte| format!("{byte:02x}")).collect();
+        let (directory, path) = write_fixture(label, OsString::from("records.log"), contents);
+        assert_partition_hex_oracle(&path, parts, &hex, delimiter);
+
+        // Worker projection holds for multi-byte delimiters too.
+        let full = run_partition_hex(&path, parts, &hex, None);
+        let ranges = parse_ranges(&full.stdout);
+        for (worker, _) in ranges.iter().enumerate() {
+            let selected = run_partition_hex(&path, parts, &hex, Some(worker));
+            assert!(selected.status.success());
+            let expected = format!(
+                "{}\t{}\t{}\t{}\n",
+                ranges[worker].0, ranges[worker].1, ranges[worker].2, ranges[worker].3
+            );
+            assert_eq!(
+                String::from_utf8(selected.stdout).unwrap(),
+                expected,
+                "worker {worker} was not the exact projection"
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn delimiter_hex_single_byte_matches_delimiter_byte() {
+    let (directory, path) = write_fixture(
+        "hex_byte_equivalence",
+        OsString::from("records.txt"),
+        b"one\ntwo\nthree\n",
+    );
+    let byte = run_partition(&path, "8", Some(0x0A), None);
+    let hex = run_partition_hex(&path, "8", "0a", None);
+    let upper_hex = run_partition_hex(&path, "8", "0A", None);
+    assert!(byte.status.success() && hex.status.success() && upper_hex.status.success());
+    assert_eq!(hex.stdout, byte.stdout);
+    assert_eq!(upper_hex.stdout, byte.stdout);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn delimiter_hex_rejects_invalid_forms() {
+    let (directory, path) = write_fixture(
+        "hex_invalid",
+        OsString::from("records.txt"),
+        b"one\ntwo\nthree\n",
+    );
+    for hex in ["", "0", "0d0", "0x0a", "zz", "0d 0a", "-1"] {
+        let output = run_partition_hex(&path, "2", hex, None);
+        assert!(
+            !output.status.success(),
+            "hex `{hex}` unexpectedly succeeded"
+        );
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            stderr.contains("--delimiter-hex"),
+            "stderr does not name the option: {stderr}"
+        );
+    }
+
+    // The two delimiter options are mutually exclusive.
+    let arguments = [
+        OsString::from("partition"),
+        path.as_os_str().to_owned(),
+        OsString::from("--parts"),
+        OsString::from("2"),
+        OsString::from("--delimiter-byte"),
+        OsString::from("10"),
+        OsString::from("--delimiter-hex"),
+        OsString::from("0d0a"),
+    ];
+    let argument_refs: Vec<&OsStr> = arguments.iter().map(OsString::as_os_str).collect();
+    let output = run(&argument_refs);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate delimiter option"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // `partition-files` stays single-byte: --delimiter-hex is rejected.
+    let files_arguments = [
+        OsString::from("partition-files"),
+        OsString::from("--parts"),
+        OsString::from("2"),
+        OsString::from("--delimiter-hex"),
+        OsString::from("0d0a"),
+        path.as_os_str().to_owned(),
+    ];
+    let files_refs: Vec<&OsStr> = files_arguments.iter().map(OsString::as_os_str).collect();
+    let files_output = run(&files_refs);
+    assert!(!files_output.status.success());
+    assert!(files_output.stdout.is_empty());
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -546,9 +731,11 @@ fn help_and_version_are_available() {
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("Usage:"));
     assert!(help_text.contains("--delimiter-byte B"));
+    assert!(help_text.contains("--delimiter-hex HEX"));
     assert!(help_text.contains("0..255"));
     assert!(help_text.contains("Raw byte framing only"));
-    assert!(help_text.contains("multi-byte partition delimiters are not supported"));
+    assert!(help_text.contains("Mutually exclusive with --delimiter-hex"));
+    assert!(help_text.contains("`partition-files` uses one raw byte"));
     assert!(help_text.contains("--worker K"));
     assert!(help_text.contains("no actual partition K exists"));
 

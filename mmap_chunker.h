@@ -21,7 +21,7 @@ typedef struct {
 
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010003U
+#define MMAP_ENGINE_ABI_VERSION 0x00010004U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
@@ -31,13 +31,14 @@ typedef struct {
 #define MMAP_ENGINE_CAP_FIXED_SIZE_CHUNKING    (1U << 3)
 #define MMAP_ENGINE_CAP_RECORD_PARTITIONING    (1U << 4)
 #define MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER   (1U << 5)
+#define MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING (1U << 6)
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010003 (v1.3). Always succeeds, never panics.
+ * Current: 0x00010004 (v1.4). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -51,6 +52,7 @@ uint32_t mmap_engine_abi_version(void);
  * Bit 3: FIXED_SIZE_CHUNKING    — mmap_engine_scan_fixed() available
  * Bit 4: RECORD_PARTITIONING    — mmap_engine_partition_records() available
  * Bit 5: MULTI_BYTE_DELIMITER   — mmap_engine_scan_chunks_pattern() available
+ * Bit 6: MULTI_BYTE_PARTITIONING — mmap_engine_partition_records_pattern() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -261,6 +263,47 @@ size_t mmap_engine_scan_fixed(CEngineHandle *handle, size_t chunk_size_bytes);
 size_t mmap_engine_partition_records(CEngineHandle *handle,
                                      size_t requested_partitions,
                                      uint8_t delimiter);
+
+/**
+ * Plan record-aligned partition byte ranges with a multi-byte delimiter
+ * pattern.
+ *
+ * Same semantics as mmap_engine_partition_records(), but each non-final
+ * partition ends immediately after the complete `delimiter` pattern
+ * (e.g. "\r\n" for CRLF records) instead of after a single byte.
+ *
+ * The delimiter memory is borrowed only for this call and is not retained
+ * by the engine. The caller may release or reuse it after the function
+ * returns. The caller must keep `delimiter` readable for `delimiter_len`
+ * bytes during the call; the pointer must be non-NULL and `delimiter_len`
+ * must be > 0. Embedded NUL bytes are allowed because the delimiter is
+ * length-delimited, not NUL-terminated.
+ *
+ * Invalid delimiter arguments return 0, set mmap_engine_last_error(), and
+ * do not replace the previous valid layout. When `delimiter_len == 1`,
+ * the result is byte-identical to mmap_engine_partition_records() with
+ * that byte.
+ *
+ * Calling this function replaces any previously computed chunk boundaries
+ * (delimited, fixed, or prior partition plan). The most recent plan call
+ * determines the layout returned by mmap_engine_get_chunk().
+ *
+ * @param handle                Valid handle from mmap_engine_open().
+ * @param requested_partitions  Desired number of partitions (must be > 0).
+ * @param delimiter             Pointer to delimiter bytes (not NUL-terminated).
+ * @param delimiter_len         Number of delimiter bytes; must be > 0.
+ * @return                      Actual partition count (may be < requested),
+ *                              or 0 on error / empty file.
+ *                              On error, call mmap_engine_last_error().
+ *
+ * Threading: Same contract as mmap_engine_scan_chunks().
+ *
+ * Added in ABI v1.4 (detect with MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING).
+ */
+size_t mmap_engine_partition_records_pattern(CEngineHandle *handle,
+                                             size_t requested_partitions,
+                                             const uint8_t *delimiter,
+                                             size_t delimiter_len);
 
 /**
  * Retrieve a chunk view by index (zero-copy).

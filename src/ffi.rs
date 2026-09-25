@@ -19,7 +19,7 @@ use crate::scanner;
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0003;
+pub const ABI_VERSION: u32 = 0x0001_0004;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
@@ -27,6 +27,7 @@ pub const CAP_ERROR_STRINGS: u32 = 1 << 2;
 pub const CAP_FIXED_SIZE_CHUNKING: u32 = 1 << 3;
 pub const CAP_RECORD_PARTITIONING: u32 = 1 << 4;
 pub const CAP_MULTI_BYTE_DELIMITER: u32 = 1 << 5;
+pub const CAP_MULTI_BYTE_PARTITIONING: u32 = 1 << 6;
 
 const MAX_ERROR_LEN: usize = 256;
 
@@ -83,7 +84,7 @@ struct Engine {
 
 /// Return the ABI version as `(major << 16) | minor`.
 ///
-/// Current: `0x0001_0003` (v1.3). Always succeeds, never panics.
+/// Current: `0x0001_0004` (v1.4). Always succeeds, never panics.
 #[no_mangle]
 pub extern "C" fn mmap_engine_abi_version() -> u32 {
     ABI_VERSION
@@ -94,13 +95,14 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.3):
+/// Current bits (v1.4):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
 ///   - Bit 3: `FIXED_SIZE_CHUNKING` — `mmap_engine_scan_fixed` available
 ///   - Bit 4: `RECORD_PARTITIONING` — `mmap_engine_partition_records` available
 ///   - Bit 5: `MULTI_BYTE_DELIMITER` — `mmap_engine_scan_chunks_pattern` available
+///   - Bit 6: `MULTI_BYTE_PARTITIONING` — `mmap_engine_partition_records_pattern` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
     CAP_ZERO_COPY
@@ -109,6 +111,7 @@ pub extern "C" fn mmap_engine_capabilities() -> u32 {
         | CAP_FIXED_SIZE_CHUNKING
         | CAP_RECORD_PARTITIONING
         | CAP_MULTI_BYTE_DELIMITER
+        | CAP_MULTI_BYTE_PARTITIONING
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -487,6 +490,109 @@ pub unsafe extern "C" fn mmap_engine_partition_records(
     }
 }
 
+/// Plan record-aligned partition byte ranges with a multi-byte delimiter
+/// pattern.
+///
+/// Same semantics as `mmap_engine_partition_records()` but each non-final
+/// partition ends immediately after the complete `delimiter` pattern
+/// (e.g. `b"\r\n"` for CRLF records or `b"\r\n\r\n"` for HTTP-style
+/// framing) instead of after a single byte.
+///
+/// The delimiter is borrowed only for the duration of this call. The engine
+/// stores only the resulting partition boundaries, so the caller may release
+/// or reuse the delimiter buffer after the function returns.
+///
+/// `delimiter_len` must be greater than zero. A null `delimiter` is invalid;
+/// embedded NUL bytes are allowed because the delimiter is length-delimited.
+/// Invalid arguments return 0, set `mmap_engine_last_error()`, and leave the
+/// previous valid layout unchanged.
+///
+/// When `delimiter_len == 1`, the result is byte-identical to
+/// `mmap_engine_partition_records()` with that byte.
+///
+/// # Return value
+///
+/// The actual number of partitions, which may be less than `requested_partitions`
+/// if records are sparse. Returns 0 on error, on an empty file, or when no
+/// partitions are requested; call `mmap_engine_last_error()` for diagnostics.
+///
+/// # Threading
+///
+/// Same contract as `mmap_engine_scan_chunks()`.
+///
+/// # Safety
+///
+/// `handle` must be a valid pointer returned by `mmap_engine_open` and must
+/// not have been freed. `delimiter` must be non-null and point to
+/// `delimiter_len` readable bytes for the duration of this call, and that
+/// memory must not be mutated concurrently.
+///
+/// Added in ABI v1.4 (detect with `MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING`).
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_partition_records_pattern(
+    handle: *mut CEngineHandle,
+    requested_partitions: usize,
+    delimiter: *const u8,
+    delimiter_len: usize,
+) -> usize {
+    let inner = move || {
+        clear_error();
+
+        if handle.is_null() {
+            set_error("handle is null");
+            return 0;
+        }
+
+        if delimiter_len == 0 {
+            set_error("delimiter_len must be > 0");
+            return 0;
+        }
+
+        if delimiter.is_null() {
+            set_error("delimiter is null");
+            return 0;
+        }
+
+        if delimiter_len > isize::MAX as usize {
+            set_error("delimiter_len exceeds supported range");
+            return 0;
+        }
+
+        let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        let file_len = engine.mmap.len();
+        if file_len == 0 {
+            engine.plan = ChunkPlan::empty();
+            return 0;
+        }
+
+        if requested_partitions == 0 {
+            set_error("requested_partitions must be > 0");
+            return 0;
+        }
+
+        let data = unsafe { engine.mmap.as_slice() };
+
+        // SAFETY: the caller guarantees that `delimiter` points to
+        // `delimiter_len` readable, immutable bytes for this call. The
+        // slice is used only to compute boundaries and is never stored.
+        let delimiter = unsafe { std::slice::from_raw_parts(delimiter, delimiter_len) };
+        let partitions =
+            scanner::find_partition_boundaries_pattern(data, requested_partitions, delimiter);
+
+        engine.plan = ChunkPlan::from_ranges(partitions);
+        engine.plan.len()
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(count) => count,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_partition_records_pattern");
+            0
+        }
+    }
+}
+
 /// Retrieve a chunk view by index.
 ///
 /// Writes the chunk's data pointer and length into `out_chunk`. The
@@ -771,6 +877,10 @@ mod tests {
         assert!(
             caps & CAP_MULTI_BYTE_DELIMITER != 0,
             "must have MULTI_BYTE_DELIMITER"
+        );
+        assert!(
+            caps & CAP_MULTI_BYTE_PARTITIONING != 0,
+            "must have MULTI_BYTE_PARTITIONING"
         );
     }
 
@@ -1867,6 +1977,135 @@ mod tests {
 
             mmap_engine_free(h);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_pattern_crlf() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_partition_pattern");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.log");
+        std::fs::write(&file_path, b"record1\r\nrecord2\r\nrecord3\r\nrecord4\r\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let count = mmap_engine_partition_records_pattern(h, 2, b"\r\n".as_ptr(), 2);
+            assert_eq!(count, 2);
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let ret = mmap_engine_get_chunk(h, 0, &mut view);
+            assert_eq!(ret, 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                b"record1\r\nrecord2\r\n"
+            );
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_pattern_single_byte_matches_single_byte_function() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_partition_pattern_parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"aaa\nbbb\nccc\nddd\neee\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let single = mmap_engine_open(c_path.as_ptr());
+            let pattern = mmap_engine_open(c_path.as_ptr());
+            assert!(!single.is_null());
+            assert!(!pattern.is_null());
+
+            let single_count = mmap_engine_partition_records(single, 3, b'\n');
+            let pattern_count =
+                mmap_engine_partition_records_pattern(pattern, 3, b"\n".as_ptr(), 1);
+            assert_eq!(single_count, pattern_count);
+
+            let mut left = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            let mut right = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            for index in 0..single_count {
+                assert_eq!(mmap_engine_get_chunk(single, index, &mut left), 0);
+                assert_eq!(mmap_engine_get_chunk(pattern, index, &mut right), 0);
+                assert_eq!(left.len, right.len);
+                assert_eq!(
+                    std::slice::from_raw_parts(left.data, left.len),
+                    std::slice::from_raw_parts(right.data, right.len)
+                );
+            }
+
+            mmap_engine_free(single);
+            mmap_engine_free(pattern);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_partition_records_pattern_invalid_arguments_keep_previous_plan() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_partition_pattern_invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"aaa\nbbb\nccc\nddd\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            assert_eq!(
+                mmap_engine_partition_records_pattern(std::ptr::null_mut(), 2, b"\r\n".as_ptr(), 2),
+                0
+            );
+            assert!(!mmap_engine_last_error().is_null());
+
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(!h.is_null());
+
+            let baseline = mmap_engine_partition_records(h, 2, b'\n');
+            assert_eq!(baseline, 2);
+
+            assert_eq!(
+                mmap_engine_partition_records_pattern(h, 2, b"\r\n".as_ptr(), 0),
+                0
+            );
+            assert_eq!(
+                mmap_engine_partition_records_pattern(h, 2, std::ptr::null(), 2),
+                0
+            );
+            assert_eq!(
+                mmap_engine_partition_records_pattern(h, 0, b"\r\n".as_ptr(), 2),
+                0
+            );
+
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                b"aaa\nbbb\n"
+            );
+
+            mmap_engine_free(h);
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

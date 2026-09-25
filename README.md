@@ -284,8 +284,7 @@ setup.
 
 - Source distributions (`python -m build --sdist`) rebuild the native library
   with Cargo and therefore require a Rust toolchain; wheels do not.
-- Unsupported: multi-byte partition delimiters (the current partition ABI is a
-  single raw byte), compressed/remote/CSV-semantics input, 32-bit platforms.
+- Unsupported: compressed/remote/CSV-semantics input, 32-bit platforms.
 
 See `PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md` for the packaging decision and
 `python/` for the package sources, tests, and proof harnesses.
@@ -324,6 +323,8 @@ mmap-chunker partition records.jsonl --parts 8
 mmap-chunker partition records.jsonl --parts 8 --worker 3
 # Partition binary records on the NUL byte.
 mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
+# Partition CRLF records on the two-byte sequence.
+mmap-chunker partition records.log --parts 8 --delimiter-hex 0d0a
 ```
 
 `partition` writes one tab-separated numeric range per line; stdout has no header:
@@ -336,11 +337,14 @@ mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
 Offsets are bytes. Starts are inclusive and ends are exclusive, so
 `end_exclusive - start == length`. The default record delimiter remains newline
 byte `0x0A`. `--delimiter-byte B` accepts one decimal raw byte in the range
-`0..255`, including arbitrary binary delimiters such as NUL and `0xFF`. Ranges
+`0..255`, including arbitrary binary delimiters such as NUL and `0xFF`.
+`--delimiter-hex HEX` accepts an even-length hex string for multi-byte
+delimiters (e.g. `0d0a` for CRLF); the two delimiter options are mutually
+exclusive. Ranges
 are deterministic, contiguous, and record-aligned; the actual range count can
 be lower than requested when giant records span multiple ideal partition
-positions. This is framing and planning only, not CSV/JSON parsing; multi-byte
-partition delimiters are not supported. The input file must remain immutable
+positions. This is framing and planning only, not CSV/JSON parsing.
+`partition-files` accepts only `--delimiter-byte`. The input file must remain immutable
 while it is mapped.
 
 With `--worker K`, `K` must be less than `--parts` and the CLI emits only the

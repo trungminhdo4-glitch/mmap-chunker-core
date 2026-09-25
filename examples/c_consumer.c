@@ -25,7 +25,7 @@ static void write_test_file(const char *path, const uint8_t *data, size_t len) {
 int main(void) {
     /* ── 1. ABI version ──────────────────────────────────────────── */
     TEST("abi_version");
-    CHECK(mmap_engine_abi_version() == 0x00010003U, "ABI version must be 0x00010003");
+    CHECK(mmap_engine_abi_version() == 0x00010004U, "ABI version must be 0x00010004");
 
     /* ── 2. Capabilities ─────────────────────────────────────────── */
     TEST("capabilities");
@@ -36,6 +36,7 @@ int main(void) {
     CHECK(caps & (1U << 3), "must have FIXED_SIZE_CHUNKING");
     CHECK(caps & (1U << 4), "must have RECORD_PARTITIONING");
     CHECK(caps & (1U << 5), "must have MULTI_BYTE_DELIMITER");
+    CHECK(caps & (1U << 6), "must have MULTI_BYTE_PARTITIONING");
 
     /* ── 3. Error on NULL path ───────────────────────────────────── */
     TEST("open_null");
