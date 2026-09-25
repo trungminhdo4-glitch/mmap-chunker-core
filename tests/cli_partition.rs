@@ -66,6 +66,37 @@ fn run_partition_hex(path: &Path, parts: &str, hex: &str, worker: Option<usize>)
     Command::new(binary()).args(arguments).output().unwrap()
 }
 
+fn run_partition_sourced(
+    path: &Path,
+    parts: &str,
+    hex: Option<&str>,
+    source: &str,
+    window: Option<&str>,
+    worker: Option<usize>,
+) -> Output {
+    let mut arguments = vec![
+        OsString::from("partition"),
+        path.as_os_str().to_owned(),
+        OsString::from("--parts"),
+        OsString::from(parts),
+    ];
+    if let Some(hex) = hex {
+        arguments.push(OsString::from("--delimiter-hex"));
+        arguments.push(OsString::from(hex));
+    }
+    arguments.push(OsString::from("--source"));
+    arguments.push(OsString::from(source));
+    if let Some(window) = window {
+        arguments.push(OsString::from("--window"));
+        arguments.push(OsString::from(window));
+    }
+    if let Some(worker) = worker {
+        arguments.push(OsString::from("--worker"));
+        arguments.push(OsString::from(worker.to_string()));
+    }
+    Command::new(binary()).args(arguments).output().unwrap()
+}
+
 fn assert_partition_hex_oracle(path: &Path, parts: &str, hex: &str, delimiter: &[u8]) {
     let first = run_partition_hex(path, parts, hex, None);
     assert!(
@@ -763,9 +794,120 @@ fn help_and_version_are_available() {
     assert!(help_text.contains("Valid for `partition` and `partition-files`"));
     assert!(help_text.contains("--worker K"));
     assert!(help_text.contains("no actual partition K exists"));
+    assert!(help_text.contains("--source MODE"));
+    assert!(help_text.contains("--window BYTES"));
 
     let version = run(&[std::ffi::OsStr::new("--version")]);
     assert!(version.status.success());
     assert!(version.stderr.is_empty());
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("mmap-chunker "));
+}
+
+#[test]
+fn source_backends_emit_identical_ranges() {
+    let (directory, path) = write_fixture(
+        "source_parity",
+        OsString::from("records.log"),
+        b"alpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\nzeta\r\n",
+    );
+    for hex in [None, Some("0d0a")] {
+        let reference = match hex {
+            Some(hex) => run_partition_hex(&path, "4", hex, None),
+            None => run_partition(&path, "4", Some(0x0A), None),
+        };
+        assert!(
+            reference.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&reference.stderr)
+        );
+        for source in ["mmap", "windowed", "pread"] {
+            let output = run_partition_sourced(&path, "4", hex, source, None, None);
+            assert!(
+                output.status.success(),
+                "source {source} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            assert_eq!(
+                output.stdout, reference.stdout,
+                "source {source} diverged from mmap"
+            );
+            // Deterministic repeated planning per backend.
+            let repeat = run_partition_sourced(&path, "4", hex, source, None, None);
+            assert_eq!(
+                output.stdout, repeat.stdout,
+                "source {source} not deterministic"
+            );
+        }
+        // Explicit small window still matches.
+        let windowed = run_partition_sourced(&path, "4", hex, "windowed", Some("65536"), None);
+        assert!(windowed.status.success());
+        assert_eq!(windowed.stdout, reference.stdout);
+        // Worker projection through the sourced path.
+        let worker = run_partition_sourced(&path, "4", hex, "pread", None, Some(1));
+        assert!(worker.status.success());
+        let reference_worker = match hex {
+            Some(hex) => run_partition_hex(&path, "4", hex, Some(1)),
+            None => run_partition(&path, "4", Some(0x0A), Some(1)),
+        };
+        assert_eq!(worker.stdout, reference_worker.stdout);
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn source_rejects_invalid_forms() {
+    let (directory, path) = write_fixture(
+        "source_invalid",
+        OsString::from("records.txt"),
+        b"one\ntwo\nthree\n",
+    );
+    // Unknown backend.
+    let output = run_partition_sourced(&path, "2", None, "direct", None, None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--source"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // --window without --source windowed.
+    let output = run_partition_sourced(&path, "2", None, "pread", Some("65536"), None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--window"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // --window below the 64 KiB minimum.
+    let output = run_partition_sourced(&path, "2", None, "windowed", Some("1024"), None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--window"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Duplicate --source.
+    let arguments = [
+        OsString::from("partition"),
+        path.as_os_str().to_owned(),
+        OsString::from("--parts"),
+        OsString::from("2"),
+        OsString::from("--source"),
+        OsString::from("mmap"),
+        OsString::from("--source"),
+        OsString::from("pread"),
+    ];
+    let argument_refs: Vec<&OsStr> = arguments.iter().map(OsString::as_os_str).collect();
+    let output = run(&argument_refs);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate option `--source`"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
 }
