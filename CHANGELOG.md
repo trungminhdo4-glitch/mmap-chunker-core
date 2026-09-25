@@ -22,6 +22,12 @@
   pattern delegates to the single-byte path with byte-identical output;
   `partition-files` remains single-byte (`--delimiter-hex` is rejected
   there). No new runtime dependencies; Rust MSRV remains 1.77.
+- Python source-selectable planning: `mmap_chunker.plan_file_ranges`
+  with `source="mmap" | "windowed" | "pread"` and `window_bytes`,
+  driving the v1.5 two-phase native API with a capability gate. Returns
+  the same immutable `Plan` contract as `plan_file` (which is unchanged
+  and keeps its mmap-only engine path); all backends emit byte-identical
+  ranges. No new runtime dependencies.
 
 ### Changed
 

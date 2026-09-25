@@ -134,6 +134,41 @@ def _coerce_delimiter(delimiter: _DelimiterInput) -> int:
     )
 
 
+_SOURCES = ("mmap", "windowed", "pread")
+_SOURCE_MODES = {
+    "mmap": _native.SOURCE_MODE_MMAP,
+    "windowed": _native.SOURCE_MODE_WINDOWED,
+    "pread": _native.SOURCE_MODE_PREAD,
+}
+
+
+def _coerce_source(source: str) -> int:
+    if isinstance(source, bool) or not isinstance(source, str):
+        raise TypeError(
+            f"source must be one of {_SOURCES}, got {type(source).__name__}"
+        )
+    try:
+        return _SOURCE_MODES[source]
+    except KeyError:
+        raise ValueError(f"source must be one of {_SOURCES}, got {source!r}") from None
+
+
+def _coerce_window_bytes(window_bytes: int | None) -> int:
+    if window_bytes is None:
+        return _native.DEFAULT_WINDOW_BYTES
+    if isinstance(window_bytes, bool) or not isinstance(window_bytes, int):
+        raise TypeError(
+            f"window_bytes must be an int >= {_native.MIN_WINDOW_BYTES} or None, "
+            f"got {type(window_bytes).__name__}"
+        )
+    window_bytes = int.__int__(window_bytes)
+    if window_bytes < _native.MIN_WINDOW_BYTES:
+        raise ValueError(
+            f"window_bytes must be >= {_native.MIN_WINDOW_BYTES}, got {window_bytes}"
+        )
+    return window_bytes
+
+
 def _verify_file(path: str) -> int:
     try:
         info = os.stat(path)
@@ -261,6 +296,98 @@ def plan_file(
         ranges.append(Range(index, offset, offset + length, length))
         offset += length
 
+    if offset != file_size:
+        raise PlanningError(
+            f"partition coverage {offset} does not match file size {file_size}; "
+            "the native library produced an inconsistent plan"
+        )
+    _verify_record_alignment(resolved, tuple(ranges), delimiter_byte)
+
+    return Plan(resolved, file_size, parts, delimiter_byte, tuple(ranges))
+
+
+def plan_file_ranges(
+    path: PathLike,
+    parts: int,
+    delimiter: _DelimiterInput = DEFAULT_DELIMITER,
+    *,
+    source: str = "mmap",
+    window_bytes: int | None = None,
+) -> Plan:
+    """Plan record-aligned byte ranges with an explicit byte source.
+
+    Same :class:`Plan` contract as :func:`plan_file`, but the ranges are
+    produced through the v1.5 source-selectable native API instead of the
+    mmap-only engine path, so ``windowed`` (bounded address space) and
+    ``pread`` (no mapping) backends are available without manual C-ABI
+    calls. All backends emit byte-identical ranges for the same inputs.
+
+    Args:
+        path: A file path (str or os.PathLike). The file must exist, be a
+            regular local file, and not be mutated while planning runs.
+        parts: Number of desired partitions; must be >= 1 and no greater than
+            the platform ``size_t`` maximum. The actual number of ranges may
+            be smaller when records are sparse.
+        delimiter: The single raw byte marking record boundaries. Defaults to
+            the newline byte ``b"\\n"`` (also accepted as the int ``10``).
+        source: One of ``"mmap"`` (default, full-file mapping),
+            ``"windowed"`` (bounded moving-window mapping), or ``"pread"``
+            (positional reads, no mapping).
+        window_bytes: Window size for ``source="windowed"``; must be
+            >= 65536. ``None`` (default) uses the native 64 MiB default.
+            Must be ``None`` for other sources.
+
+    Returns:
+        An immutable :class:`Plan`. No returned object references a live
+        memory map.
+
+    Raises:
+        TypeError: Invalid argument types.
+        ValueError: Non-positive ``parts``, invalid delimiter value, unknown
+            source, out-of-range ``window_bytes``, misplaced ``window_bytes``,
+            or an embedded NUL in the path.
+        OverflowError: ``parts`` exceeds the platform ``size_t`` maximum.
+        FileNotFoundError: The input file does not exist.
+        IsADirectoryError: The input path is a directory.
+        PlanningError: Native planning fails or a verified invariant is
+            violated.
+    """
+    resolved = _coerce_path(path)
+    parts = _coerce_parts(parts)
+    delimiter_byte = _coerce_delimiter(delimiter)
+    source_mode = _coerce_source(source)
+    window_value = _coerce_window_bytes(window_bytes)
+    if source != "windowed" and window_bytes is not None:
+        raise ValueError(
+            f"window_bytes requires source='windowed', got source={source!r}"
+        )
+    file_size = _verify_file(resolved)
+
+    lib = _native.get_library()
+    try:
+        pairs = _native.plan_partition_ranges(
+            lib,
+            resolved,
+            parts,
+            bytes((delimiter_byte,)),
+            source_mode,
+            window_value,
+        )
+    except _native.NativeLibraryError as exc:
+        raise PlanningError(f"native range planning failed: {exc}") from exc
+
+    ranges = [
+        Range(index, start, end, end - start)
+        for index, (start, end) in enumerate(pairs)
+    ]
+    offset = 0
+    for r in ranges:
+        if r.start != offset:
+            raise PlanningError(
+                f"native plan has a gap or overlap at range {r.index}; "
+                "the native library produced an inconsistent plan"
+            )
+        offset = r.end
     if offset != file_size:
         raise PlanningError(
             f"partition coverage {offset} does not match file size {file_size}; "

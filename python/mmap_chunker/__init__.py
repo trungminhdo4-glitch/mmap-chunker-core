@@ -12,6 +12,12 @@ Public API::
     for r in plan.ranges:
         print(r.start, r.end, r.length)
 
+Source-selectable planning (mmap/windowed/pread backends)::
+
+    from mmap_chunker import plan_file_ranges
+
+    plan = plan_file_ranges("records.jsonl", parts=8, source="windowed")
+
 Diagnostics::
 
     import mmap_chunker
@@ -41,6 +47,7 @@ from mmap_chunker.planning import (
     PlanningError,
     Range,
     plan_file,
+    plan_file_ranges,
 )
 
 __all__ = [
@@ -49,6 +56,7 @@ __all__ = [
     "PlanningError",
     "Range",
     "plan_file",
+    "plan_file_ranges",
     "abi_version",
     "capabilities",
 ]

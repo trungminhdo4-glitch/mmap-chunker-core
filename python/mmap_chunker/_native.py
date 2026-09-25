@@ -29,6 +29,15 @@ CAP_WINDOWED_PLANNING = 1 << 7
 
 _REQUIRED_CAPABILITY = CAP_RECORD_PARTITIONING
 
+SOURCE_MODE_MMAP = 0
+SOURCE_MODE_WINDOWED = 1
+SOURCE_MODE_PREAD = 2
+
+# Mirror of the native PlannerOptions defaults (src/source.rs); the native
+# side remains authoritative and rejects out-of-range windows itself.
+DEFAULT_WINDOW_BYTES = 64 * 1024 * 1024
+MIN_WINDOW_BYTES = 65536
+
 _LIBRARY_NAMES = {
     ("linux", "x86_64"): "libmmap_chunker_core.so",
     ("linux", "aarch64"): "libmmap_chunker_core.so",
@@ -49,6 +58,15 @@ class _CChunkView(ctypes.Structure):
     _fields_ = [
         ("data", ctypes.POINTER(ctypes.c_uint8)),
         ("len", ctypes.c_size_t),
+    ]
+
+
+class _CPartitionRange(ctypes.Structure):
+    """Matches the C ``CPartitionRange`` layout (two size_t, 16 bytes)."""
+
+    _fields_ = [
+        ("start", ctypes.c_size_t),
+        ("end", ctypes.c_size_t),
     ]
 
 
@@ -120,6 +138,18 @@ def _configure(lib: ctypes.CDLL) -> None:
     lib.mmap_engine_get_chunk.restype = ctypes.c_int32
     lib.mmap_engine_free.argtypes = [ctypes.c_void_p]
     lib.mmap_engine_free.restype = None
+    lib.mmap_engine_plan_partition_ranges.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_size_t,
+        ctypes.c_uint32,
+        ctypes.c_size_t,
+        ctypes.POINTER(_CPartitionRange),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.mmap_engine_plan_partition_ranges.restype = ctypes.c_int32
 
 
 def _load(path: Path) -> ctypes.CDLL:
@@ -183,3 +213,75 @@ def last_error(lib: ctypes.CDLL) -> str:
     if not raw:
         return ""
     return raw.decode("utf-8", "replace")
+
+
+def plan_partition_ranges(
+    lib: ctypes.CDLL,
+    path: str,
+    parts: int,
+    delimiter: bytes,
+    source_mode: int,
+    window_bytes: int,
+) -> list[tuple[int, int]]:
+    """Plan ``(start, end)`` ranges via the v1.5 two-phase native API.
+
+    Requires the ``CAP_WINDOWED_PLANNING`` capability. A ``-2`` (capacity
+    too small) result is retried at most once, which can only trigger if
+    the input file is replaced between the count and fill phases (the
+    caller contract forbids mutating the file during planning).
+    """
+    if not int(lib.mmap_engine_capabilities()) & CAP_WINDOWED_PLANNING:
+        raise NativeLibraryError(
+            "bundled native library lacks the WINDOWED_PLANNING capability "
+            "(bit 7), which source-selectable range planning requires."
+        )
+    raw_path = os.fsencode(path)
+    delim_buf = ctypes.create_string_buffer(bytes(delimiter))
+    for _attempt in range(2):
+        count = ctypes.c_size_t(0)
+        code = int(
+            lib.mmap_engine_plan_partition_ranges(
+                raw_path,
+                ctypes.c_size_t(parts),
+                ctypes.cast(delim_buf, ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_size_t(len(delimiter)),
+                ctypes.c_uint32(source_mode),
+                ctypes.c_size_t(window_bytes),
+                None,
+                ctypes.c_size_t(0),
+                ctypes.byref(count),
+            )
+        )
+        if code == 0:
+            # Success with zero ranges (e.g. empty input); nothing to fill.
+            return []
+        if code != -2:
+            raise NativeLibraryError(
+                f"native range-planning count phase failed: {last_error(lib)}"
+            )
+        capacity = int(count.value)
+        out = (_CPartitionRange * capacity)()
+        filled = ctypes.c_size_t(0)
+        code = int(
+            lib.mmap_engine_plan_partition_ranges(
+                raw_path,
+                ctypes.c_size_t(parts),
+                ctypes.cast(delim_buf, ctypes.POINTER(ctypes.c_uint8)),
+                ctypes.c_size_t(len(delimiter)),
+                ctypes.c_uint32(source_mode),
+                ctypes.c_size_t(window_bytes),
+                out,
+                ctypes.c_size_t(capacity),
+                ctypes.byref(filled),
+            )
+        )
+        if code == 0:
+            return [(int(r.start), int(r.end)) for r in out[: int(filled.value)]]
+        if code != -2:
+            raise NativeLibraryError(
+                f"native range-planning fill phase failed: {last_error(lib)}"
+            )
+    raise NativeLibraryError(
+        "native range-planning count changed between phases; the input file "
+        "must not be modified while planning runs."
+    )
