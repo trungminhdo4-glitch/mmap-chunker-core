@@ -4,6 +4,17 @@
 
 ### Added
 
+- Source-selectable range planning: `ByteSource` trait with `MmapSource`
+  (full-file, reference), `WindowedMmapSource` (bounded 64 KiB-aligned
+  windows), and `PreadSource` (positional reads, no mapping);
+  `plan_partition_boundaries` / `plan_partition_ranges` with
+  `SourceMode` / `PlannerOptions`; CLI `partition --source
+  mmap|windowed|pread [--window BYTES]`; C ABI v1.5
+  (`mmap_engine_plan_partition_ranges` two-phase API,
+  `CAP_WINDOWED_PLANNING`, bit 7, `CPartitionRange`, `SOURCE_MODE_*`).
+  All backends emit byte-identical ranges (differential tests incl.
+  tiny-read and larger-than-window cases). No new runtime dependencies;
+  Rust MSRV remains 1.77.
 - Multi-byte record partitioning: `find_partition_boundaries_pattern`,
   `MmapChunker::partition_records_pattern`,
   `mmap_engine_partition_records_pattern`, and CLI `--delimiter-hex`
@@ -11,12 +22,20 @@
   pattern delegates to the single-byte path with byte-identical output;
   `partition-files` remains single-byte (`--delimiter-hex` is rejected
   there). No new runtime dependencies; Rust MSRV remains 1.77.
+- Python source-selectable planning: `mmap_chunker.plan_file_ranges`
+  with `source="mmap" | "windowed" | "pread"` and `window_bytes`,
+  driving the v1.5 two-phase native API with a capability gate. Returns
+  the same immutable `Plan` contract as `plan_file` (which is unchanged
+  and keeps its mmap-only engine path); all backends emit byte-identical
+  ranges. No new runtime dependencies.
 
 ### Changed
 
-- C ABI version is now `0x00010004` (v1.4); existing symbols,
-  signatures, layouts, and capability bits 0–5 are unchanged.
-  Conformance pins updated (`abi_version=65540`, `capabilities=127`).
+- C ABI version is now `0x00010005` (v1.5, via v1.4:
+  `mmap_engine_partition_records_pattern` + `CAP_MULTI_BYTE_PARTITIONING`);
+  existing symbols, signatures, layouts, and capability bits 0–6 are
+  unchanged. Conformance pins updated (`abi_version=65541`,
+  `capabilities=255`).
 
 ## [0.2.6] — 2026-08-20
 
