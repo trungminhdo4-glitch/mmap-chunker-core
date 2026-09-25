@@ -40,13 +40,17 @@ python -m venv .venv && .venv/Scripts/python -m pip install build wheel
 ```
 src/
   lib.rs      — module declarations + public re-exports
-  mmap.rs     — MmapFile: platform-specific mmap (Unix/Win), Send+Sync
+  mmap.rs     — MmapFile: platform-specific mmap (Unix/Win), Send+Sync;
+                 WindowedMmapFile: one bounded 64 KiB-aligned window at a time
   scanner.rs  — find_chunk_boundaries (delimiter), ChunkCursor (lazy iterator),
                  PatternChunkCursor (multi-byte delimiter cursor),
                  find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds,
                  find_partition_boundaries (N-way), find_partition_boundaries_pattern,
                  ranges_from_boundaries (pub(crate))
-  ffi.rs      — C ABI: 12 public functions, ChunkLayout enum, panic containment
+  ffi.rs      — C ABI: 13 public functions, ChunkLayout enum, panic containment
+  source.rs   — ByteSource trait; MmapSource/WindowedMmapSource/PreadSource;
+                 plan_partition_boundaries/plan_partition_ranges (SourceMode,
+                 PlannerOptions), buffered exact-target parity with scanner
 
 tests/
   c_abi_test.rs        — Integration test: C ABI via extern "C" (Rust calling Rust)
@@ -102,12 +106,12 @@ PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision re
 - **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
 - **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. Python wheels + sdist are built/verified by the reusable `python-wheel.yml` and published to PyPI via Trusted Publishing; the crate is published to crates.io via OIDC. Both registries use protected environments (`pypi`, `crates-io`); `workflow_dispatch` is a non-publishing dry run.
 
-## Public C ABI (12 functions, v1.4)
+## Public C ABI (13 functions, v1.5)
 
 | Function                          | Purpose                              |
 |-----------------------------------|--------------------------------------|
 | `mmap_engine_abi_version()`       | Returns `(major << 16) \| minor`     |
-| `mmap_engine_capabilities()`      | Feature detection bitmask (bits 0-6) |
+| `mmap_engine_capabilities()`      | Feature detection bitmask (bits 0-7) |
 | `mmap_engine_last_error()`        | Thread-local error diagnostics       |
 | `mmap_engine_open(path)`          | Open + mmap file                     |
 | `mmap_engine_scan_chunks(h, sz)`  | Scan with newline delimiter (v1.0)   |
@@ -116,6 +120,7 @@ PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision re
 | `mmap_engine_scan_fixed(h, sz)`   | Fixed-size arithmetic chunking (v1.1)|
 | `mmap_engine_partition_records(h, n, d)` | Record-aligned N-way partition (v1.2)|
 | `mmap_engine_partition_records_pattern(h,n,d,len)` | Multi-byte record-aligned partition (v1.4) |
+| `mmap_engine_plan_partition_ranges(path,n,d,len,mode,win,out,cap,count)` | Source-selectable range planning, two-phase (v1.5) |
 | `mmap_engine_get_chunk(h, i, out)`| Zero-copy chunk by index (returns 0/-1) |
 | `mmap_engine_free(h)`             | Release all resources (abort on panic)|
 

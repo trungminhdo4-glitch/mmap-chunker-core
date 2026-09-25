@@ -1036,7 +1036,7 @@ impl<'a> Iterator for ChunkCursor<'a> {
 ///
 /// Time complexity: O(n + m) typical, O(n*m) pathological (repeated
 /// prefix). No unsafe. No dependencies. MSRV 1.77.
-fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
+pub(crate) fn find_pattern_in_slice(haystack: &[u8], pattern: &[u8]) -> Option<usize> {
     let plen = pattern.len();
     if plen == 0 || haystack.len() < plen {
         return None;
