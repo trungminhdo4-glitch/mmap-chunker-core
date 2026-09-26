@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-26
+
 ### Added
 
 - Source-selectable range planning: `ByteSource` trait with `MmapSource`

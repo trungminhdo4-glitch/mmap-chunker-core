@@ -23,7 +23,7 @@ except ImportError as exc:
     print(f"FATAL: mmap_chunker is not importable: {exc}", file=sys.stderr)
     sys.exit(1)
 
-from mmap_chunker import plan_file
+from mmap_chunker import plan_file, plan_file_ranges
 
 REPORT: dict = {
     "import_ok": True,
@@ -59,6 +59,10 @@ def verify_abi() -> None:
         raise AssertionError(f"unexpected ABI version 0x{abi:08x}")
     if not caps & (1 << 4):
         raise AssertionError("RECORD_PARTITIONING capability missing")
+    if not caps & (1 << 7):
+        raise AssertionError(
+            "WINDOWED_PLANNING capability missing; plan_file_ranges requires ABI v1.5"
+        )
 
 
 def run_planner_proof() -> None:
@@ -103,6 +107,14 @@ def run_planner_proof() -> None:
         # Determinism
         plan2 = plan_file(path, parts=4)
         assert plan2.ranges == plan.ranges
+
+        # Source-selectable planning (v1.5): every backend must emit
+        # byte-identical ranges to plan_file for the same inputs.
+        for source in ("mmap", "windowed", "pread"):
+            sourced = plan_file_ranges(path, parts=4, source=source)
+            assert sourced.ranges == plan.ranges, source
+            assert sourced.file_size == plan.file_size, source
+        REPORT["sources_match_plan_file"] = ["mmap", "windowed", "pread"]
 
         # Empty file
         empty = tmp / "empty.jsonl"
