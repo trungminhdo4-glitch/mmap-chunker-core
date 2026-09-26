@@ -279,12 +279,12 @@ def main() -> None:
     root = Path(__file__).resolve().parents[1]
     library = args.library or root / "target" / "release" / library_name()
     workers = parse_workers(args.workers, os.cpu_count())
-    print(json.dumps({"type": "metadata", "platform": platform.platform(), "python": sys.version.split()[0], "cpu_count": os.cpu_count(), "workers": workers, "repeats": args.repeats, "library": str(library), "abi_expected": "0x00010003", "capability_record_partitioning": 1 << 4}, sort_keys=True))
+    print(json.dumps({"type": "metadata", "platform": platform.platform(), "python": sys.version.split()[0], "cpu_count": os.cpu_count(), "workers": workers, "repeats": args.repeats, "library": str(library), "abi_expected": "0x00010005", "capability_record_partitioning": 1 << 4}, sort_keys=True))
 
     lib = load_library(library)
     abi = int(lib.mmap_engine_abi_version())
     capabilities = int(lib.mmap_engine_capabilities())
-    if abi != 0x00010003 or not capabilities & (1 << 4):
+    if abi != 0x00010005 or not capabilities & (1 << 4):
         raise RuntimeError(f"unsupported library: abi=0x{abi:08x}, capabilities=0x{capabilities:08x}")
 
     if args.input:
