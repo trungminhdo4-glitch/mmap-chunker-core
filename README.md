@@ -52,6 +52,9 @@ consumer.
 - POSIX `mmap` / Windows `CreateFileMappingW`
 - Configurable raw single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
 - Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust and C ABI
+- Source-selectable range planning (`mmap` / `windowed` / `pread`) with
+  byte-identical ranges across backends — Rust, C ABI v1.5, Python
+  `plan_file_ranges`, and both CLI partition commands
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
 - Panic containment at all FFI boundaries
@@ -201,7 +204,7 @@ Verified prebuilt native libraries are published on [GitHub Releases](https://gi
 import ctypes
 lib = ctypes.CDLL("./libmmap_chunker_core.so")  # or .dll / .dylib
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
-assert lib.mmap_engine_abi_version() == 0x00010003
+assert lib.mmap_engine_abi_version() == 0x00010005
 ```
 
 ```c
@@ -266,6 +269,21 @@ setup.
 - Public API: `plan_file(path, parts, delimiter=b"\n")` returns an immutable
   `Plan` of record-aligned `Range` objects. Native handles are opened and
   released inside the call; no returned object references the memory map.
+  The delimiter is a single raw byte; multi-byte delimiters are available
+  through the C ABI (`mmap_engine_partition_records_pattern`, v1.4) and the
+  CLI (`--delimiter-hex`), not through the Python API.
+- Source-selectable planning: `plan_file_ranges(path, parts, delimiter=b"\n",
+  source="mmap" | "windowed" | "pread", window_bytes=None)` drives the v1.5
+  native API with a capability gate and returns the same immutable `Plan`
+  contract. All backends emit byte-identical ranges; `window_bytes` (minimum
+  65536) applies to `source="windowed"` only. `plan_file` keeps the
+  mmap-only engine path and remains fully compatible.
+
+  ```python
+  from mmap_chunker import plan_file_ranges
+
+  plan = plan_file_ranges("records.jsonl", parts=8, source="windowed")
+  ```
 - Diagnostics: `mmap_chunker.__version__`, `mmap_chunker.abi_version()`,
   `mmap_chunker.capabilities()`.
 - Optional DataTrove integration (lazy import, base package unaffected):
@@ -325,6 +343,9 @@ mmap-chunker partition records.jsonl --parts 8 --worker 3
 mmap-chunker partition records.bin --parts 8 --delimiter-byte 0
 # Partition CRLF records on the two-byte sequence.
 mmap-chunker partition records.log --parts 8 --delimiter-hex 0d0a
+# Plan through a bounded window mapping or positional reads (no mapping).
+mmap-chunker partition records.jsonl --parts 8 --source windowed
+mmap-chunker partition records.jsonl --parts 8 --source pread
 ```
 
 `partition` writes one tab-separated numeric range per line; stdout has no header:
@@ -560,7 +581,12 @@ Companion test suites:
 
 ## Limitations
 
-- Full-file mapping only (no windowed mmap). Very large files may exhaust address space.
+- Byte-source backends: `mmap` maps the full file (reference backend for
+  zero-copy chunk views); `windowed` holds at most one bounded mapping
+  window at a time; `pread` maps nothing and reads positionally. Zero-copy
+  `CChunkView` pointers exist only on the mmap engine path — windowed/pread
+  planning returns ranges, not mapped views, and re-reads regions on demand,
+  so inputs must stay immutable while planned.
 - No copy-on-write or mutable access. Read-only mapping.
 - No regex delimiters. Multi-byte delimiters supported (e.g., `b"\r\n"`, `b"\r\n\r\n"`).
 
