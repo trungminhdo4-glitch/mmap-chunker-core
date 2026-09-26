@@ -47,7 +47,7 @@ src/
                  find_byte_swar (SWAR, pub(crate)), fixed_chunk_count/bounds,
                  find_partition_boundaries (N-way), find_partition_boundaries_pattern,
                  ranges_from_boundaries (pub(crate))
-  ffi.rs      — C ABI: 13 public functions, ChunkLayout enum, panic containment
+  ffi.rs      — C ABI: 14 public functions, ChunkLayout enum, panic containment
   source.rs   — ByteSource trait; MmapSource/WindowedMmapSource/PreadSource;
                  plan_partition_boundaries/plan_partition_ranges (SourceMode,
                  PlannerOptions), buffered exact-target parity with scanner
@@ -106,14 +106,15 @@ PYTHON_WHEEL_DISTRIBUTION_ARCHITECTURE.md — packaging architecture decision re
 - **Integer safety**: all byte offsets and lengths are checked (`try_from`) or saturating — no silent wraparound
 - **Release artifacts**: tag `vX.Y.Z` triggers `release.yml` — validates tag == Cargo.toml version, matrix-builds 5 platforms, uploads per-platform archives (header + dynamic + static lib + sha256). Draft created for manual review. Python wheels + sdist are built/verified by the reusable `python-wheel.yml` and published to PyPI via Trusted Publishing; the crate is published to crates.io via OIDC. Both registries use protected environments (`pypi`, `crates-io`); `workflow_dispatch` is a non-publishing dry run.
 
-## Public C ABI (13 functions, v1.5)
+## Public C ABI (14 functions, v1.6)
 
 | Function                          | Purpose                              |
 |-----------------------------------|--------------------------------------|
 | `mmap_engine_abi_version()`       | Returns `(major << 16) \| minor`     |
-| `mmap_engine_capabilities()`      | Feature detection bitmask (bits 0-7) |
+| `mmap_engine_capabilities()`      | Feature detection bitmask (bits 0-8) |
 | `mmap_engine_last_error()`        | Thread-local error diagnostics       |
 | `mmap_engine_open(path)`          | Open + mmap file                     |
+| `mmap_engine_open_pinned(path, flags)` | Open + mmap with file-identity pinning (v1.6) |
 | `mmap_engine_scan_chunks(h, sz)`  | Scan with newline delimiter (v1.0)   |
 | `mmap_engine_scan_chunks_ex(h,sz,delim)` | Scan with configurable single-byte delimiter |
 | `mmap_engine_scan_chunks_pattern(h,sz,d,len)` | Scan with borrowed multi-byte delimiter (v1.3) |

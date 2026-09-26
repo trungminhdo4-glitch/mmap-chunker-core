@@ -25,7 +25,7 @@ static void write_test_file(const char *path, const uint8_t *data, size_t len) {
 int main(void) {
     /* ── 1. ABI version ──────────────────────────────────────────── */
     TEST("abi_version");
-    CHECK(mmap_engine_abi_version() == 0x00010005U, "ABI version must be 0x00010005");
+    CHECK(mmap_engine_abi_version() == 0x00010006U, "ABI version must be 0x00010006");
 
     /* ── 2. Capabilities ─────────────────────────────────────────── */
     TEST("capabilities");
@@ -38,6 +38,7 @@ int main(void) {
     CHECK(caps & (1U << 5), "must have MULTI_BYTE_DELIMITER");
     CHECK(caps & (1U << 6), "must have MULTI_BYTE_PARTITIONING");
     CHECK(caps & (1U << 7), "must have WINDOWED_PLANNING");
+    CHECK(caps & (1U << 8), "must have FILE_PIN");
 
     /* ── 3. Error on NULL path ───────────────────────────────────── */
     TEST("open_null");

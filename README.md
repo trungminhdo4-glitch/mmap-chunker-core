@@ -53,7 +53,7 @@ consumer.
 - Configurable raw single-byte delimiter (newline, comma, tab, pipe, NUL, etc.)
 - Multi-byte delimiter support (e.g., `b"\r\n"` for CRLF, `b"\r\n\r\n"` for HTTP-style) — Rust and C ABI
 - Source-selectable range planning (`mmap` / `windowed` / `pread`) with
-  byte-identical ranges across backends — Rust, C ABI v1.5, Python
+  byte-identical ranges across backends — Rust, C ABI v1.6, Python
   `plan_file_ranges`, and both CLI partition commands
 - Zero-copy `CChunkView` — chunk pointers reference the mapped file directly
 - `MADV_SEQUENTIAL` hint for sequential scan throughput
@@ -204,7 +204,7 @@ Verified prebuilt native libraries are published on [GitHub Releases](https://gi
 import ctypes
 lib = ctypes.CDLL("./libmmap_chunker_core.so")  # or .dll / .dylib
 lib.mmap_engine_abi_version.restype = ctypes.c_uint32
-assert lib.mmap_engine_abi_version() == 0x00010005
+assert lib.mmap_engine_abi_version() == 0x00010006
 ```
 
 ```c
@@ -273,7 +273,7 @@ setup.
   through the C ABI (`mmap_engine_partition_records_pattern`, v1.4) and the
   CLI (`--delimiter-hex`), not through the Python API.
 - Source-selectable planning: `plan_file_ranges(path, parts, delimiter=b"\n",
-  source="mmap" | "windowed" | "pread", window_bytes=None)` drives the v1.5
+  source="mmap" | "windowed" | "pread", window_bytes=None)` drives the v1.6
   native API with a capability gate and returns the same immutable `Plan`
   contract. All backends emit byte-identical ranges; `window_bytes` (minimum
   65536) applies to `source="windowed"` only. `plan_file` keeps the

@@ -436,7 +436,7 @@ mod tests {
     fn unknown_flags_rejected() {
         let dir = temp_dir("flags");
         let path = write_file(&dir, "data.txt", b"data\n");
-        let err = PinnedFile::capture(&path, 1 << 30).unwrap_err();
+        let err = PinnedFile::capture(path, 1 << 30).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(&dir);
     }
