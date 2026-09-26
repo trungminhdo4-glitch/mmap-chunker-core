@@ -449,6 +449,8 @@ fn help_documents_the_multi_file_contract() {
     assert!(help.contains("worker<TAB>source<TAB>start<TAB>end_exclusive<TAB>length"));
     assert!(help.contains("ordered logical dataset"));
     assert!(help.contains("all-empty dataset succeeds"));
+    assert!(help.contains("[--source MODE]"));
+    assert!(help.contains("never hold more than one source open"));
 }
 
 #[test]
@@ -640,5 +642,263 @@ fn hex_rejects_invalid_forms_and_conflicts() {
         .unwrap();
     assert!(!duplicate_hex.status.success());
     assert!(duplicate_hex.stdout.is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn run_partition_files_sourced(
+    paths: &[&Path],
+    parts: usize,
+    delimiter_byte: Option<u8>,
+    delimiter_hex: Option<&str>,
+    source: &str,
+    window: Option<usize>,
+) -> Output {
+    assert!(delimiter_byte.is_some() != delimiter_hex.is_some());
+    let mut arguments = vec![
+        OsString::from("partition-files"),
+        OsString::from("--parts"),
+        OsString::from(parts.to_string()),
+    ];
+    match (delimiter_byte, delimiter_hex) {
+        (Some(delimiter), None) => {
+            arguments.push(OsString::from("--delimiter-byte"));
+            arguments.push(OsString::from(delimiter.to_string()));
+        }
+        (None, Some(hex)) => {
+            arguments.push(OsString::from("--delimiter-hex"));
+            arguments.push(OsString::from(hex));
+        }
+        _ => unreachable!("exactly one delimiter form is required"),
+    }
+    arguments.push(OsString::from("--source"));
+    arguments.push(OsString::from(source));
+    if let Some(window) = window {
+        arguments.push(OsString::from("--window"));
+        arguments.push(OsString::from(window.to_string()));
+    }
+    arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+    Command::new(binary()).args(arguments).output().unwrap()
+}
+
+/// Differential contract: a sourced run must emit byte-identical stdout to
+/// the default mmap engine for the same inputs. Oracle properties of the
+/// shared output are validated through the existing mmap oracles.
+fn assert_sourced_matches_mmap(
+    paths: &[PathBuf],
+    parts: usize,
+    delimiter_byte: Option<u8>,
+    delimiter_hex: Option<&str>,
+    hex_bytes: Option<&[u8]>,
+    source: &str,
+    window: Option<usize>,
+) {
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    let expected = match (delimiter_byte, delimiter_hex) {
+        (Some(delimiter), None) => run_partition_files(&path_refs, parts, Some(delimiter)),
+        (None, Some(hex)) => run_partition_files_hex(&path_refs, parts, hex),
+        _ => unreachable!("exactly one delimiter form is required"),
+    };
+    assert!(expected.status.success());
+    let got = run_partition_files_sourced(
+        &path_refs,
+        parts,
+        delimiter_byte,
+        delimiter_hex,
+        source,
+        window,
+    );
+    assert!(
+        got.status.success(),
+        "source={source} window={window:?} stderr: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert!(got.stderr.is_empty());
+    assert_eq!(
+        got.stdout, expected.stdout,
+        "source={source} window={window:?} diverged from mmap"
+    );
+    match (delimiter_byte, delimiter_hex, hex_bytes) {
+        (Some(delimiter), None, None) => {
+            assert_dataset_oracle(paths, parts, Some(delimiter));
+        }
+        (None, Some(hex), Some(delimiter)) => {
+            assert_dataset_oracle_pattern(paths, parts, hex, delimiter);
+        }
+        _ => unreachable!("hex runs require the decoded delimiter"),
+    }
+}
+
+#[test]
+fn sourced_backends_match_mmap_across_corpora() {
+    let (directory, paths) = write_sources(
+        "sourced_jsonl",
+        &[
+            b"{\"id\":1}\n{\"id\":2}\n",
+            b"",
+            b"{\"id\":3}\n{\"id\":4,\"p\":\"x\"}\n{\"id\":5}\n",
+            b"tail-no-delimiter",
+        ],
+    );
+    let (binary_directory, binary_paths) =
+        write_sources("sourced_nul", &[&[0x01, 0x00, 0xFE, 0x00, 0x02]]);
+    let (crlf_directory, crlf_paths) = write_sources(
+        "sourced_crlf",
+        &[b"row-1\r\nrow-2\r\n", b"", b"row-3\r\nrow-4\r\n"],
+    );
+
+    // `--window` is only valid with `--source windowed`; pread always
+    // runs without it.
+    for (source, window) in [
+        ("windowed", None),
+        ("windowed", Some(65536)),
+        ("pread", None),
+    ] {
+        assert_sourced_matches_mmap(&paths, 4, Some(b'\n'), None, None, source, window);
+        assert_sourced_matches_mmap(&binary_paths, 3, Some(0), None, None, source, window);
+        assert_sourced_matches_mmap(
+            &crlf_paths,
+            3,
+            None,
+            Some("0d0a"),
+            Some(b"\r\n"),
+            source,
+            window,
+        );
+    }
+    // Explicit `--source mmap` takes the legacy engine path and matches the
+    // default invocation exactly.
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    let implicit = run_partition_files(&path_refs, 4, None);
+    let explicit = run_partition_files_sourced(&path_refs, 4, None, Some("0a"), "mmap", None);
+    assert!(implicit.status.success() && explicit.status.success());
+    assert_eq!(explicit.stdout, implicit.stdout);
+
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(binary_directory).unwrap();
+    fs::remove_dir_all(crlf_directory).unwrap();
+}
+
+#[test]
+fn sourced_handles_window_straddling_and_long_delimiters() {
+    // CRLF split exactly across the 64 KiB window edge with a minimum window.
+    let edge = 65536usize;
+    let mut straddle = vec![0u8; 0];
+    straddle.extend_from_slice(&b"ab\r\n".repeat((edge - 1) / 4));
+    straddle.resize(edge - 1, b'x');
+    straddle.extend_from_slice(b"\r\ntail\r\n");
+    assert_eq!(&straddle[edge - 1..edge + 1], b"\r\n");
+    let (directory, paths) = write_sources("sourced_straddle", &[&straddle]);
+    for (source, window) in [("windowed", Some(65536)), ("pread", None)] {
+        assert_sourced_matches_mmap(&paths, 4, None, Some("0d0a"), Some(b"\r\n"), source, window);
+    }
+    fs::remove_dir_all(directory).unwrap();
+
+    // 200-byte delimiter: longer than any adaptive initial probe and far
+    // beyond a single tiny read.
+    let long_pattern = [b'A'; 199];
+    let mut long_delimiter = long_pattern.to_vec();
+    long_delimiter.push(b'\n');
+    assert_eq!(long_delimiter.len(), 200);
+    let mut long_body = Vec::new();
+    for _ in 0..6 {
+        long_body.extend_from_slice(&long_delimiter);
+    }
+    long_body.extend_from_slice(b"tail");
+    let long_hex: String = long_delimiter.iter().map(|b| format!("{b:02x}")).collect();
+    let (directory, paths) = write_sources("sourced_long", &[&long_body]);
+    for (source, window) in [("windowed", Some(65536)), ("pread", None)] {
+        assert_sourced_matches_mmap(
+            &paths,
+            3,
+            None,
+            Some(&long_hex),
+            Some(&long_delimiter),
+            source,
+            window,
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sourced_rejects_invalid_source_and_window_options() {
+    let (directory, paths) = write_sources("sourced_invalid", &[b"a\nb\n"]);
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+
+    // `--window` requires `--source windowed`, for every other mode.
+    for mode in ["mmap", "pread"] {
+        let output = Command::new(binary())
+            .args([
+                OsString::from("partition-files"),
+                OsString::from("--parts"),
+                OsString::from("2"),
+                OsString::from("--source"),
+                OsString::from(mode),
+                OsString::from("--window"),
+                OsString::from("65536"),
+                paths[0].as_os_str().to_owned(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("`--window` requires `--source windowed`"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _ = path_refs;
+
+    // Below-minimum, non-numeric, unknown, duplicate, and missing values.
+    let bad_options: Vec<Vec<OsString>> = vec![
+        vec![
+            OsString::from("--source"),
+            OsString::from("windowed"),
+            OsString::from("--window"),
+            OsString::from("1000"),
+        ],
+        vec![
+            OsString::from("--source"),
+            OsString::from("windowed"),
+            OsString::from("--window"),
+            OsString::from("nope"),
+        ],
+        vec![OsString::from("--source"), OsString::from("mmapx")],
+        vec![
+            OsString::from("--source"),
+            OsString::from("pread"),
+            OsString::from("--source"),
+            OsString::from("mmap"),
+        ],
+        vec![
+            OsString::from("--source"),
+            OsString::from("windowed"),
+            OsString::from("--window"),
+            OsString::from("65536"),
+            OsString::from("--window"),
+            OsString::from("131072"),
+        ],
+        vec![OsString::from("--source")],
+        vec![
+            OsString::from("--source"),
+            OsString::from("windowed"),
+            OsString::from("--window"),
+        ],
+    ];
+    for options in bad_options {
+        let mut arguments = vec![
+            OsString::from("partition-files"),
+            OsString::from("--parts"),
+            OsString::from("2"),
+        ];
+        arguments.extend(options);
+        arguments.push(paths[0].as_os_str().to_owned());
+        let output = Command::new(binary()).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
     fs::remove_dir_all(directory).unwrap();
 }

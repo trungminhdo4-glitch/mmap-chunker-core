@@ -362,14 +362,27 @@ mmap-chunker partition-files --parts 8 file-a.jsonl file-b.jsonl file-c.jsonl
 # The delimiter options are the same raw framing contract as `partition`:
 mmap-chunker partition-files --parts 8 --delimiter-byte 0 file-a.bin file-b.bin
 mmap-chunker partition-files --parts 8 --delimiter-hex 0d0a file-a.log file-b.log
+# The source backends match `partition`: mmap (default), bounded
+# moving-window mapping, or positional reads without mapping.
+mmap-chunker partition-files --parts 8 --source pread file-a.jsonl file-b.jsonl
+mmap-chunker partition-files --parts 8 --source windowed --window 65536 file-a.jsonl
 ```
 
 `partition-files` accepts only the explicitly ordered file paths shown on the
-command line. Each input is mapped independently and remains a separate source;
-the CLI does not concatenate files, copy them into a temporary file, or create a
+command line. With the default `--source mmap` each input is mapped
+independently and remains a separate source; with `--source windowed` or
+`--source pread` each source is instead opened only while its own boundaries
+are projected, so at most one source is ever held open (at most one live
+window for `windowed`, nothing mapped for `pread`), while lengths are read up
+front and rechecked on open — a source whose length changed mid-planning
+aborts the plan. The CLI does not concatenate files, copy them into a
+temporary file, or create a
 virtual contiguous address space. Duplicate paths are valid and are treated as
 distinct sources in the order supplied. Directory traversal, globbing, stdin,
-manifests, and watching are not part of this proof.
+manifests, and watching are not part of this proof. All backends emit
+byte-identical ranges; the mode only changes how bytes are accessed. The input
+files must remain immutable while they are planned; `windowed` and especially
+`pread` re-read file regions on demand and can otherwise observe torn data.
 
 Its headerless TSV output has exactly five fields per row:
 
