@@ -28,6 +28,16 @@
   output for single-byte invocations. A target that already follows a
   complete delimiter pattern is accepted exactly, mirroring
   `find_partition_boundaries_pattern`. No C ABI, dependency, or MSRV changes.
+- `partition-files` accepts `--source mmap|windowed|pread [--window BYTES]`
+  with the same backend contract as `partition`. The default `mmap` engine
+  path is unchanged; `windowed`/`pread` plan through `ByteSource` reads with
+  overlap-safe buffered projection, opening each source on demand so at most
+  one source is ever held open (at most one live window for `windowed`,
+  nothing mapped for `pread`). Lengths are read up front and rechecked on
+  open; a source whose length changed mid-planning aborts the plan. All
+  backends emit byte-identical ranges (differential tests incl. minimum
+  windows, window-straddling delimiters, and 200-byte patterns). No C ABI,
+  dependency, or MSRV changes.
 - Python source-selectable planning: `mmap_chunker.plan_file_ranges`
   with `source="mmap" | "windowed" | "pread"` and `window_bytes`,
   driving the v1.5 two-phase native API with a capability gate. Returns

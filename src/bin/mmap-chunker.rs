@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use mmap_chunker_core::source::{
-    plan_partition_ranges, PlannerOptions, SourceMode, MIN_WINDOW_BYTES,
+    plan_partition_ranges, ByteSource, PlannerOptions, PreadSource, SourceMode, WindowedMmapSource,
+    MIN_WINDOW_BYTES,
 };
 use mmap_chunker_core::MmapChunker;
 
@@ -14,7 +15,7 @@ mmap-chunker - record-aligned byte-range planning for immutable local files
 
 Usage:
   mmap-chunker partition FILE --parts N [--delimiter-byte B | --delimiter-hex HEX] [--source MODE] [--window BYTES] [--worker K]
-  mmap-chunker partition-files --parts N [--delimiter-byte B | --delimiter-hex HEX] FILE...
+  mmap-chunker partition-files --parts N [--delimiter-byte B | --delimiter-hex HEX] [--source MODE] [--window BYTES] FILE...
   mmap-chunker --help
   mmap-chunker --version
 
@@ -34,10 +35,13 @@ Options:
                 Record delimiter bytes as an even-length hex string, e.g.
                 0d0a for CRLF. Mutually exclusive with --delimiter-byte.
                 Valid for `partition` and `partition-files`.
-  --source MODE Byte source backend for `partition`: mmap (default, full-file
-                mapping), windowed (bounded moving-window mapping), or pread
-                (positional reads, no mapping). All backends emit identical
-                ranges; the mode only changes how bytes are accessed.
+  --source MODE Byte source backend for `partition` and `partition-files`:
+                mmap (default, full-file mapping), windowed (bounded
+                moving-window mapping), or pread (positional reads, no
+                mapping). All backends emit identical ranges; the mode only
+                changes how bytes are accessed. For `partition-files` the
+                mode applies to every source; non-mmap modes open each
+                source on demand and never hold more than one source open.
   --window BYTES
                 Window size in bytes for --source windowed (default 67108864,
                 minimum 65536). Requires --source windowed.
@@ -56,7 +60,11 @@ Offsets are bytes; starts are inclusive and ends are exclusive. The input file
 must remain immutable while it is mapped. The actual number of ranges can be
 lower than N when records span multiple ideal partition positions.
 partition-files treats each FILE as an independent source in argument order;
-it never concatenates or remaps files. Its worker rows are ordered by worker,
+it never concatenates or remaps files. With `--source windowed` or
+`--source pread` each source is opened only while its own boundaries are
+projected, so at most one source is ever held open; lengths are read up
+front and rechecked on open, and a source whose length changed mid-planning
+aborts the plan. Its worker rows are ordered by worker,
 then source, and a worker may contain multiple source ranges. An empty FILE
 contributes no rows; an all-empty dataset succeeds with empty stdout.\n";
 
@@ -220,6 +228,9 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
     let mut parts = None;
     let mut delimiter = vec![0x0A];
     let mut delimiter_seen = false;
+    let mut source = SourceMode::Mmap;
+    let mut source_seen = false;
+    let mut window = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -258,6 +269,25 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
                 .get(index)
                 .ok_or_else(|| "missing value for `--delimiter-hex`".to_owned())?;
             delimiter = parse_delimiter_hex(value)?;
+        } else if argument == "--source" {
+            if source_seen {
+                return Err("duplicate option `--source`".to_owned());
+            }
+            source_seen = true;
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--source`".to_owned())?;
+            source = parse_source(value)?;
+        } else if argument == "--window" {
+            if window.is_some() {
+                return Err("duplicate option `--window`".to_owned());
+            }
+            index += 1;
+            let value = arguments
+                .get(index)
+                .ok_or_else(|| "missing value for `--window`".to_owned())?;
+            window = Some(parse_window(value)?);
         } else if argument.as_os_str().to_string_lossy().starts_with('-') {
             return Err(format!(
                 "unexpected option `{}`",
@@ -273,7 +303,26 @@ fn run_partition_files(arguments: &[OsString]) -> Result<(), String> {
     if files.is_empty() {
         return Err("missing FILE (provide one or more ordered source paths)".to_owned());
     }
-    emit_file_partitions(files, parts, &delimiter)
+    if let Some(window_bytes) = window {
+        if source != SourceMode::Windowed {
+            return Err("`--window` requires `--source windowed`".to_owned());
+        }
+        let options = PlannerOptions::new(SourceMode::Windowed).with_window_bytes(window_bytes);
+        return emit_file_partitions_sourced(files, parts, &delimiter, &options);
+    }
+    match source {
+        // The default mmap engine path is unchanged: identical behavior by
+        // construction, including for an explicit `--source mmap`.
+        SourceMode::Mmap => emit_file_partitions(files, parts, &delimiter),
+        SourceMode::Windowed => {
+            let options = PlannerOptions::new(SourceMode::Windowed);
+            emit_file_partitions_sourced(files, parts, &delimiter, &options)
+        }
+        SourceMode::Pread => {
+            let options = PlannerOptions::new(SourceMode::Pread);
+            emit_file_partitions_sourced(files, parts, &delimiter, &options)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,10 +356,14 @@ fn emit_file_partitions(paths: Vec<PathBuf>, parts: usize, delimiter: &[u8]) -> 
     }
 
     let assignments = plan_logical_partitions(&sources, parts, delimiter)?;
+    write_assignments(&assignments)
+}
+
+fn write_assignments(assignments: &[WorkerAssignment]) -> Result<(), String> {
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
     for assignment in assignments {
-        for range in assignment.ranges {
+        for range in &assignment.ranges {
             writeln!(
                 output,
                 "{}\t{}\t{}\t{}\t{}",
@@ -326,6 +379,307 @@ fn emit_file_partitions(paths: Vec<PathBuf>, parts: usize, delimiter: &[u8]) -> 
     output
         .flush()
         .map_err(|error| format!("failed to write output: {error}"))
+}
+
+/// One on-demand source held open while its own targets are projected.
+///
+/// Planning keeps at most one of these alive at a time, so the peak held
+/// resources are one open source plus one scan buffer (and at most one
+/// live window for `SourceMode::Windowed`; nothing mapped for
+/// `SourceMode::Pread`).
+struct OpenSourced {
+    index: usize,
+    source: Box<dyn ByteSource>,
+    state: BoundarySearchState,
+    buffer: Vec<u8>,
+}
+
+fn open_sourced(path: &Path, options: &PlannerOptions) -> Result<Box<dyn ByteSource>, String> {
+    // Safety: the CLI contract requires every input file to remain
+    // immutable while it is planned, matching single-file sourced planning.
+    // `SourceMode::Mmap` never reaches this path; it uses the legacy
+    // full-mapping engine so default behavior is identical by construction.
+    match options.mode {
+        SourceMode::Mmap => Err("internal error: mmap uses the legacy engine path".to_owned()),
+        SourceMode::Windowed => {
+            unsafe { WindowedMmapSource::open_path(path, options.window_bytes) }
+                .map(|source| Box::new(source) as Box<dyn ByteSource>)
+                .map_err(|error| format!("failed to open {}: {error}", path.display()))
+        }
+        SourceMode::Pread => PreadSource::open_path(path)
+            .map(|source| Box::new(source) as Box<dyn ByteSource>)
+            .map_err(|error| format!("failed to open {}: {error}", path.display())),
+    }
+}
+
+fn emit_file_partitions_sourced(
+    paths: Vec<PathBuf>,
+    parts: usize,
+    delimiter: &[u8],
+    options: &PlannerOptions,
+) -> Result<(), String> {
+    let assignments = plan_logical_partitions_sourced(&paths, parts, delimiter, options)?;
+    write_assignments(&assignments)
+}
+
+fn plan_logical_partitions_sourced(
+    paths: &[PathBuf],
+    requested_parts: usize,
+    delimiter: &[u8],
+    options: &PlannerOptions,
+) -> Result<Vec<WorkerAssignment>, String> {
+    if requested_parts == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Phase 1: lengths only — no mappings, no held handles. Every path is
+    // statted up front so a missing file fails before any output, matching
+    // the legacy open-everything-first atomicity.
+    let mut prefixes = Vec::with_capacity(paths.len() + 1);
+    prefixes.push(0u128);
+    for path in paths {
+        let len = std::fs::metadata(path)
+            .map_err(|error| format!("failed to open {}: {error}", path.display()))?
+            .len();
+        let previous = *prefixes
+            .last()
+            .ok_or_else(|| "internal error: missing logical prefix".to_owned())?;
+        let next = previous
+            .checked_add(u128::from(len))
+            .ok_or_else(|| "logical dataset is too large".to_owned())?;
+        prefixes.push(next);
+    }
+    let total = *prefixes
+        .last()
+        .ok_or_else(|| "internal error: missing logical length".to_owned())?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Match the legacy planner's bounded request behavior whenever the
+    // logical byte count fits usize. All arithmetic for target positions is
+    // still performed in u128 so many independent files compose safely.
+    let effective_parts = requested_parts.min(usize::try_from(total).unwrap_or(usize::MAX));
+    // Every search window holds at least one complete pattern.
+    let buffer_len = options.scan_buffer_bytes.max(delimiter.len()).max(1);
+    // Do not reserve one entry per requested partition up front: a giant
+    // record or a sparse delimiter layout may collapse almost every target.
+    let mut cut_points = Vec::new();
+    let mut last_cut = 0u128;
+    // Logical targets increase monotonically, so per-source targets do too;
+    // once a source is closed it is never reopened.
+    let mut current: Option<OpenSourced> = None;
+
+    for partition in 1..effective_parts {
+        let target = total
+            .checked_mul(usize_to_u128(partition)?)
+            .ok_or_else(|| "logical target arithmetic overflow".to_owned())?
+            / usize_to_u128(effective_parts)?;
+        if target <= last_cut {
+            continue;
+        }
+
+        let projected = project_sourced_target(
+            target,
+            &prefixes,
+            paths,
+            delimiter,
+            options,
+            &mut current,
+            buffer_len,
+        )?;
+        if projected <= last_cut {
+            continue;
+        }
+        if projected == total {
+            break;
+        }
+        cut_points.push(projected);
+        last_cut = projected;
+    }
+
+    let mut assignments = Vec::with_capacity(cut_points.len() + 1);
+    let mut start = 0u128;
+    for end in cut_points.into_iter().chain(std::iter::once(total)) {
+        let ranges = ranges_for_interval(start, end, &prefixes, paths.len())?;
+        if !ranges.is_empty() {
+            assignments.push(WorkerAssignment {
+                worker_index: assignments.len(),
+                ranges,
+            });
+        }
+        start = end;
+    }
+    Ok(assignments)
+}
+
+fn project_sourced_target(
+    target: u128,
+    prefixes: &[u128],
+    paths: &[PathBuf],
+    delimiter: &[u8],
+    options: &PlannerOptions,
+    current: &mut Option<OpenSourced>,
+    buffer_len: usize,
+) -> Result<u128, String> {
+    // A source boundary is always a valid logical boundary, including the
+    // boundaries around empty sources.
+    if prefixes.binary_search(&target).is_ok() {
+        return Ok(target);
+    }
+
+    let upper = prefixes.partition_point(|prefix| *prefix <= target);
+    let source_index = upper
+        .checked_sub(1)
+        .ok_or_else(|| "internal error: target before first source".to_owned())?;
+    let source_start = prefixes[source_index];
+    let expected_len = prefixes[source_index + 1] - source_start;
+    let local_target = usize::try_from(target - source_start)
+        .map_err(|_| "logical target does not fit source offset".to_owned())?;
+    let path = paths
+        .get(source_index)
+        .ok_or_else(|| "internal error: target source out of bounds".to_owned())?;
+
+    if current.as_ref().map(|open| open.index) != Some(source_index) {
+        // Drop the previous source *before* opening the next one so at most
+        // one source is ever held open.
+        *current = None;
+        let source = open_sourced(path, options)?;
+        // The immutable-input contract forbids length changes between the
+        // phase-1 stat and this open; fail closed instead of planning
+        // against stale prefixes.
+        if usize_to_u128(source.len())? != expected_len {
+            return Err(format!(
+                "source length changed during planning: {}",
+                path.display()
+            ));
+        }
+        *current = Some(OpenSourced {
+            index: source_index,
+            source,
+            state: BoundarySearchState::default(),
+            buffer: vec![0u8; buffer_len],
+        });
+    }
+    let open = current
+        .as_mut()
+        .ok_or_else(|| "internal error: source not open".to_owned())?;
+    let local_boundary = next_record_boundary_sourced(
+        open.source.as_ref(),
+        local_target,
+        delimiter,
+        &mut open.state,
+        &mut open.buffer,
+        path,
+    )?;
+    Ok(source_start + usize_to_u128(local_boundary)?)
+}
+
+/// Fill `buf` from `offset`, tolerating short reads (`read_at` may return
+/// fewer bytes than requested). Returns the bytes accumulated; `0` means
+/// the source is exhausted at `offset`.
+fn fill_from(source: &dyn ByteSource, offset: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let read = source.read_at(offset + filled, &mut buf[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled = filled.saturating_add(read);
+    }
+    Ok(filled)
+}
+
+fn next_record_boundary_sourced(
+    source: &dyn ByteSource,
+    target: usize,
+    delimiter: &[u8],
+    state: &mut BoundarySearchState,
+    buffer: &mut [u8],
+    path: &Path,
+) -> Result<usize, String> {
+    if let Some(cached_boundary) = state.cached_boundary {
+        if target < cached_boundary {
+            return Ok(cached_boundary);
+        }
+    }
+
+    let file_len = source.len();
+    let read_error = |error: std::io::Error| format!("failed to read {}: {error}", path.display());
+    if delimiter.len() == 1 {
+        // No exact-target acceptance for single-byte: matches the legacy
+        // path, which the differential matrix proves byte-identical.
+        let byte = delimiter[0];
+        let scan_from = target.max(state.scan_from);
+        let mut offset = scan_from;
+        let boundary = loop {
+            if offset >= file_len {
+                break file_len;
+            }
+            let want = buffer.len().min(file_len - offset);
+            let filled = fill_from(source, offset, &mut buffer[..want]).map_err(&read_error)?;
+            if filled == 0 {
+                break file_len;
+            }
+            if let Some(relative) = buffer[..filled].iter().position(|b| *b == byte) {
+                break offset
+                    .saturating_add(relative)
+                    .saturating_add(1)
+                    .min(file_len);
+            }
+            if offset.saturating_add(filled) >= file_len {
+                break file_len;
+            }
+            offset = offset.saturating_add(filled);
+        };
+        state.scan_from = boundary;
+        state.cached_boundary = Some(boundary);
+        return Ok(boundary);
+    }
+
+    // Mirror the multi-byte exact-target semantics: a target that already
+    // follows a complete delimiter pattern is accepted exactly.
+    let dlen = delimiter.len();
+    if target >= dlen && target <= file_len {
+        let filled = fill_from(source, target - dlen, &mut buffer[..dlen]).map_err(&read_error)?;
+        if filled == dlen && buffer[..dlen] == delimiter[..] {
+            state.scan_from = target.max(state.scan_from);
+            state.cached_boundary = Some(target);
+            return Ok(target);
+        }
+    }
+
+    let scan_from = target.max(state.scan_from);
+    let mut offset = scan_from;
+    let boundary = loop {
+        if offset >= file_len {
+            break file_len;
+        }
+        let want = buffer.len().min(file_len - offset);
+        let filled = fill_from(source, offset, &mut buffer[..want]).map_err(&read_error)?;
+        if filled == 0 {
+            break file_len;
+        }
+        // The advance below re-reads the last `dlen - 1` bytes, so a
+        // pattern spanning two reads still appears whole in some buffer;
+        // matching inside filled bytes (overlap-safe, one-byte steps)
+        // therefore has the same observable contract as the slice search.
+        if filled >= dlen {
+            if let Some(relative) = find_first_pattern_from(&buffer[..filled], delimiter) {
+                break offset
+                    .saturating_add(relative)
+                    .saturating_add(dlen)
+                    .min(file_len);
+            }
+        }
+        if offset.saturating_add(filled) >= file_len {
+            break file_len;
+        }
+        offset = offset.saturating_add(filled.saturating_sub(dlen.saturating_sub(1)).max(1));
+    };
+    state.scan_from = boundary;
+    state.cached_boundary = Some(boundary);
+    Ok(boundary)
 }
 
 fn plan_logical_partitions(
@@ -388,7 +742,7 @@ fn plan_logical_partitions(
     let mut assignments = Vec::with_capacity(cut_points.len() + 1);
     let mut start = 0u128;
     for end in cut_points.into_iter().chain(std::iter::once(total)) {
-        let ranges = ranges_for_interval(start, end, &prefixes, sources)?;
+        let ranges = ranges_for_interval(start, end, &prefixes, sources.len())?;
         if !ranges.is_empty() {
             assignments.push(WorkerAssignment {
                 worker_index: assignments.len(),
@@ -535,14 +889,14 @@ fn ranges_for_interval(
     start: u128,
     end: u128,
     prefixes: &[u128],
-    sources: &[MmapChunker],
+    source_count: usize,
 ) -> Result<Vec<SourceRange>, String> {
     if start >= end {
         return Ok(Vec::new());
     }
 
     let mut ranges = Vec::new();
-    for source_index in 0..sources.len() {
+    for source_index in 0..source_count {
         let source_start = prefixes[source_index];
         let source_end = prefixes[source_index + 1];
         let range_start = start.max(source_start);
