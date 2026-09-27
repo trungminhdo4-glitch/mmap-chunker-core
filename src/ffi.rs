@@ -2692,4 +2692,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_fifo_reports_precise_error() {
+        // Same trip-wire as the probe-level fifo test: the FFI open probes
+        // before mapping, so asserting on the refused open never blocks on
+        // the fifo.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_fifo_ffi_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo_path = dir.join("test.fifo");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        if !matches!(mkfifo, Ok(status) if status.success()) {
+            eprintln!("SKIP fifo FFI test (mkfifo unavailable)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null(), "fifo open must return NULL (no handle leaked)");
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("not a regular file"),
+                "expected precise probe reason, got: {msg}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_missing_path_reports_generic_error() {
+        // Distinguishability contract: the generic open-failure text must
+        // not carry the probe's "not a regular file" reason. That suffix is
+        // reserved for InvalidInput refusals (see the open None-arm); a
+        // missing path takes the generic arm.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_missing_ffi_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.dat");
+        let c_path = std::ffi::CString::new(missing.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("failed to open"),
+                "expected generic open failure, got: {msg}"
+            );
+            assert!(
+                !msg.contains("not a regular"),
+                "generic error must not carry the probe reason, got: {msg}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

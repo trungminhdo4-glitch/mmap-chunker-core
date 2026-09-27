@@ -1409,4 +1409,144 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_refuses_fifo() {
+        // Trip-wire: the probe stats the path before any open attempt. A
+        // regression to open-first would block forever opening this fifo
+        // for reading and hang the suite instead of failing, so the probe
+        // assertion runs before any open is attempted.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_fifo_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo_path = dir.join("test.fifo");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        if !matches!(mkfifo, Ok(status) if status.success()) {
+            eprintln!("SKIP fifo refusal test (mkfifo unavailable)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let probe_err = probe_mmap_eligible(&fifo_path).unwrap_err();
+        assert_eq!(probe_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(probe_err.to_string().contains("not a regular file"));
+
+        unsafe {
+            let err = MmapFile::open_path(&fifo_path).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+
+            let err = WindowedMmapFile::open_path(&fifo_path, 65536).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_refuses_dev_null() {
+        // Character devices are non-regular without a dedicated probe
+        // message; they fall through to the generic refusal.
+        let path = std::path::Path::new("/dev/null");
+
+        let probe_err = probe_mmap_eligible(path).unwrap_err();
+        assert_eq!(probe_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(probe_err.to_string().contains("not a regular file"));
+
+        unsafe {
+            let err = MmapFile::open_path(path).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+
+            let err = WindowedMmapFile::open_path(path, 65536).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+        }
+    }
+
+    #[test]
+    fn test_probe_dangling_symlink_is_not_found() {
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_dangling_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("no_such_target.dat");
+        let link = dir.join("dangling.dat");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_file(target, &link).is_err() {
+                eprintln!("SKIP dangling-symlink test (creation refused)");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+
+        let probe_err = probe_mmap_eligible(&link).unwrap_err();
+        assert_eq!(probe_err.kind(), std::io::ErrorKind::NotFound);
+
+        unsafe {
+            let err = MmapFile::open_path(&link).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+            let err = WindowedMmapFile::open_path(&link, 65536).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_probe_refuses_symlink_to_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_symlink_dir_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target_dir = dir.join("real_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let link = dir.join("link_to_dir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            if std::os::windows::fs::symlink_dir(&target_dir, &link).is_err() {
+                eprintln!("SKIP symlink-to-directory test (creation refused)");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+
+        let probe_err = probe_mmap_eligible(&link).unwrap_err();
+        assert_eq!(probe_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(probe_err.to_string().contains("not a regular file"));
+
+        unsafe {
+            let err = MmapFile::open_path(&link).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+
+            let err = WindowedMmapFile::open_path(&link, 65536).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

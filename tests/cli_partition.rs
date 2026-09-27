@@ -911,3 +911,14 @@ fn source_rejects_invalid_forms() {
     );
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn partition_on_directory_reports_precise_refusal() {
+    let directory = fixture_dir("refusal_dir");
+    fs::create_dir_all(&directory).unwrap();
+    let output = run_partition(&directory, "2", None, None);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
+    fs::remove_dir_all(directory).unwrap();
+}
