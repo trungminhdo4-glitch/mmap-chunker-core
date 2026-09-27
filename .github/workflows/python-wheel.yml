@@ -196,6 +196,49 @@ jobs:
           "$VENV_PY" -m pip install --quiet pytest
           "$VENV_PY" -m pytest python/tests/test_datatrove_integration.py -q
 
+  python-tests:
+    # Native Python planning/loading/refusal suite against the packaged wheel.
+    # Runs the whole python/tests directory on one representative platform;
+    # the DataTrove file self-skips without the extra (covered by
+    # datatrove-smoke) and the CLI parity test self-skips without a
+    # release CLI build.
+    needs: wheel-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Linux x86_64 wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wheel-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Install wheel and run Python test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/pytest-venv
+          if [ -f /tmp/pytest-venv/Scripts/python.exe ]; then
+            VENV_PY=/tmp/pytest-venv/Scripts/python.exe
+          else
+            VENV_PY=/tmp/pytest-venv/bin/python
+          fi
+          "$VENV_PY" -m pip install --quiet --upgrade pip
+          WHEEL=$(ls dist/*.whl | head -n1)
+          "$VENV_PY" -m pip install --quiet "$WHEEL"
+          "$VENV_PY" -m pip install --quiet pytest
+          # Prove the suite exercises the installed wheel (not the repo
+          # source-tree fallback): every test module falls back to
+          # `python/` on ImportError, which must never trigger here.
+          "$VENV_PY" -c "import mmap_chunker; p=mmap_chunker.__file__; assert 'site-packages' in p, p; print('wheel under test:', p)"
+          "$VENV_PY" -m pytest python/tests -q
+
   sdist:
     # Source distribution: packaged from the release tree and verified. An sdist
     # rebuilds the native library with Cargo (documented requirement) and must
