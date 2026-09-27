@@ -755,4 +755,19 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_chunker_open_directory_refused() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_mc_probe_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        unsafe {
+            let err = MmapChunker::open(&dir).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

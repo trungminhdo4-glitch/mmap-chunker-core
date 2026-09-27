@@ -27,6 +27,25 @@
   `file identity changed: <detail>` while leaving the prior layout
   untouched. `mmap_engine_free` handles pinned handles via normal drop.
 
+### Fixed
+
+- Fail-closed mmap-eligibility probe before any mapping attempt: every open
+  path (`MmapFile::open` / `open_path`, `WindowedMmapFile::open_path`, and
+  therefore `MmapChunker::open` and both FFI opens) refuses directories,
+  fifos, sockets, and other non-regular types with `InvalidInput`
+  (`not a regular file: ...`); symlinks are followed (symlink-to-regular
+  opens fine, symlink-to-dir/fifo refused, dangling propagates `NotFound`);
+  regular files including empty and sparse still open. `procfs`/`sysfs`
+  size-liars and post-probe TOCTOU remain caller-contract territory.
+- FFI open failures caused by the probe now report the precise reason in
+  `mmap_engine_last_error()` (`failed to open or map file: not a regular
+  file: ...`) on the same code path; other open/map failures keep the
+  existing generic text.
+- No ABI change: no new exported symbol, capability bit, or version bump
+  (stays Cargo 0.4.0 / ABI v1.6); only new precise `last_error` texts.
+  Windows refuses directories precisely; named pipes/devices beyond `is_dir`
+  are best-effort (no unstable APIs under MSRV 1.77).
+
 ## [0.3.0] — 2026-09-26
 
 ### Added

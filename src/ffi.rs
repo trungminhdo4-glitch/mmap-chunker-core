@@ -204,7 +204,14 @@ pub unsafe extern "C" fn mmap_engine_open(path: *const c_char) -> *mut CEngineHa
                 Box::into_raw(engine) as *mut CEngineHandle
             }
             None => {
-                set_error("failed to open or map file");
+                match crate::mmap::probe_cstr_eligible(c_str) {
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        set_error(&format!("failed to open or map file: {error}"));
+                    }
+                    _ => {
+                        set_error("failed to open or map file");
+                    }
+                }
                 std::ptr::null_mut()
             }
         }
@@ -278,7 +285,14 @@ pub unsafe extern "C" fn mmap_engine_open_pinned(
                 Box::into_raw(engine) as *mut CEngineHandle
             }
             None => {
-                set_error("failed to open or map file");
+                match crate::mmap::probe_cstr_eligible(c_str) {
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        set_error(&format!("failed to open or map file: {error}"));
+                    }
+                    _ => {
+                        set_error("failed to open or map file");
+                    }
+                }
                 std::ptr::null_mut()
             }
         }
@@ -1194,6 +1208,28 @@ mod tests {
             let err = mmap_engine_last_error();
             assert!(!err.is_null());
         }
+    }
+
+    #[test]
+    fn test_open_directory_reports_precise_error() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_probe_dir_ffi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("not a regular file"),
+                "expected precise probe reason, got: {msg}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
