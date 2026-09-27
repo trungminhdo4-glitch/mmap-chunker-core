@@ -398,6 +398,15 @@ pub(crate) fn find_pattern_from(
 /// The `scan_buffer_bytes` value is clamped up to the delimiter length
 /// so every search window can hold at least one complete pattern.
 ///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::InvalidInput`] when the effective buffer size
+/// (`max(scan_buffer_bytes, delimiter.len())`) exceeds the addressable
+/// allocation limit, and [`io::ErrorKind::OutOfMemory`] when the
+/// reservation itself fails. Extreme caller sizes therefore surface as a
+/// recoverable library error instead of a capacity-overflow panic or an
+/// allocator abort.
+///
 /// # Panics
 ///
 /// Panics if `delimiter` is empty.
@@ -427,7 +436,29 @@ pub fn plan_partition_boundaries(
 
     let dlen = delimiter.len();
     let n = num_partitions.min(file_len);
-    let mut buffer = vec![0u8; scan_buffer_bytes.max(dlen).max(1)];
+    // Fallible reservation: `vec![0u8; len]` would panic on capacity
+    // overflow (len > isize::MAX) and abort the process on allocator
+    // failure, turning an extreme caller size into process death.
+    // `try_reserve_exact` reports allocation failure so it surfaces as
+    // `Err`; sizes past the platform `Vec` capacity bound are rejected
+    // up front. The following `resize` cannot grow again: the exact
+    // reservation already covers `buffer_len`, so it only writes zeros
+    // and sets the length.
+    let buffer_len = scan_buffer_bytes.max(dlen).max(1);
+    if buffer_len > isize::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("scan buffer size {buffer_len} bytes exceeds the addressable limit"),
+        ));
+    }
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(buffer_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("failed to allocate {buffer_len}-byte scan buffer"),
+        )
+    })?;
+    buffer.resize(buffer_len, 0);
 
     let mut boundaries = Vec::new();
     let mut last_boundary: usize = 0;
@@ -1037,5 +1068,65 @@ mod tests {
             requested <= 2 * DEFAULT_SCAN_BUFFER_BYTES as u64 + 2 * delimiter.len() as u64,
             "unbounded probe growth: {requested}"
         );
+    }
+
+    #[test]
+    fn scan_buffer_extreme_size_returns_invalid_input() {
+        // `usize::MAX` exceeds the addressable `Vec` capacity, so the old
+        // `vec![0u8; len]` panicked with capacity overflow. The buffered
+        // (non-slice) path must report it as a recoverable error instead.
+        // `DribbleSource` never exposes a slice, guaranteeing the cold
+        // allocation path is exercised.
+        let source = DribbleSource {
+            data: b"a\nb\nc\nd\ne\nf\n".to_vec(),
+            max_read: usize::MAX,
+        };
+        let error = plan_partition_boundaries(&source, 2, b"\n", usize::MAX)
+            .expect_err("extreme scan buffer must not succeed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn scan_buffer_unallocatable_size_returns_out_of_memory() {
+        // `isize::MAX` passes the `Vec` capacity check, so the old code
+        // attempted a ~9.2 EB zeroed allocation and the allocator aborted
+        // the process. The fixed code must return `OutOfMemory` without
+        // touching the allocator's failure path.
+        let source = DribbleSource {
+            data: b"a\nb\nc\nd\ne\nf\n".to_vec(),
+            max_read: usize::MAX,
+        };
+        let error = plan_partition_boundaries(&source, 2, b"\n", isize::MAX as usize)
+            .expect_err("unallocatable scan buffer must not succeed");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    }
+
+    #[test]
+    fn scan_buffer_zero_matches_slice_oracle() {
+        // Zero-size semantics are unchanged: the buffer is clamped up to
+        // `max(delimiter.len(), 1)` and planning matches the reference.
+        let content = b"a\r\nbb\r\nccc\r\ndddd\r\n";
+        let source = DribbleSource {
+            data: content.to_vec(),
+            max_read: usize::MAX,
+        };
+        let actual = plan_partition_boundaries(&source, 3, b"\r\n", 0).unwrap();
+        let expected = scanner::find_partition_boundaries_pattern(content, 3, b"\r\n");
+        assert_eq!(actual, expected, "zero scan buffer changed semantics");
+    }
+
+    #[test]
+    fn slice_backed_source_ignores_extreme_scan_buffer() {
+        // Sources exposing a complete slice delegate to the slice scanner
+        // before any scan buffer is allocated, so an extreme size is
+        // harmless there (documents the reachability boundary: only
+        // buffered backends allocate).
+        let content = b"alpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\n";
+        let path = temp_file("extreme_scan_slice", content);
+        let source = unsafe { MmapSource::open_path(&path).unwrap() };
+        let actual = plan_partition_boundaries(&source, 3, b"\r\n", usize::MAX).unwrap();
+        let expected = scanner::find_partition_boundaries_pattern(content, 3, b"\r\n");
+        assert_eq!(actual, expected, "slice delegation changed semantics");
+        cleanup(&path);
     }
 }
