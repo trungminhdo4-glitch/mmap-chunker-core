@@ -112,6 +112,9 @@ impl MmapChunker {
     /// `PIN_MTIME` from [`crate::pin`]); `0` means all. Unknown flag bits
     /// fail closed with [`io::ErrorKind::InvalidInput`].
     ///
+    /// Snapshot and mapping are separate path-based steps: a swap landing
+    /// between capture and map is caught at the first gated scan/plan call.
+    ///
     /// Every subsequent [`scan_delimited`](Self::scan_delimited),
     /// [`scan_fixed`](Self::scan_fixed),
     /// [`scan_delimited_pattern`](Self::scan_delimited_pattern),

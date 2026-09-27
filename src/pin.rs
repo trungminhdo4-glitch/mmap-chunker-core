@@ -5,6 +5,14 @@
 //! and re-stats the same path before every scan/plan operation. Any visible
 //! change fails closed.
 //!
+//! Snapshot and mapping are two separate path-based steps (stat, then
+//! open/map): a swap landing exactly between them pins one file while
+//! mapping the other. The first gated scan/plan call catches the skew
+//! (path re-stat vs. snapshot mismatch) and fails closed; pre-first-scan
+//! reads have no gate by design (see `MmapChunker::open_pinned`).
+//! Symlinks are followed per [`std::fs::metadata`] semantics: a target swap
+//! surfaces only as size/mtime/key change, like a rename-over.
+//!
 //! Platform keys:
 //!
 //! * Unix: `(dev, ino)` via [`std::os::unix::fs::MetadataExt`] (long-stable).

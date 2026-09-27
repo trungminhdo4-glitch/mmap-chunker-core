@@ -116,6 +116,9 @@ CEngineHandle *mmap_engine_open(const char *path);
  * (1U<<0 size, 1U<<1 identity, 1U<<2 mtime); 0 means all. Unknown flag
  * bits fail closed (NULL + error).
  *
+ * Snapshot and mapping are separate path-based steps; a swap landing
+ * between them is caught at the first gated scan/partition call.
+ *
  * Every subsequent scan/partition call on the returned handle revalidates
  * the live path first; on mismatch it reports
  * "file identity changed: <detail>" via mmap_engine_last_error(), leaves

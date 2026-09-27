@@ -1,7 +1,9 @@
-"""Cross-surface refusal matrix for non-regular inputs (Python surface).
+"""Refusal coverage for non-regular/missing inputs (Python surface).
 
 Covers the wheel's planning entry point: refusal must happen before any
-native call, matching the probe's fail-closed contract.
+native call, matching the probe's fail-closed contract. Directories are
+refused early with IsADirectoryError (precise per-surface spelling of the
+"not a regular file" refusal); other non-regulars reach the native probe.
 """
 
 from __future__ import annotations
@@ -31,3 +33,8 @@ from mmap_chunker import plan_file  # noqa: E402
 def test_plan_file_missing_path(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         plan_file(tmp_path / "nope.dat", 2)
+
+
+def test_plan_file_directory_refused(tmp_path: Path) -> None:
+    with pytest.raises(IsADirectoryError, match="not a file"):
+        plan_file(tmp_path, 2)
