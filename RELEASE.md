@@ -6,8 +6,8 @@ Three independent version domains:
 
 | Domain        | Current  | Controls                                  |
 |---------------|----------|-------------------------------------------|
-| Crate SemVer  | 0.3.0    | crates.io package, PyPI distribution, GitHub tag, Release |
-| C ABI         | 1.5      | Additive C API capability evolution       |
+| Crate SemVer  | 0.4.0    | crates.io package, PyPI distribution, GitHub tag, Release |
+| C ABI         | 1.6      | Additive C API capability evolution       |
 | Rust MSRV     | 1.77     | Minimum Supported Rust Version            |
 
 The Rust crate and the Python distribution share one version: the Python

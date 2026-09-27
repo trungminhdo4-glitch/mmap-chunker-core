@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
     }
 
     if (mmap_engine_abi_version() != MMAP_ENGINE_ABI_VERSION ||
-        mmap_engine_capabilities() != 255U) {
+        mmap_engine_capabilities() != 511U) {
         fail("ABI discovery mismatch");
     }
     if (sizeof(CChunkView) != 16 || offsetof(CChunkView, data) != 0 ||
