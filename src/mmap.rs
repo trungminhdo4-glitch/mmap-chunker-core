@@ -422,7 +422,10 @@ impl WindowedMmapFile {
         let aligned_start = (offset as u64 / VIEW_ALIGNMENT) * VIEW_ALIGNMENT;
         let slack = offset as u64 - aligned_start;
         let needed = slack + n as u64;
-        let desired = (self.window_bytes as u64 + slack).max(needed);
+        // `window_bytes` is caller-controlled (FFI/CLI); saturate instead of
+        // wrapping so absurd values clamp to EOF instead of panicking in
+        // debug builds. `mapped_len` below still bounds the view by the file.
+        let desired = (self.window_bytes as u64).saturating_add(slack).max(needed);
         let mapped_len = desired.min(self.size as u64 - aligned_start) as usize;
 
         let view = self.map_view(aligned_start, mapped_len)?;
@@ -1234,6 +1237,31 @@ mod tests {
         unsafe {
             let error = WindowedMmapFile::open_path(&path, 1024).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_windowed_huge_window_saturates_without_overflow() {
+        // `window_bytes` is caller-controlled (FFI/CLI); values near
+        // `usize::MAX` must clamp to EOF, not panic on `window + slack`
+        // overflow (regression: debug builds panicked at `read_at`).
+        let path = windowed_temp_file("huge", b"0123456789abcdef");
+        // NOTE: each read uses a fresh handle starting cold: a prior read
+        // would cache the whole 16-byte file and the second read would take
+        // the cached-view fast path without recomputing `desired`.
+        // Unaligned first: `slack > 0` exercises `window + slack`.
+        unsafe {
+            let file = WindowedMmapFile::open_path(&path, usize::MAX).unwrap();
+            let mut unaligned = [0u8; 8];
+            assert_eq!(file.read_at(1, &mut unaligned).unwrap(), 8);
+            assert_eq!(&unaligned, b"12345678");
+        }
+        unsafe {
+            let file = WindowedMmapFile::open_path(&path, usize::MAX).unwrap();
+            let mut aligned = [0u8; 8];
+            assert_eq!(file.read_at(0, &mut aligned).unwrap(), 8);
+            assert_eq!(&aligned, b"01234567");
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
