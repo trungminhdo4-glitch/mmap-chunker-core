@@ -34,7 +34,7 @@ typedef struct {
 
 /* ── ABI version ──────────────────────────────────────────────────────────── */
 
-#define MMAP_ENGINE_ABI_VERSION 0x00010005U
+#define MMAP_ENGINE_ABI_VERSION 0x00010006U
 
 /* ── Capability bits ──────────────────────────────────────────────────────── */
 
@@ -46,13 +46,14 @@ typedef struct {
 #define MMAP_ENGINE_CAP_MULTI_BYTE_DELIMITER   (1U << 5)
 #define MMAP_ENGINE_CAP_MULTI_BYTE_PARTITIONING (1U << 6)
 #define MMAP_ENGINE_CAP_WINDOWED_PLANNING      (1U << 7)
+#define MMAP_ENGINE_CAP_FILE_PIN               (1U << 8)
 
 /* ── ABI discovery ────────────────────────────────────────────────────────── */
 
 /**
  * Return the ABI version as (major << 16) | minor.
  *
- * Current: 0x00010005 (v1.5). Always succeeds, never panics.
+ * Current: 0x00010006 (v1.6). Always succeeds, never panics.
  * Call once at library load time to verify compatibility.
  */
 uint32_t mmap_engine_abi_version(void);
@@ -68,6 +69,7 @@ uint32_t mmap_engine_abi_version(void);
  * Bit 5: MULTI_BYTE_DELIMITER   — mmap_engine_scan_chunks_pattern() available
  * Bit 6: MULTI_BYTE_PARTITIONING — mmap_engine_partition_records_pattern() available
  * Bit 7: WINDOWED_PLANNING       — mmap_engine_plan_partition_ranges() available
+ * Bit 8: FILE_PIN                — mmap_engine_open_pinned() available
  *
  * Call once at library load time to discover which optional features
  * the loaded library provides.
@@ -105,6 +107,28 @@ const char *mmap_engine_last_error(void);
  * - On POSIX, `path` is passed directly to open(2).
  */
 CEngineHandle *mmap_engine_open(const char *path);
+
+/**
+ * Open and memory-map a file with file-identity pinning.
+ *
+ * Snapshots the path identity (size, mtime, plus dev/ino on Unix;
+ * size+mtime fallback on Windows/other targets) at open time. `flags` selects which classes are enforced
+ * (1U<<0 size, 1U<<1 identity, 1U<<2 mtime); 0 means all. Unknown flag
+ * bits fail closed (NULL + error).
+ *
+ * Snapshot and mapping are separate path-based steps; a swap landing
+ * between them is caught at the first gated scan/partition call.
+ *
+ * Every subsequent scan/partition call on the returned handle revalidates
+ * the live path first; on mismatch it reports
+ * "file identity changed: <detail>" via mmap_engine_last_error(), leaves
+ * the prior layout untouched, and returns the function's existing error
+ * value (0 for scan/partition fns). Free with mmap_engine_free() like any
+ * other handle.
+ *
+ * Added in v1.6 (detect via MMAP_ENGINE_CAP_FILE_PIN).
+ */
+CEngineHandle *mmap_engine_open_pinned(const char *path, uint32_t flags);
 
 /**
  * Scan the mapped file for chunk boundaries using newline ('\\n', 0x0A)
@@ -439,6 +463,7 @@ void mmap_engine_free(CEngineHandle *handle);
  *   v1.3 (0x00010003): Added mmap_engine_scan_chunks_pattern() + CAP_MULTI_BYTE_DELIMITER.
  *   v1.4 (0x00010004): Added mmap_engine_partition_records_pattern() + CAP_MULTI_BYTE_PARTITIONING.
  *   v1.5 (0x00010005): Added mmap_engine_plan_partition_ranges() + CAP_WINDOWED_PLANNING.
+ *   v1.6 (0x00010006): Added mmap_engine_open_pinned() + CAP_FILE_PIN.
  *
  * CChunkView layout (guaranteed by #[repr(C)]):
  *

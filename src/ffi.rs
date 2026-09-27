@@ -14,13 +14,14 @@ use std::cell::RefCell;
 use std::ffi::{c_char, c_int, CStr};
 
 use crate::mmap::MmapFile;
+use crate::pin::{PinnedFile, PIN_ALL};
 use crate::plan::ChunkPlan;
 use crate::scanner;
 use crate::source::{plan_partition_ranges, PlannerOptions, SourceMode};
 
 // ─── ABI constants ────────────────────────────────────────────────────────────
 
-pub const ABI_VERSION: u32 = 0x0001_0005;
+pub const ABI_VERSION: u32 = 0x0001_0006;
 
 pub const CAP_ZERO_COPY: u32 = 1 << 0;
 pub const CAP_CONFIGURABLE_DELIMITER: u32 = 1 << 1;
@@ -30,6 +31,7 @@ pub const CAP_RECORD_PARTITIONING: u32 = 1 << 4;
 pub const CAP_MULTI_BYTE_DELIMITER: u32 = 1 << 5;
 pub const CAP_MULTI_BYTE_PARTITIONING: u32 = 1 << 6;
 pub const CAP_WINDOWED_PLANNING: u32 = 1 << 7;
+pub const CAP_FILE_PIN: u32 = 1 << 8;
 
 /// Source mode passed to `mmap_engine_plan_partition_ranges`.
 pub const SOURCE_MODE_MMAP: u32 = 0;
@@ -96,13 +98,21 @@ pub struct CEngineHandle {
 struct Engine {
     mmap: MmapFile,
     plan: ChunkPlan,
+    pin: Option<PinnedFile>,
+}
+
+fn check_engine_pin(engine: &Engine) -> Result<(), crate::pin::PinMismatch> {
+    match &engine.pin {
+        None => Ok(()),
+        Some(pinned) => pinned.revalidate(),
+    }
 }
 
 // ─── ABI discovery ────────────────────────────────────────────────────────────
 
 /// Return the ABI version as `(major << 16) | minor`.
 ///
-/// Current: `0x0001_0005` (v1.5). Always succeeds, never panics.
+/// Current: `0x0001_0006` (v1.6). Always succeeds, never panics.
 #[no_mangle]
 pub extern "C" fn mmap_engine_abi_version() -> u32 {
     ABI_VERSION
@@ -113,7 +123,7 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 /// Consumers call this once at load time to discover which optional
 /// features the loaded library provides.
 ///
-/// Current bits (v1.5):
+/// Current bits (v1.6):
 ///   - Bit 0: `ZERO_COPY` — chunk views reference mapped memory directly
 ///   - Bit 1: `CONFIGURABLE_DELIMITER` — `mmap_engine_scan_chunks_ex` available
 ///   - Bit 2: `ERROR_STRINGS` — `mmap_engine_last_error` returns diagnostic text
@@ -122,6 +132,7 @@ pub extern "C" fn mmap_engine_abi_version() -> u32 {
 ///   - Bit 5: `MULTI_BYTE_DELIMITER` — `mmap_engine_scan_chunks_pattern` available
 ///   - Bit 6: `MULTI_BYTE_PARTITIONING` — `mmap_engine_partition_records_pattern` available
 ///   - Bit 7: `WINDOWED_PLANNING` — `mmap_engine_plan_partition_ranges` available
+///   - Bit 8: `FILE_PIN` — `mmap_engine_open_pinned` available
 #[no_mangle]
 pub extern "C" fn mmap_engine_capabilities() -> u32 {
     CAP_ZERO_COPY
@@ -132,6 +143,7 @@ pub extern "C" fn mmap_engine_capabilities() -> u32 {
         | CAP_MULTI_BYTE_DELIMITER
         | CAP_MULTI_BYTE_PARTITIONING
         | CAP_WINDOWED_PLANNING
+        | CAP_FILE_PIN
 }
 
 /// Return a pointer to the last error message for the calling thread,
@@ -187,11 +199,19 @@ pub unsafe extern "C" fn mmap_engine_open(path: *const c_char) -> *mut CEngineHa
                 let engine = Box::new(Engine {
                     mmap,
                     plan: ChunkPlan::empty(),
+                    pin: None,
                 });
                 Box::into_raw(engine) as *mut CEngineHandle
             }
             None => {
-                set_error("failed to open or map file");
+                match crate::mmap::probe_cstr_eligible(c_str) {
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        set_error(&format!("failed to open or map file: {error}"));
+                    }
+                    _ => {
+                        set_error("failed to open or map file");
+                    }
+                }
                 std::ptr::null_mut()
             }
         }
@@ -201,6 +221,87 @@ pub unsafe extern "C" fn mmap_engine_open(path: *const c_char) -> *mut CEngineHa
         Ok(ptr) => ptr,
         Err(_) => {
             set_error("internal error: panic in mmap_engine_open");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open and memory-map a file with file-identity pinning.
+///
+/// Same as [`mmap_engine_open`] but additionally snapshots the path identity
+/// (size, mtime, plus the Unix `dev/ino` key; size+mtime fallback on
+/// Windows/other targets) via `std::fs::metadata`.
+/// `flags` selects which classes are enforced (`1<<0` size, `1<<1`
+/// identity, `1<<2` mtime); `0` means all. Unknown flag bits fail closed
+/// (null + error).
+///
+/// Every subsequent scan/partition call on the returned handle revalidates
+/// the live path first; on mismatch it sets
+/// `mmap_engine_last_error()` to `file identity changed: <detail>`, leaves
+/// the prior layout untouched, and returns the function's existing error
+/// value (`0` for scan/partition fns). `mmap_engine_free` handles pinned
+/// handles with no special casing (normal drop).
+///
+/// # Safety
+///
+/// Same contract as [`mmap_engine_open`]. Added in ABI v1.6 (detect with
+/// `MMAP_ENGINE_CAP_FILE_PIN`).
+#[no_mangle]
+pub unsafe extern "C" fn mmap_engine_open_pinned(
+    path: *const c_char,
+    flags: u32,
+) -> *mut CEngineHandle {
+    let inner = move || {
+        clear_error();
+
+        if path.is_null() {
+            set_error("path is null");
+            return std::ptr::null_mut();
+        }
+
+        if flags & !PIN_ALL != 0 {
+            set_error("unknown pin flag bits");
+            return std::ptr::null_mut();
+        }
+
+        let c_str = unsafe { CStr::from_ptr(path) };
+        let path_lossy = c_str.to_string_lossy();
+        let pinned = match PinnedFile::capture(&*path_lossy, flags) {
+            Ok(pinned) => pinned,
+            Err(error) => {
+                set_error(&format!("failed to capture file identity: {error}"));
+                return std::ptr::null_mut();
+            }
+        };
+
+        match unsafe { MmapFile::open(c_str) } {
+            Some(mmap) => {
+                mmap.advise_sequential();
+                let engine = Box::new(Engine {
+                    mmap,
+                    plan: ChunkPlan::empty(),
+                    pin: Some(pinned),
+                });
+                Box::into_raw(engine) as *mut CEngineHandle
+            }
+            None => {
+                match crate::mmap::probe_cstr_eligible(c_str) {
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        set_error(&format!("failed to open or map file: {error}"));
+                    }
+                    _ => {
+                        set_error("failed to open or map file");
+                    }
+                }
+                std::ptr::null_mut()
+            }
+        }
+    };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(inner)) {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            set_error("internal error: panic in mmap_engine_open_pinned");
             std::ptr::null_mut()
         }
     }
@@ -262,6 +363,11 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_ex(
         }
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        if let Err(mismatch) = check_engine_pin(engine) {
+            set_error(&format!("file identity changed: {mismatch}"));
+            return 0;
+        }
 
         let data = unsafe { engine.mmap.as_slice() };
         if data.is_empty() {
@@ -342,6 +448,12 @@ pub unsafe extern "C" fn mmap_engine_scan_chunks_pattern(
         }
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        if let Err(mismatch) = check_engine_pin(engine) {
+            set_error(&format!("file identity changed: {mismatch}"));
+            return 0;
+        }
+
         let data = unsafe { engine.mmap.as_slice() };
 
         // SAFETY: the caller guarantees that `delimiter` points to
@@ -397,6 +509,11 @@ pub unsafe extern "C" fn mmap_engine_scan_fixed(
         }
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        if let Err(mismatch) = check_engine_pin(engine) {
+            set_error(&format!("file identity changed: {mismatch}"));
+            return 0;
+        }
 
         engine.plan = ChunkPlan::fixed(engine.mmap.len(), chunk_size_bytes);
         engine.plan.len()
@@ -482,6 +599,11 @@ pub unsafe extern "C" fn mmap_engine_partition_records(
         }
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
+
+        if let Err(mismatch) = check_engine_pin(engine) {
+            set_error(&format!("file identity changed: {mismatch}"));
+            return 0;
+        }
 
         let file_len = engine.mmap.len();
         if file_len == 0 {
@@ -580,6 +702,11 @@ pub unsafe extern "C" fn mmap_engine_partition_records_pattern(
 
         let engine = unsafe { &mut *(handle as *mut Engine) };
 
+        if let Err(mismatch) = check_engine_pin(engine) {
+            set_error(&format!("file identity changed: {mismatch}"));
+            return 0;
+        }
+
         let file_len = engine.mmap.len();
         if file_len == 0 {
             engine.plan = ChunkPlan::empty();
@@ -655,6 +782,10 @@ pub unsafe extern "C" fn mmap_engine_partition_records_pattern(
 /// non-zero, `out_ranges` must point to `capacity` writable
 /// `CPartitionRange` values. The input file must not be modified while
 /// this function runs (mmap-backed modes).
+///
+/// This entry point is stateless (no engine handle, no pin) and therefore
+/// has no file-identity gate; pinned handles revalidate only in the
+/// handle-based scan/partition entries above.
 ///
 /// Added in ABI v1.5 (detect with `MMAP_ENGINE_CAP_WINDOWED_PLANNING`).
 #[no_mangle]
@@ -830,9 +961,12 @@ pub unsafe extern "C" fn mmap_engine_get_chunk(
 /// After this call, the handle is invalid and chunk views obtained from
 /// `mmap_engine_get_chunk` must no longer be used.
 ///
+/// Works for both plain and pinned handles (normal drop; no special casing).
+///
 /// # Safety
 ///
-/// `handle` must be a valid pointer returned by `mmap_engine_open` or null.
+/// `handle` must be a valid pointer returned by `mmap_engine_open` or
+/// `mmap_engine_open_pinned`, or null.
 /// Passing null is a no-op. Must not be called more than once.
 #[no_mangle]
 pub unsafe extern "C" fn mmap_engine_free(handle: *mut CEngineHandle) {
@@ -1074,6 +1208,28 @@ mod tests {
             let err = mmap_engine_last_error();
             assert!(!err.is_null());
         }
+    }
+
+    #[test]
+    fn test_open_directory_reports_precise_error() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_probe_dir_ffi");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let c_path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("not a regular file"),
+                "expected precise probe reason, got: {msg}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2429,6 +2585,179 @@ mod tests {
                     &mut count,
                 ),
                 -1
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capabilities_include_file_pin() {
+        let caps = mmap_engine_capabilities();
+        assert!(caps & CAP_FILE_PIN != 0, "must have FILE_PIN");
+        assert_eq!(mmap_engine_abi_version(), 0x0001_0006);
+    }
+
+    #[test]
+    fn test_open_pinned_scans_ok_and_frees() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pinned_ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"aaa\nbbb\nccc\nddd\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open_pinned(c_path.as_ptr(), 0);
+            assert!(!h.is_null());
+            let count = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+            assert_eq!(count, 2);
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            assert_eq!(
+                std::slice::from_raw_parts(view.data, view.len),
+                b"aaa\nbbb\n"
+            );
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_pinned_rejects_unknown_flags() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pinned_flags");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"data\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open_pinned(c_path.as_ptr(), 1 << 30);
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pinned_scan_after_replace_fails_closed_and_keeps_layout() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pinned_replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"original-content\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open_pinned(c_path.as_ptr(), 0);
+            assert!(!h.is_null());
+            let baseline = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+            assert!(baseline > 0);
+            let mut view = CChunkView {
+                data: std::ptr::null(),
+                len: 0,
+            };
+            assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+            let baseline_len = view.len;
+
+            let tmp = dir.join("replacement.tmp");
+            std::fs::write(&tmp, b"original-content\n").unwrap();
+            if std::fs::rename(&tmp, &file_path).is_ok() {
+                // Scan fns return 0 on pin mismatch (their existing error
+                // value); the prior layout must stay readable.
+                let count = mmap_engine_scan_chunks_ex(h, 4, b'\n');
+                assert_eq!(count, 0);
+                let err = mmap_engine_last_error();
+                assert!(!err.is_null());
+                let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+                assert!(
+                    msg.contains("identity"),
+                    "expected identity error, got: {msg}"
+                );
+                assert_eq!(mmap_engine_get_chunk(h, 0, &mut view), 0);
+                assert_eq!(view.len, baseline_len);
+            } else {
+                eprintln!("SKIP pinned FFI replace (rename refused while mapped)");
+            }
+
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_fifo_reports_precise_error() {
+        // Same trip-wire as the probe-level fifo test: the FFI open probes
+        // before mapping, so asserting on the refused open never blocks on
+        // the fifo.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_fifo_ffi_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo_path = dir.join("test.fifo");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        if !matches!(mkfifo, Ok(status) if status.success()) {
+            eprintln!("SKIP fifo FFI test (mkfifo unavailable)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null(), "fifo open must return NULL (no handle leaked)");
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("not a regular file"),
+                "expected precise probe reason, got: {msg}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_open_missing_path_reports_generic_error() {
+        // Distinguishability contract: the generic open-failure text must
+        // not carry the probe's "not a regular file" reason. That suffix is
+        // reserved for InvalidInput refusals (see the open None-arm); a
+        // missing path takes the generic arm.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_probe_missing_ffi_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.dat");
+        let c_path = std::ffi::CString::new(missing.to_str().unwrap()).unwrap();
+        unsafe {
+            let h = mmap_engine_open(c_path.as_ptr());
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+            assert!(
+                msg.contains("failed to open"),
+                "expected generic open failure, got: {msg}"
+            );
+            assert!(
+                !msg.contains("not a regular"),
+                "generic error must not carry the probe reason, got: {msg}"
             );
         }
 

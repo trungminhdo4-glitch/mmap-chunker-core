@@ -35,7 +35,7 @@ def test_loader_returns_singleton_cdll() -> None:
 
 def test_abi_version_matches_expected() -> None:
     lib = _native.get_library()
-    assert int(lib.mmap_engine_abi_version()) == 0x0001_0005
+    assert int(lib.mmap_engine_abi_version()) == 0x0001_0006
 
 
 def test_required_capability_present() -> None:

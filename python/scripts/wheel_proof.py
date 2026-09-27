@@ -55,13 +55,13 @@ def verify_abi() -> None:
     REPORT["version"] = version
     REPORT["abi_version"] = f"0x{abi:08x}"
     REPORT["capabilities"] = f"0x{caps:08x}"
-    if abi != 0x0001_0005:
+    if abi != 0x0001_0006:
         raise AssertionError(f"unexpected ABI version 0x{abi:08x}")
     if not caps & (1 << 4):
         raise AssertionError("RECORD_PARTITIONING capability missing")
     if not caps & (1 << 7):
         raise AssertionError(
-            "WINDOWED_PLANNING capability missing; plan_file_ranges requires ABI v1.5"
+            "WINDOWED_PLANNING capability missing; plan_file_ranges requires ABI v1.5+"
         )
 
 

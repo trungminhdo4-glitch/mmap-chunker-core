@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Added
+
+- File-identity pinning (mechanical enforcement of the immutable-input
+  contract): new `pin` module with `FileIdentity` (size + mtime + platform
+  key: `dev/ino` on Unix, size+mtime fallback on Windows/other targets —
+  `volume_serial_number` / `file_index` need unstable `windows_by_handle`
+  and creation time proved unreliable under timer granularity/tunneling),
+  `PinnedFile::capture` / `revalidate`, `PinMismatch` /
+  `PinMismatchKind` (`Replaced`, `Truncated`, `MtimeJump`,
+  `MetadataUnavailable`; `Rotated` reserved for future hash-anchoring),
+  and `PIN_SIZE` / `PIN_IDENTITY` / `PIN_MTIME` flag classes (`0` means
+  all, unknown bits fail closed with `InvalidInput`).
+- Safe Rust API: `MmapChunker::open_pinned(path, flags)` with fail-closed
+  revalidation at the top of every scan/plan entry (`scan_delimited`,
+  `scan_fixed`, `scan_delimited_pattern`, `partition_records`,
+  `partition_records_pattern`); on mismatch the plan resets to empty and
+  the error is stashed for `take_pin_error` / `pin_status`. `get_chunk`
+  and cursors stay unhooked (hot path). No new runtime dependencies; Rust
+  MSRV remains 1.77.
+- C ABI v1.6 (`0x00010006`): `mmap_engine_open_pinned(path, flags)` with
+  `CAP_FILE_PIN` (bit 8); pinned handles revalidate at the top of every
+  handle-based scan/partition entry and report
+  `file identity changed: <detail>` while leaving the prior layout
+  untouched. `mmap_engine_free` handles pinned handles via normal drop.
+
+### Fixed
+
+- Fail-closed mmap-eligibility probe before any mapping attempt: every open
+  path (`MmapFile::open` / `open_path`, `WindowedMmapFile::open_path`, and
+  therefore `MmapChunker::open` and both FFI opens) refuses directories,
+  fifos, sockets, and other non-regular types with `InvalidInput`
+  (`not a regular file: ...`); symlinks are followed (symlink-to-regular
+  opens fine, symlink-to-dir/fifo refused, dangling propagates `NotFound`);
+  regular files including empty and sparse still open. `procfs`/`sysfs`
+  size-liars and post-probe TOCTOU remain caller-contract territory.
+- FFI open failures caused by the probe now report the precise reason in
+  `mmap_engine_last_error()` (`failed to open or map file: not a regular
+  file: ...`) on the same code path; other open/map failures keep the
+  existing generic text.
+- No ABI change: no new exported symbol, capability bit, or version bump
+  (stays Cargo 0.4.0 / ABI v1.6); only new precise `last_error` texts.
+  Windows refuses directories precisely; named pipes/devices beyond `is_dir`
+  are best-effort (no unstable APIs under MSRV 1.77).
+
 ## [0.3.0] — 2026-09-26
 
 ### Added

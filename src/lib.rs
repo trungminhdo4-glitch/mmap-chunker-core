@@ -1,5 +1,6 @@
 pub mod ffi;
 pub mod mmap;
+pub mod pin;
 pub mod scanner;
 pub mod source;
 
@@ -7,11 +8,15 @@ mod plan;
 
 pub use ffi::{
     CChunkView, CEngineHandle, CPartitionRange, ABI_VERSION, CAP_CONFIGURABLE_DELIMITER,
-    CAP_ERROR_STRINGS, CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER,
+    CAP_ERROR_STRINGS, CAP_FILE_PIN, CAP_FIXED_SIZE_CHUNKING, CAP_MULTI_BYTE_DELIMITER,
     CAP_MULTI_BYTE_PARTITIONING, CAP_RECORD_PARTITIONING, CAP_WINDOWED_PLANNING, CAP_ZERO_COPY,
     SOURCE_MODE_MMAP, SOURCE_MODE_PREAD, SOURCE_MODE_WINDOWED,
 };
 pub use mmap::MmapFile;
+pub use pin::{
+    FileIdentity, PinMismatch, PinMismatchKind, PinnedFile, PIN_ALL, PIN_IDENTITY, PIN_MTIME,
+    PIN_SIZE,
+};
 pub use scanner::ChunkCursor;
 pub use scanner::PatternChunkCursor;
 pub use source::{
@@ -58,6 +63,8 @@ use plan::ChunkPlan;
 pub struct MmapChunker {
     mmap: MmapFile,
     plan: ChunkPlan,
+    pinned: Option<PinnedFile>,
+    pin_error: Option<PinMismatch>,
 }
 
 impl MmapChunker {
@@ -91,7 +98,94 @@ impl MmapChunker {
         Ok(Self {
             mmap,
             plan: ChunkPlan::empty(),
+            pinned: None,
+            pin_error: None,
         })
+    }
+
+    /// Open and memory-map the file at `path` with file-identity pinning.
+    ///
+    /// Snapshots the path identity via [`PinnedFile::capture`] (size, mtime,
+    /// plus the Unix `dev/ino` key; size+mtime fallback on Windows/other
+    /// targets) using `std::fs::metadata`. `flags`
+    /// selects which classes are enforced (`PIN_SIZE` / `PIN_IDENTITY` /
+    /// `PIN_MTIME` from [`crate::pin`]); `0` means all. Unknown flag bits
+    /// fail closed with [`io::ErrorKind::InvalidInput`].
+    ///
+    /// Snapshot and mapping are separate path-based steps: a swap landing
+    /// between capture and map is caught at the first gated scan/plan call.
+    ///
+    /// Every subsequent [`scan_delimited`](Self::scan_delimited),
+    /// [`scan_fixed`](Self::scan_fixed),
+    /// [`scan_delimited_pattern`](Self::scan_delimited_pattern),
+    /// [`partition_records`](Self::partition_records), and
+    /// [`partition_records_pattern`](Self::partition_records_pattern) call
+    /// revalidates the live path first. On mismatch the plan is reset to
+    /// empty, the call returns `0`, and the mismatch is stashed for
+    /// [`take_pin_error`](Self::take_pin_error) / [`pin_status`](Self::pin_status).
+    /// `get_chunk` and the streaming cursors deliberately do NOT revalidate
+    /// (hot path; a scan must precede any read, so the scan gate suffices).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`open`](Self::open). Pinning is a fail-closed
+    /// trip-wire, not a substitute for the immutability obligation: it
+    /// detects visible rotation/replacement/truncation/mtime jumps via
+    /// re-stat, but a same-size/same-mtime/same-key swap is undecidable by
+    /// stat alone (hash-anchoring is future work).
+    pub unsafe fn open_pinned(path: impl AsRef<Path>, flags: u32) -> io::Result<Self> {
+        let pinned = PinnedFile::capture(path.as_ref(), flags)?;
+        let mmap = MmapFile::open_path(path)?;
+        Ok(Self {
+            mmap,
+            plan: ChunkPlan::empty(),
+            pinned: Some(pinned),
+            pin_error: None,
+        })
+    }
+
+    /// Take the stashed pin mismatch from the last scan/plan call, if any.
+    ///
+    /// Scan/plan functions keep their `usize` signatures and cannot
+    /// propagate the mismatch directly, so on mismatch they reset the plan
+    /// to empty, return `0`, and stash the [`PinMismatch`] here. A
+    /// successful revalidation clears the stash.
+    pub fn take_pin_error(&mut self) -> Option<PinMismatch> {
+        self.pin_error.take()
+    }
+
+    /// Peek at the stashed pin mismatch without taking it.
+    ///
+    /// Returns `Ok(())` when no mismatch is stashed (unpinned handles are
+    /// always `Ok`). Reflects the last scan/plan revalidation, not a live
+    /// re-stat; call a scan to refresh after an external change.
+    pub fn pin_status(&self) -> Result<(), &PinMismatch> {
+        match &self.pin_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Revalidate the pin (when present) before a scan/plan call.
+    ///
+    /// On mismatch resets the plan to empty, stashes the error, and returns
+    /// `false` so the caller can return `0` early. On success clears any
+    /// prior stash and returns `true`.
+    fn check_pinned(&mut self) -> bool {
+        match &self.pinned {
+            None => true,
+            Some(pinned) => match pinned.revalidate() {
+                Ok(()) => {
+                    self.pin_error = None;
+                    true
+                }
+                Err(err) => {
+                    self.plan = ChunkPlan::empty();
+                    self.pin_error = Some(err);
+                    false
+                }
+            },
+        }
     }
 
     /// Returns the number of chunks in the current layout.
@@ -110,7 +204,14 @@ impl MmapChunker {
     /// The last chunk extends to EOF.
     ///
     /// Replaces any previous layout. Returns the number of chunks.
+    ///
+    /// When opened via [`open_pinned`](Self::open_pinned), revalidates the
+    /// pin first; on mismatch resets the plan to empty, stashes the error
+    /// (see [`take_pin_error`](Self::take_pin_error)), and returns `0`.
     pub fn scan_delimited(&mut self, chunk_size: usize, delimiter: u8) -> usize {
+        if !self.check_pinned() {
+            return 0;
+        }
         let data = self.mmap.as_bytes();
         if data.is_empty() {
             self.plan = ChunkPlan::empty();
@@ -127,7 +228,12 @@ impl MmapChunker {
     /// potentially shorter at EOF. No delimiter scanning.
     ///
     /// Replaces any previous layout. Returns the number of chunks.
+    ///
+    /// Pinned handles revalidate first (see [`scan_delimited`](Self::scan_delimited)).
     pub fn scan_fixed(&mut self, chunk_size: usize) -> usize {
+        if !self.check_pinned() {
+            return 0;
+        }
         let file_len = self.mmap.len();
         self.plan = ChunkPlan::fixed(file_len, chunk_size);
         self.plan.len()
@@ -144,7 +250,12 @@ impl MmapChunker {
     /// giant records span multiple ideal target positions.
     ///
     /// Replaces any previous layout. Returns the number of partitions.
+    ///
+    /// Pinned handles revalidate first (see [`scan_delimited`](Self::scan_delimited)).
     pub fn partition_records(&mut self, num_partitions: usize, delimiter: u8) -> usize {
+        if !self.check_pinned() {
+            return 0;
+        }
         let data = self.mmap.as_bytes();
         let file_len = data.len();
         if file_len == 0 || num_partitions == 0 {
@@ -172,7 +283,12 @@ impl MmapChunker {
     /// # Panics
     ///
     /// Panics if `delimiter` is empty.
+    ///
+    /// Pinned handles revalidate first (see [`scan_delimited`](Self::scan_delimited)).
     pub fn partition_records_pattern(&mut self, num_partitions: usize, delimiter: &[u8]) -> usize {
+        if !self.check_pinned() {
+            return 0;
+        }
         let data = self.mmap.as_bytes();
         let file_len = data.len();
         if file_len == 0 || num_partitions == 0 {
@@ -224,7 +340,12 @@ impl MmapChunker {
     /// # Panics
     ///
     /// Panics if `delimiter` is empty.
+    ///
+    /// Pinned handles revalidate first (see [`scan_delimited`](Self::scan_delimited)).
     pub fn scan_delimited_pattern(&mut self, chunk_size: usize, delimiter: &[u8]) -> usize {
+        if !self.check_pinned() {
+            return 0;
+        }
         let data = self.mmap.as_bytes();
         if data.is_empty() {
             self.plan = ChunkPlan::empty();
@@ -541,5 +662,115 @@ mod tests {
         }
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_pinned_scan_works_and_status_clean() {
+        let path = temp_file("pinned_ok", b"aaa\nbbb\nccc\nddd\n");
+
+        unsafe {
+            let mut file = MmapChunker::open_pinned(&path, 0).unwrap();
+            assert!(file.pin_status().is_ok());
+            let count = file.scan_delimited(4, b'\n');
+            assert_eq!(count, 2);
+            assert!(file.pin_status().is_ok());
+            assert!(file.take_pin_error().is_none());
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_open_pinned_unknown_flags_rejected() {
+        let path = temp_file("pinned_flags", b"data\n");
+
+        unsafe {
+            let err = MmapChunker::open_pinned(&path, 1 << 30).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_pinned_scan_after_replace_yields_empty_plan_and_error() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_mc_pinned_replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"original-content\n").unwrap();
+
+        unsafe {
+            let mut file = MmapChunker::open_pinned(&path, 0).unwrap();
+            let baseline = file.scan_delimited(4, b'\n');
+            assert!(baseline > 0);
+
+            // Replace by rename-over with identical bytes. On Unix the
+            // dev/ino key changes so the pin trips as Replaced even though
+            // size and mtime may match; this is the atomic-deploy hazard.
+            let tmp = dir.join("replacement.tmp");
+            std::fs::write(&tmp, b"original-content\n").unwrap();
+            match std::fs::rename(&tmp, &path) {
+                Ok(()) => {
+                    let count = file.scan_delimited(4, b'\n');
+                    assert_eq!(count, 0);
+                    assert_eq!(file.chunk_count(), 0);
+                    assert!(file.pin_status().is_err());
+                    let err = file.take_pin_error();
+                    assert!(err.is_some());
+                    // Stash is drained by take.
+                    assert!(file.take_pin_error().is_none());
+                }
+                Err(e) => {
+                    // Windows file locking (FILE_SHARE_READ without DELETE)
+                    // can refuse rename-over while mapped. The pin cannot be
+                    // exercised through the live handle on such targets;
+                    // PinnedFile-only tests cover the detector itself.
+                    eprintln!("SKIP pinned-replace (rename refused): {e}");
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unpinned_open_unaffected_by_later_file_change() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_mc_unpinned_change");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"aaa\nbbb\nccc\nddd\n").unwrap();
+
+        unsafe {
+            let mut file = MmapChunker::open(&path).unwrap();
+            let first = file.scan_delimited(4, b'\n');
+            assert!(first > 0);
+            // Unpinned handles never stash pin errors, no matter what the
+            // path does afterwards.
+            assert!(file.pin_status().is_ok());
+            assert!(file.take_pin_error().is_none());
+            // Second scan still runs (no fail-closed gate for unpinned).
+            let second = file.scan_delimited(4, b'\n');
+            assert_eq!(second, first);
+            assert!(file.pin_status().is_ok());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_chunker_open_directory_refused() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_mc_probe_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        unsafe {
+            let err = MmapChunker::open(&dir).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("not a regular file"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
