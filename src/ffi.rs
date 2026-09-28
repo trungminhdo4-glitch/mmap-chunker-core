@@ -2646,6 +2646,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// No platform key here: identity-only pinning fails closed at capture
+    /// instead of returning a handle that can never trip.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_open_pinned_rejects_identity_only_without_platform_key() {
+        let dir = std::env::temp_dir().join("mmap_chunker_core_test_pinned_identity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("data.txt");
+        std::fs::write(&file_path, b"data\n").unwrap();
+
+        let c_path = std::ffi::CString::new(file_path.to_str().unwrap()).unwrap();
+        unsafe {
+            // Bit 1 == PIN_IDENTITY.
+            let h = mmap_engine_open_pinned(c_path.as_ptr(), 1 << 1);
+            assert!(h.is_null());
+            let err = mmap_engine_last_error();
+            assert!(!err.is_null());
+            // All-classes still opens: size+mtime keep enforcing.
+            let h = mmap_engine_open_pinned(c_path.as_ptr(), 0);
+            assert!(!h.is_null());
+            mmap_engine_free(h);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_pinned_scan_after_replace_fails_closed_and_keeps_layout() {
         let dir = std::env::temp_dir().join("mmap_chunker_core_test_pinned_replace");
