@@ -63,6 +63,24 @@ fn clear_error() {
     });
 }
 
+/// Platform-correct `CStr` → `PathBuf`, mirroring
+/// `crate::mmap::probe_cstr_eligible` / `MmapFile::open`.
+///
+/// Unix paths are raw byte sequences (except NUL); converting through
+/// lossy UTF-8 would stat a different file than the mapping opens.
+/// Other targets keep the lossy form, matching `open_windows`.
+fn cstr_to_path(path: &CStr) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf()
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::Path::new(&*path.to_string_lossy()).to_path_buf()
+    }
+}
+
 // ─── C-compatible types ───────────────────────────────────────────────────────
 
 /// A view into a single chunk.
@@ -265,8 +283,8 @@ pub unsafe extern "C" fn mmap_engine_open_pinned(
         }
 
         let c_str = unsafe { CStr::from_ptr(path) };
-        let path_lossy = c_str.to_string_lossy();
-        let pinned = match PinnedFile::capture(&*path_lossy, flags) {
+        let owned = cstr_to_path(c_str);
+        let pinned = match PinnedFile::capture(&owned, flags) {
             Ok(pinned) => pinned,
             Err(error) => {
                 set_error(&format!("failed to capture file identity: {error}"));
@@ -843,7 +861,7 @@ pub unsafe extern "C" fn mmap_engine_plan_partition_ranges(
         };
 
         let c_str = unsafe { CStr::from_ptr(path) };
-        let path_lossy = c_str.to_string_lossy();
+        let owned = cstr_to_path(c_str);
         // SAFETY: the caller guarantees that `delimiter` points to
         // `delimiter_len` readable, immutable bytes for this call.
         let delimiter = unsafe { std::slice::from_raw_parts(delimiter, delimiter_len) };
@@ -851,7 +869,7 @@ pub unsafe extern "C" fn mmap_engine_plan_partition_ranges(
         let options = PlannerOptions::new(mode).with_window_bytes(window_bytes);
         // SAFETY: forward the caller's immutable-input contract.
         let ranges = match unsafe {
-            plan_partition_ranges(&*path_lossy, requested_partitions, delimiter, &options)
+            plan_partition_ranges(&owned, requested_partitions, delimiter, &options)
         } {
             Ok(ranges) => ranges,
             Err(error) => {
@@ -2759,6 +2777,74 @@ mod tests {
                 !msg.contains("not a regular"),
                 "generic error must not carry the probe reason, got: {msg}"
             );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unix non-UTF8 pin path: the FFI capture must use raw OS bytes,
+    /// matching `MmapFile::open` / `probe_cstr_eligible`.
+    ///
+    /// Pre-fix `mmap_engine_open_pinned` stat-ed the lossy (`U+FFFD`)
+    /// rendering while the mapping opened the raw bytes, so a pinned
+    /// open on a `0xFF` pathname failed with `NotFound` even though the
+    /// unpinned open succeeded. Distinct raw names (`0xFF` vs `0xFE`)
+    /// must not collapse to the same capture.
+    #[cfg(unix)]
+    #[test]
+    fn test_open_pinned_raw_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_core_test_pinned_nonutf8_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut raw_a = dir.as_os_str().as_bytes().to_vec();
+        raw_a.extend_from_slice(b"/data_\xff.bin");
+        let mut raw_b = dir.as_os_str().as_bytes().to_vec();
+        raw_b.extend_from_slice(b"/data_\xfe.bin");
+        let path_a = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&raw_a));
+        let path_b = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&raw_b));
+        std::fs::write(&path_a, b"aaa\nbbb\nccc\nddd\n").unwrap();
+        std::fs::write(&path_b, b"aaa\nbbb\nccc\nddd\n").unwrap();
+
+        // Lossy renderings collapse, raw files do not.
+        let c_a = std::ffi::CString::new(raw_a).unwrap();
+        let c_b = std::ffi::CString::new(raw_b).unwrap();
+        assert_eq!(c_a.to_string_lossy(), c_b.to_string_lossy());
+        assert!(std::fs::metadata(&path_a).is_ok());
+        assert!(std::fs::metadata(&path_b).is_ok());
+
+        unsafe {
+            // Unpinned open is the negative control: raw bytes always worked.
+            let h = mmap_engine_open(c_a.as_ptr());
+            assert!(!h.is_null(), "unpinned open on raw path must succeed");
+            mmap_engine_free(h);
+
+            // Pinned open must track the same raw file, not the lossy ghost.
+            let hp = mmap_engine_open_pinned(c_a.as_ptr(), 0);
+            assert!(
+                !hp.is_null(),
+                "pinned open on raw path must succeed: {}",
+                if mmap_engine_last_error().is_null() {
+                    "<null>".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(mmap_engine_last_error())
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            );
+            let count = mmap_engine_scan_chunks_ex(hp, 4, b'\n');
+            assert_eq!(count, 2);
+            mmap_engine_free(hp);
+
+            // The sibling raw name is independent, not an alias.
+            let hp_b = mmap_engine_open_pinned(c_b.as_ptr(), 0);
+            assert!(!hp_b.is_null(), "sibling raw path must pin independently");
+            mmap_engine_free(hp_b);
         }
 
         let _ = std::fs::remove_dir_all(&dir);
