@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::mmap::{MmapFile, WindowedMmapFile, VIEW_ALIGNMENT};
+use crate::mmap::{probe_mmap_eligible, MmapFile, WindowedMmapFile, VIEW_ALIGNMENT};
 use crate::scanner;
 
 /// Default scan buffer for buffered backends (1 MiB).
@@ -172,6 +172,13 @@ impl PreadSource {
     /// On Windows the file is opened with `FILE_SHARE_READ` only, so
     /// other processes cannot open it for writing while planning.
     pub fn open_path(path: impl AsRef<Path>) -> io::Result<Self> {
+        // Fail-closed eligibility gate, identical to the mmap-backed
+        // openers: refuse directories, fifos, sockets, and other
+        // non-regular inputs before any open attempt (a fifo open would
+        // block; a directory open succeeds on some platforms and fails
+        // mid-plan with a confusing error elsewhere).
+        probe_mmap_eligible(path.as_ref())?;
+
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
@@ -1128,5 +1135,72 @@ mod tests {
         let expected = scanner::find_partition_boundaries_pattern(content, 3, b"\r\n");
         assert_eq!(actual, expected, "slice delegation changed semantics");
         cleanup(&path);
+    }
+
+    // ── pread refusal parity ──────────────────────────────────────────
+    // PreadSource::open_path must enforce the same fail-closed
+    // eligibility gate as the mmap-backed openers (see
+    // test_probe_refuses_directory / test_probe_refuses_fifo in mmap.rs).
+    // Without it, `--source pread` (and the stateless FFI planner in
+    // Pread mode) accepts directories and hangs opening fifos.
+
+    #[test]
+    fn pread_open_path_refuses_directory() {
+        let dir = std::env::temp_dir().join("mmap_chunker_source_test_pread_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = PreadSource::open_path(&dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pread_plan_ranges_refuses_directory() {
+        let dir = std::env::temp_dir().join("mmap_chunker_source_test_pread_plan_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let options = PlannerOptions::new(SourceMode::Pread);
+        let err = unsafe { plan_partition_ranges(&dir, 4, b"\n", &options) }.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pread_open_path_refuses_fifo() {
+        // Trip-wire mirrors mmap.rs: probe-first must reject the fifo;
+        // open-first would block forever and hang the suite instead.
+        let dir = std::env::temp_dir().join(format!(
+            "mmap_chunker_source_test_pread_fifo_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo_path = dir.join("test.fifo");
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status();
+        if !matches!(mkfifo, Ok(status) if status.success()) {
+            eprintln!("SKIP pread fifo refusal test (mkfifo unavailable)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let err = PreadSource::open_path(&fifo_path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"));
+
+        let options = PlannerOptions::new(SourceMode::Pread);
+        let err = unsafe { plan_partition_ranges(&fifo_path, 4, b"\n", &options) }.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("not a regular file"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
