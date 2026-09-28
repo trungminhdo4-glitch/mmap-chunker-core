@@ -123,9 +123,12 @@ def _coerce_delimiter(delimiter: _DelimiterInput) -> int:
     if isinstance(delimiter, bytes):
         if len(delimiter) != 1:
             raise ValueError(
-                "partition delimiter must be exactly one byte; the current "
-                "partition ABI accepts a single raw byte only, got "
-                f"{len(delimiter)} bytes"
+                "partition delimiter must be exactly one byte; the Python API "
+                "accepts a single raw byte only, got "
+                f"{len(delimiter)} bytes; for multi-byte delimiters (e.g. CRLF) "
+                "use the CLI --delimiter-hex or the C ABI pattern APIs "
+                "(mmap_engine_partition_records_pattern / "
+                "mmap_engine_plan_partition_ranges)"
             )
         return delimiter[0]
     raise TypeError(
@@ -226,8 +229,9 @@ def plan_file(
             be smaller when records are sparse.
         delimiter: The single raw byte marking record boundaries. Defaults to
             the newline byte ``b"\\n"`` (also accepted as the int ``10``).
-            Multi-byte partition delimiters are not supported by the current
-            native partition ABI.
+            Multi-byte delimiters are not supported by this Python API; for
+            CRLF use the CLI ``--delimiter-hex 0d0a`` or the C ABI pattern
+            APIs.
 
     Returns:
         An immutable :class:`Plan`. No returned object references the
