@@ -902,3 +902,100 @@ fn sourced_rejects_invalid_source_and_window_options() {
     }
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn single_byte_accepts_exact_target_boundaries() {
+    // Every ideal target (2, 4, 6) of this 8-byte fixture already follows
+    // a newline, so all three must be accepted exactly — mirroring the
+    // slice oracle (scanner::find_partition_boundaries) and the
+    // multi-byte CLI path. Previously the single-byte paths skipped the
+    // check and collapsed to two ranges.
+    let (directory, paths) = write_sources("single_byte_exact", &[b"a\nb\nc\nd\n"]);
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    let expected = vec![
+        Row {
+            worker: 0,
+            source: 0,
+            start: 0,
+            end_exclusive: 2,
+            length: 2,
+        },
+        Row {
+            worker: 1,
+            source: 0,
+            start: 2,
+            end_exclusive: 4,
+            length: 2,
+        },
+        Row {
+            worker: 2,
+            source: 0,
+            start: 4,
+            end_exclusive: 6,
+            length: 2,
+        },
+        Row {
+            worker: 3,
+            source: 0,
+            start: 6,
+            end_exclusive: 8,
+            length: 2,
+        },
+    ];
+    for mode in ["mmap", "windowed", "pread"] {
+        let output = run_partition_files_sourced(&path_refs, 4, Some(b'\n'), None, mode, None);
+        assert!(
+            output.status.success(),
+            "mode={mode} stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            parse_rows(&output.stdout),
+            expected,
+            "mode={mode} diverged on exact-target fixture"
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn single_file_and_files_agree_on_exact_targets() {
+    // Cross-surface differential: `partition` (library oracle) and
+    // `partition-files` must emit identical byte coverage for one file.
+    let (directory, paths) = write_sources("single_vs_files", &[b"a\nb\nc\nd\n"]);
+    let single = Command::new(binary())
+        .args([
+            OsString::from("partition"),
+            paths[0].as_os_str().to_owned(),
+            OsString::from("--parts"),
+            OsString::from("4"),
+        ])
+        .output()
+        .unwrap();
+    assert!(single.status.success());
+    let single_ranges: Vec<(usize, usize)> = std::str::from_utf8(&single.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4, "unexpected partition line: {line}");
+            (fields[1].parse().unwrap(), fields[2].parse().unwrap())
+        })
+        .collect();
+    assert_eq!(single_ranges, vec![(0, 2), (2, 4), (4, 6), (6, 8)]);
+
+    let path_refs: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+    for mode in ["mmap", "windowed", "pread"] {
+        let output = run_partition_files_sourced(&path_refs, 4, Some(b'\n'), None, mode, None);
+        assert!(output.status.success());
+        let files_ranges: Vec<(usize, usize)> = parse_rows(&output.stdout)
+            .iter()
+            .map(|row| (row.start, row.end_exclusive))
+            .collect();
+        assert_eq!(
+            files_ranges, single_ranges,
+            "mode={mode}: partition-files disagrees with partition"
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
