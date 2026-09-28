@@ -17,6 +17,8 @@
 //!
 //! * Unix: `(dev, ino)` via [`std::os::unix::fs::MetadataExt`] (long-stable).
 //! * Windows and other platforms: size + mtime only (documented fallback).
+//!   Requesting only [`PIN_IDENTITY`] there fails closed at capture,
+//!   since such a pin could never trip.
 //!
 //!   Windows has no usable stable file key: `volume_serial_number` /
 //!   `file_index` require the unstable `windows_by_handle` feature
@@ -44,8 +46,8 @@ use std::time::SystemTime;
 /// Check only the file size class.
 pub const PIN_SIZE: u32 = 1 << 0;
 /// Check only the platform identity class (`dev/ino` on Unix; no key on
-/// Windows/other targets, where the flag is accepted but has nothing to
-/// compare — see the module docs).
+/// Windows/other targets, where requesting *only* this class fails closed
+/// at capture — see the module docs).
 pub const PIN_IDENTITY: u32 = 1 << 1;
 /// Check only the modification-time class.
 pub const PIN_MTIME: u32 = 1 << 2;
@@ -225,8 +227,20 @@ impl PinnedFile {
     /// `flags` selects which classes [`revalidate`](Self::revalidate)
     /// checks (`PIN_SIZE` / `PIN_IDENTITY` / `PIN_MTIME`); `0` means all.
     /// Unknown flag bits fail closed with [`io::ErrorKind::InvalidInput`].
+    /// Where no platform key exists (Windows/other targets), requesting
+    /// only `PIN_IDENTITY` also fails closed: such a pin could never trip.
+    /// Broader masks keep the documented fallback (identity passes while
+    /// the other enabled classes enforce).
     pub fn capture(path: impl AsRef<Path>, flags: u32) -> io::Result<Self> {
         effective_flags(flags)?;
+        #[cfg(not(unix))]
+        if flags == PIN_IDENTITY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "identity pinning (dev/ino) is not supported on this platform; \
+                 request PIN_SIZE, PIN_MTIME, or all classes instead",
+            ));
+        }
         let path_buf = path.as_ref().to_path_buf();
         let meta = std::fs::metadata(&path_buf)?;
         Ok(Self {
@@ -485,6 +499,30 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let err = pinned.revalidate().unwrap_err();
         assert_eq!(err.kind(), PinMismatchKind::MetadataUnavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No stable file key exists here (see module docs), so requesting
+    /// *only* the identity class would check nothing at all. Fail closed
+    /// instead of returning a pin that can never trip. Broader masks
+    /// (`0`/PIN_ALL, or identity combined with size/mtime) keep the
+    /// documented fallback: the identity class passes while the other
+    /// classes still enforce.
+    #[cfg(not(unix))]
+    #[test]
+    fn identity_only_fails_closed_without_platform_key() {
+        let dir = temp_dir("identity_only");
+        let path = write_file(&dir, "data.txt", b"data\n");
+        let err = PinnedFile::capture(&path, PIN_IDENTITY).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("identity"));
+        // The degraded masks still work: size and mtime keep enforcing.
+        let pinned = PinnedFile::capture(&path, 0).unwrap();
+        assert!(pinned.revalidate().is_ok());
+        // Boundary: identity combined with a real class stays accepted
+        // (identity passes vacuously, size still enforces).
+        let combined = PinnedFile::capture(&path, PIN_IDENTITY | PIN_SIZE).unwrap();
+        assert!(combined.revalidate().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
