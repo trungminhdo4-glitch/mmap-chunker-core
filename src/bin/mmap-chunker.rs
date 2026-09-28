@@ -607,9 +607,19 @@ fn next_record_boundary_sourced(
     let file_len = source.len();
     let read_error = |error: std::io::Error| format!("failed to read {}: {error}", path.display());
     if delimiter.len() == 1 {
-        // No exact-target acceptance for single-byte: matches the legacy
-        // path, which the differential matrix proves byte-identical.
+        // Exact-target acceptance mirrors the slice oracle
+        // (scanner::find_partition_boundaries) and the multi-byte path
+        // below: a target that immediately follows the delimiter byte is
+        // already a record boundary.
         let byte = delimiter[0];
+        if target >= 1 && target <= file_len {
+            let filled = fill_from(source, target - 1, &mut buffer[..1]).map_err(&read_error)?;
+            if filled == 1 && buffer[0] == byte {
+                state.scan_from = target.max(state.scan_from);
+                state.cached_boundary = Some(target);
+                return Ok(target);
+            }
+        }
         let scan_from = target.max(state.scan_from);
         let mut offset = scan_from;
         let boundary = loop {
@@ -782,7 +792,6 @@ fn project_logical_target(
         .get_mut(source_index)
         .ok_or_else(|| "internal error: boundary state out of bounds".to_owned())?;
     let local_boundary = if delimiter.len() == 1 {
-        // Byte-identical to the pre-existing single-byte path.
         next_record_boundary(data, local_target, delimiter[0], state)
     } else {
         next_record_boundary_pattern(data, local_target, delimiter, state)
@@ -806,6 +815,15 @@ fn next_record_boundary(
         if target < cached_boundary {
             return cached_boundary;
         }
+    }
+
+    // Mirror scanner::find_partition_boundaries exact-target semantics
+    // (and next_record_boundary_pattern below): a target that immediately
+    // follows the delimiter byte is already a record boundary.
+    if target >= 1 && target <= data.len() && data[target - 1] == delimiter {
+        state.scan_from = target.max(state.scan_from);
+        state.cached_boundary = Some(target);
+        return target;
     }
 
     let scan_from = target.max(state.scan_from);
