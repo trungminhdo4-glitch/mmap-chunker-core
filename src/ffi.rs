@@ -2790,7 +2790,11 @@ mod tests {
     /// open on a `0xFF` pathname failed with `NotFound` even though the
     /// unpinned open succeeded. Distinct raw names (`0xFF` vs `0xFE`)
     /// must not collapse to the same capture.
-    #[cfg(unix)]
+    ///
+    /// Linux-only: macOS (APFS) rejects non-UTF8 filenames at creation with
+    /// `EILSEQ`, so this fixture cannot exist there; the production helper
+    /// under test is platform-correct on all Unix targets regardless.
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_open_pinned_raw_non_utf8_path() {
         use std::os::unix::ffi::OsStrExt;
