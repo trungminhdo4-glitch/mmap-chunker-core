@@ -914,8 +914,15 @@ fn ranges_for_interval(
     }
 
     let mut ranges = Vec::new();
-    for source_index in 0..source_count {
+    // Look up the first overlapping source. Equal prefixes denote empty sources.
+    let first_source = prefixes[..source_count]
+        .partition_point(|offset| *offset <= start)
+        .saturating_sub(1);
+    for source_index in first_source..source_count {
         let source_start = prefixes[source_index];
+        if source_start >= end {
+            break;
+        }
         let source_end = prefixes[source_index + 1];
         let range_start = start.max(source_start);
         let range_end = end.min(source_end);
