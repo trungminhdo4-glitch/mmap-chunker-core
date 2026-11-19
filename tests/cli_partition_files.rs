@@ -324,7 +324,16 @@ fn proves_empty_sources_no_final_delimiter_and_partition_count_edges() {
 
     let (directory, paths) = write_sources(
         "empty_edges",
-        &[b"", b"", b"one\n", b"two\nthree", b"single record"],
+        &[
+            b"",
+            b"",
+            b"one\n",
+            b"",
+            b"",
+            b"two\nthree",
+            b"single record",
+            b"",
+        ],
     );
     assert_dataset_oracle(&paths, 1, None);
     let rows = assert_dataset_oracle(&paths, usize::MAX, None);
